@@ -90,6 +90,12 @@ mod tests {
         assert_eq!(quote.percent_change(), None);
     }
     #[test]
+    fn quote_change_returns_none_without_a_previous_close() {
+        let quote = quote(None);
+        assert_eq!(quote.absolute_change(), None);
+        assert_eq!(quote.percent_change(), None);
+    }
+    #[test]
     fn quote_change_uses_previous_close() {
         let quote = quote(Some(100.0));
         assert_eq!(quote.absolute_change(), Some(25.0));
