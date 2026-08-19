@@ -16,6 +16,7 @@ use std::{
 
 const COMMAND_CAPACITY: usize = 64;
 const EVENT_CAPACITY: usize = 128;
+const MAX_CONCURRENT_OTHER_JOBS: usize = 31;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum RuntimeCommand {
@@ -114,7 +115,8 @@ enum RuntimeMode {
 struct RecordingRuntime {
     commands: Mutex<VecDeque<RuntimeCommand>>,
     events: Receiver<RuntimeEvent>,
-    _event_sender: Sender<RuntimeEvent>,
+    event_sender: Sender<RuntimeEvent>,
+    shutdown: AtomicBool,
 }
 
 struct LiveRuntime {
@@ -132,7 +134,8 @@ impl Default for RuntimeHandle {
             mode: RuntimeMode::Recording(Arc::new(RecordingRuntime {
                 commands: Mutex::new(VecDeque::with_capacity(COMMAND_CAPACITY)),
                 events,
-                _event_sender: event_sender,
+                event_sender,
+                shutdown: AtomicBool::new(false),
             })),
         }
     }
@@ -184,6 +187,9 @@ impl RuntimeHandle {
     pub fn send(&self, command: RuntimeCommand) -> Result<(), RuntimeSendError> {
         match &self.mode {
             RuntimeMode::Recording(runtime) => {
+                if runtime.shutdown.load(Ordering::SeqCst) {
+                    return Err(RuntimeSendError::Closed);
+                }
                 let mut commands = runtime
                     .commands
                     .lock()
@@ -231,8 +237,13 @@ impl RuntimeHandle {
     }
 
     pub fn shutdown(&self) {
-        let RuntimeMode::Live(runtime) = &self.mode else {
-            return;
+        let runtime = match &self.mode {
+            RuntimeMode::Recording(runtime) => {
+                runtime.shutdown.store(true, Ordering::SeqCst);
+                runtime.event_sender.close();
+                return;
+            }
+            RuntimeMode::Live(runtime) => runtime,
         };
         if runtime.shutdown.swap(true, Ordering::SeqCst) {
             return;
@@ -254,7 +265,7 @@ impl RuntimeHandle {
 
     pub fn is_shutdown(&self) -> bool {
         match &self.mode {
-            RuntimeMode::Recording(_) => false,
+            RuntimeMode::Recording(runtime) => runtime.shutdown.load(Ordering::SeqCst),
             RuntimeMode::Live(runtime) => runtime.shutdown.load(Ordering::SeqCst),
         }
     }
@@ -283,7 +294,7 @@ fn run_network(
     events: Sender<RuntimeEvent>,
     shutdown: Receiver<()>,
     providers: ProviderSet,
-    repository: Arc<dyn StateRepository>,
+    _repository: Arc<dyn StateRepository>,
 ) {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -293,84 +304,154 @@ fn run_network(
     let Ok(runtime) = runtime else {
         return;
     };
-    runtime.block_on(async move {
-        loop {
-            let command = tokio::select! {
-                _ = shutdown.recv() => break,
-                command = commands.recv() => match command {
-                    Ok(command) => command,
-                    Err(_) => break,
-                },
-            };
-            let keep_running = tokio::select! {
-                _ = shutdown.recv() => false,
-                keep_running = handle_command(command, &events, &providers, &repository) => keep_running,
-            };
-            if !keep_running {
+    runtime.block_on(run_dispatcher(commands, events, shutdown, providers));
+}
+
+async fn run_dispatcher(
+    commands: Receiver<RuntimeCommand>,
+    events: Sender<RuntimeEvent>,
+    shutdown: Receiver<()>,
+    providers: ProviderSet,
+) {
+    let mut jobs = tokio::task::JoinSet::new();
+    let mut search_job: Option<tokio::task::JoinHandle<()>> = None;
+    let mut pending = VecDeque::with_capacity(COMMAND_CAPACITY);
+    let mut other_in_flight = 0usize;
+
+    loop {
+        while other_in_flight < MAX_CONCURRENT_OTHER_JOBS {
+            let Some(command) = pending.pop_front() else {
                 break;
+            };
+            spawn_other_job(command, &mut jobs, &events, &providers);
+            other_in_flight += 1;
+        }
+
+        tokio::select! {
+            _ = shutdown.recv() => break,
+            completed = jobs.join_next(), if !jobs.is_empty() => {
+                if completed.is_some() {
+                    other_in_flight = other_in_flight.saturating_sub(1);
+                }
             }
+            command = commands.recv(), if pending.len() < COMMAND_CAPACITY => {
+                let Ok(command) = command else {
+                    break;
+                };
+                match command {
+                    RuntimeCommand::Search { generation, query } => {
+                        if let Some(job) = search_job.take() {
+                            job.abort();
+                            _ = job.await;
+                        }
+                        let events = events.clone();
+                        let providers = providers.clone();
+                        search_job = Some(tokio::spawn(async move {
+                            send_search(generation, query, &providers, &events).await;
+                        }));
+                    }
+                    RuntimeCommand::Snapshot { .. } | RuntimeCommand::History { .. } => {
+                        if other_in_flight < MAX_CONCURRENT_OTHER_JOBS {
+                            spawn_other_job(command, &mut jobs, &events, &providers);
+                            other_in_flight += 1;
+                        } else {
+                            pending.push_back(command);
+                        }
+                    }
+                    RuntimeCommand::SetVisible(_) | RuntimeCommand::SetCryptoWatchlist(_) => {}
+                    RuntimeCommand::Shutdown => break,
+                }
+            }
+        }
+    }
+
+    if let Some(job) = search_job {
+        job.abort();
+        _ = job.await;
+    }
+    jobs.abort_all();
+    while jobs.join_next().await.is_some() {}
+}
+
+fn spawn_other_job(
+    command: RuntimeCommand,
+    jobs: &mut tokio::task::JoinSet<()>,
+    events: &Sender<RuntimeEvent>,
+    providers: &ProviderSet,
+) {
+    let events = events.clone();
+    let providers = providers.clone();
+    jobs.spawn(async move {
+        match command {
+            RuntimeCommand::Snapshot { instruments } => {
+                send_snapshots(instruments, &providers, &events).await;
+            }
+            RuntimeCommand::History {
+                generation,
+                instrument,
+                period,
+            } => {
+                send_history(generation, instrument, period, &providers, &events).await;
+            }
+            RuntimeCommand::Search { .. }
+            | RuntimeCommand::SetVisible(_)
+            | RuntimeCommand::SetCryptoWatchlist(_)
+            | RuntimeCommand::Shutdown => {}
         }
     });
 }
 
-async fn handle_command(
-    command: RuntimeCommand,
-    events: &Sender<RuntimeEvent>,
+async fn send_search(
+    generation: GenerationId,
+    query: String,
     providers: &ProviderSet,
-    _repository: &Arc<dyn StateRepository>,
-) -> bool {
-    match command {
-        RuntimeCommand::Search { generation, query } => {
-            let (equities, crypto) = tokio::join!(
-                providers.equities.search(&query),
-                providers.crypto.search(&query)
-            );
-            let mut results = Vec::new();
-            let mut warnings = Vec::new();
-            collect_search_outcome(DataSource::Yahoo, equities, &mut results, &mut warnings);
-            collect_search_outcome(DataSource::Binance, crypto, &mut results, &mut warnings);
-            _ = events
-                .send(RuntimeEvent::SearchCompleted {
-                    generation,
-                    results: rank_search_results(&query, results),
-                    warnings,
-                })
-                .await;
-        }
-        RuntimeCommand::Snapshot { instruments } => {
-            send_snapshots(instruments, providers, events).await;
-        }
-        RuntimeCommand::History {
+    events: &Sender<RuntimeEvent>,
+) {
+    let (equities, crypto) = tokio::join!(
+        providers.equities.search(&query),
+        providers.crypto.search(&query)
+    );
+    let mut results = Vec::new();
+    let mut warnings = Vec::new();
+    collect_search_outcome(DataSource::Yahoo, equities, &mut results, &mut warnings);
+    collect_search_outcome(DataSource::Binance, crypto, &mut results, &mut warnings);
+    _ = events
+        .send(RuntimeEvent::SearchCompleted {
             generation,
-            instrument,
-            period,
-        } => {
-            let key = ChartRequestKey {
-                instrument_id: instrument.id.clone(),
-                period,
-            };
-            let outcome = match instrument.id.asset_class() {
-                AssetClass::Equity => providers.equities.history(&instrument, period).await,
-                AssetClass::Crypto => providers.crypto.history(&instrument, period).await,
-            };
-            let event = match outcome {
-                Ok(candles) => RuntimeEvent::HistoryCompleted {
-                    generation,
-                    key,
-                    candles,
-                },
-                Err(error) => RuntimeEvent::HistoryFailed {
-                    generation,
-                    key,
-                    error,
-                },
-            };
-            _ = events.send(event).await;
-        }
-        RuntimeCommand::SetVisible(_) | RuntimeCommand::SetCryptoWatchlist(_) => {}
-        RuntimeCommand::Shutdown => return false,
-    }
-    true
+            results: rank_search_results(&query, results),
+            warnings,
+        })
+        .await;
+}
+
+async fn send_history(
+    generation: GenerationId,
+    instrument: Instrument,
+    period: ChartPeriod,
+    providers: &ProviderSet,
+    events: &Sender<RuntimeEvent>,
+) {
+    let key = ChartRequestKey {
+        instrument_id: instrument.id.clone(),
+        period,
+    };
+    let outcome = match instrument.id.asset_class() {
+        AssetClass::Equity => providers.equities.history(&instrument, period).await,
+        AssetClass::Crypto => providers.crypto.history(&instrument, period).await,
+    };
+    let event = match outcome {
+        Ok(candles) => RuntimeEvent::HistoryCompleted {
+            generation,
+            key,
+            candles,
+        },
+        Err(error) => RuntimeEvent::HistoryFailed {
+            generation,
+            key,
+            error,
+        },
+    };
+    _ = events.send(event).await;
 }
 
 fn collect_search_outcome(
@@ -440,9 +521,10 @@ mod tests {
     use super::{ProviderSet, RuntimeCommand, RuntimeEvent, RuntimeHandle};
     use async_trait::async_trait;
     use kabu_core::{
-        CachedMarketState, Candle, ChartHistory, ChartPeriod, DataSource, Instrument,
-        InstrumentSearch, MarketDataError, MarketDataErrorKind, PersistedState, PersistenceError,
-        Quote, QuoteSnapshots, QuoteStream, QuoteSubscription, SearchResult, StateRepository,
+        CachedMarketState, Candle, ChartHistory, ChartPeriod, DataSource, Instrument, InstrumentId,
+        InstrumentSearch, MarketDataError, MarketDataErrorKind, MarketState, PersistedState,
+        PersistenceError, Quote, QuoteSnapshots, QuoteStream, QuoteSubscription, SearchResult,
+        StateRepository,
     };
     use std::{
         sync::{
@@ -630,6 +712,202 @@ mod tests {
         assert!(runtime.is_shutdown());
     }
 
+    #[test]
+    fn snapshot_and_history_commands_overlap_and_emit_success_events() {
+        let probe = Arc::new(OperationProbe::default());
+        let providers = ProviderSet {
+            equities: Arc::new(ControlledProvider::new(
+                DataSource::Yahoo,
+                probe.clone(),
+                Duration::from_millis(80),
+            )),
+            crypto: Arc::new(ControlledProvider::new(
+                DataSource::Binance,
+                Arc::new(OperationProbe::default()),
+                Duration::ZERO,
+            )),
+        };
+        let runtime = RuntimeHandle::start(providers, Arc::new(NoopRepository)).expect("runtime");
+        let instrument = Instrument::equity("AAPL", Some("NASDAQ"), "Apple", "USD").expect("AAPL");
+        let generation = kabu_core::Generation::default().next();
+
+        runtime
+            .send(RuntimeCommand::Snapshot {
+                instruments: vec![instrument.clone()],
+            })
+            .expect("snapshot");
+        runtime
+            .send(RuntimeCommand::History {
+                generation,
+                instrument: instrument.clone(),
+                period: ChartPeriod::OneDay,
+            })
+            .expect("history");
+
+        let events = [
+            runtime.events().recv_blocking().expect("first event"),
+            runtime.events().recv_blocking().expect("second event"),
+        ];
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, RuntimeEvent::Quotes(quotes) if quotes.len() == 1 && quotes[0].instrument_id == instrument.id))
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::HistoryCompleted { generation: event_generation, key, candles }
+                if *event_generation == generation
+                    && key.instrument_id == instrument.id
+                    && key.period == ChartPeriod::OneDay
+                    && candles.len() == 1
+        )));
+        assert!(
+            runtime.events().try_recv().is_err(),
+            "exactly one snapshot and one history completion"
+        );
+        assert_eq!(probe.maximum.load(Ordering::SeqCst), 2);
+        runtime.shutdown();
+    }
+
+    #[test]
+    fn newer_search_cancels_the_prior_generation_before_it_can_emit() {
+        let probe = Arc::new(OperationProbe::default());
+        let providers = ProviderSet {
+            equities: Arc::new(
+                ControlledProvider::new(DataSource::Yahoo, probe.clone(), Duration::ZERO)
+                    .with_slow_search(Duration::from_millis(400)),
+            ),
+            crypto: Arc::new(
+                ControlledProvider::new(DataSource::Binance, probe.clone(), Duration::ZERO)
+                    .with_slow_search(Duration::from_millis(400)),
+            ),
+        };
+        let runtime = RuntimeHandle::start(providers, Arc::new(NoopRepository)).expect("runtime");
+        let mut generations = kabu_core::Generation::default();
+        let old = generations.next();
+        let current = generations.next();
+        runtime
+            .send(RuntimeCommand::Search {
+                generation: old,
+                query: "old".into(),
+            })
+            .expect("old search");
+        wait_for_counter(&probe.started, 2);
+
+        runtime
+            .send(RuntimeCommand::Search {
+                generation: current,
+                query: "new".into(),
+            })
+            .expect("new search");
+
+        let RuntimeEvent::SearchCompleted { generation, .. } =
+            runtime.events().recv_blocking().expect("current result")
+        else {
+            panic!("expected search completion");
+        };
+        assert_eq!(generation, current);
+        assert_eq!(probe.cancelled.load(Ordering::SeqCst), 2);
+        assert!(runtime.events().try_recv().is_err());
+        runtime.shutdown();
+    }
+
+    #[test]
+    fn shutdown_cancels_and_drains_every_tracked_job() {
+        let probe = Arc::new(OperationProbe::default());
+        let providers = ProviderSet {
+            equities: Arc::new(
+                ControlledProvider::new(DataSource::Yahoo, probe.clone(), Duration::from_secs(2))
+                    .with_slow_search(Duration::from_secs(2)),
+            ),
+            crypto: Arc::new(
+                ControlledProvider::new(DataSource::Binance, probe.clone(), Duration::ZERO)
+                    .with_slow_search(Duration::from_secs(2)),
+            ),
+        };
+        let runtime = RuntimeHandle::start(providers, Arc::new(NoopRepository)).expect("runtime");
+        let instrument = Instrument::equity("AAPL", Some("NASDAQ"), "Apple", "USD").expect("AAPL");
+        runtime
+            .send(RuntimeCommand::Search {
+                generation: kabu_core::Generation::default().next(),
+                query: "old".into(),
+            })
+            .expect("search");
+        runtime
+            .send(RuntimeCommand::Snapshot {
+                instruments: vec![instrument.clone()],
+            })
+            .expect("snapshot");
+        runtime
+            .send(RuntimeCommand::History {
+                generation: kabu_core::Generation::default().next(),
+                instrument,
+                period: ChartPeriod::OneDay,
+            })
+            .expect("history");
+        wait_for_counter(&probe.started, 4);
+
+        runtime.shutdown();
+
+        assert_eq!(probe.active.load(Ordering::SeqCst), 0);
+        assert_eq!(probe.cancelled.load(Ordering::SeqCst), 4);
+        assert!(runtime.is_shutdown());
+    }
+
+    #[test]
+    fn snapshot_and_history_failures_preserve_typed_event_shapes() {
+        let provider = ControlledProvider::new(
+            DataSource::Yahoo,
+            Arc::new(OperationProbe::default()),
+            Duration::ZERO,
+        )
+        .with_snapshot_failure()
+        .with_history_failure();
+        let providers = ProviderSet {
+            equities: Arc::new(provider),
+            crypto: Arc::new(ControlledProvider::new(
+                DataSource::Binance,
+                Arc::new(OperationProbe::default()),
+                Duration::ZERO,
+            )),
+        };
+        let runtime = RuntimeHandle::start(providers, Arc::new(NoopRepository)).expect("runtime");
+        let instrument = Instrument::equity("AAPL", Some("NASDAQ"), "Apple", "USD").expect("AAPL");
+        let generation = kabu_core::Generation::default().next();
+        runtime
+            .send(RuntimeCommand::Snapshot {
+                instruments: vec![instrument.clone()],
+            })
+            .expect("snapshot");
+        runtime
+            .send(RuntimeCommand::History {
+                generation,
+                instrument: instrument.clone(),
+                period: ChartPeriod::OneDay,
+            })
+            .expect("history");
+
+        let events = [
+            runtime.events().recv_blocking().expect("first failure"),
+            runtime.events().recv_blocking().expect("second failure"),
+        ];
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::QuoteError { instrument_ids, error }
+                if instrument_ids == std::slice::from_ref(&instrument.id)
+                    && error.kind == MarketDataErrorKind::Unavailable
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::HistoryFailed { generation: event_generation, key, error }
+                if *event_generation == generation
+                    && key.instrument_id == instrument.id
+                    && key.period == ChartPeriod::OneDay
+                    && error.kind == MarketDataErrorKind::Timeout
+        )));
+        runtime.shutdown();
+    }
+
     #[derive(Clone)]
     struct FakeProvider {
         source: DataSource,
@@ -729,6 +1007,198 @@ mod tests {
                 message: format!("{:?} stream unavailable in test", self.source),
                 retry_after: None,
             })
+        }
+    }
+
+    #[derive(Default)]
+    struct OperationProbe {
+        active: AtomicUsize,
+        maximum: AtomicUsize,
+        started: AtomicUsize,
+        cancelled: AtomicUsize,
+    }
+
+    struct OperationGuard {
+        probe: Arc<OperationProbe>,
+        completed: bool,
+    }
+
+    impl OperationGuard {
+        fn begin(probe: Arc<OperationProbe>) -> Self {
+            let active = probe.active.fetch_add(1, Ordering::SeqCst) + 1;
+            probe.maximum.fetch_max(active, Ordering::SeqCst);
+            probe.started.fetch_add(1, Ordering::SeqCst);
+            Self {
+                probe,
+                completed: false,
+            }
+        }
+
+        fn complete(mut self) {
+            self.completed = true;
+        }
+    }
+
+    impl Drop for OperationGuard {
+        fn drop(&mut self) {
+            self.probe.active.fetch_sub(1, Ordering::SeqCst);
+            if !self.completed {
+                self.probe.cancelled.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct ControlledProvider {
+        source: DataSource,
+        probe: Arc<OperationProbe>,
+        operation_delay: Duration,
+        slow_search_delay: Duration,
+        fail_snapshot: bool,
+        fail_history: bool,
+    }
+
+    impl ControlledProvider {
+        fn new(source: DataSource, probe: Arc<OperationProbe>, operation_delay: Duration) -> Self {
+            Self {
+                source,
+                probe,
+                operation_delay,
+                slow_search_delay: Duration::ZERO,
+                fail_snapshot: false,
+                fail_history: false,
+            }
+        }
+
+        fn with_slow_search(mut self, delay: Duration) -> Self {
+            self.slow_search_delay = delay;
+            self
+        }
+
+        fn with_snapshot_failure(mut self) -> Self {
+            self.fail_snapshot = true;
+            self
+        }
+
+        fn with_history_failure(mut self) -> Self {
+            self.fail_history = true;
+            self
+        }
+
+        async fn controlled_delay(&self, delay: Duration) -> OperationGuard {
+            let guard = OperationGuard::begin(self.probe.clone());
+            tokio::time::sleep(delay).await;
+            guard
+        }
+    }
+
+    #[async_trait]
+    impl InstrumentSearch for ControlledProvider {
+        async fn search(&self, query: &str) -> Result<Vec<SearchResult>, MarketDataError> {
+            let delay = if query == "old" {
+                self.slow_search_delay
+            } else {
+                Duration::ZERO
+            };
+            let guard = self.controlled_delay(delay).await;
+            guard.complete();
+            Ok(match self.source {
+                DataSource::Yahoo => vec![nvda_result()],
+                DataSource::Binance => vec![btc_result()],
+            })
+        }
+    }
+
+    #[async_trait]
+    impl QuoteSnapshots for ControlledProvider {
+        async fn snapshots(
+            &self,
+            instruments: &[Instrument],
+        ) -> Result<Vec<Quote>, MarketDataError> {
+            if instruments.is_empty() {
+                return Ok(Vec::new());
+            }
+            let guard = self.controlled_delay(self.operation_delay).await;
+            guard.complete();
+            if self.fail_snapshot {
+                return Err(test_error(MarketDataErrorKind::Unavailable));
+            }
+            Ok(instruments
+                .iter()
+                .map(|instrument| test_quote(instrument.id.clone(), self.source))
+                .collect())
+        }
+    }
+
+    #[async_trait]
+    impl ChartHistory for ControlledProvider {
+        async fn history(
+            &self,
+            _: &Instrument,
+            _: ChartPeriod,
+        ) -> Result<Vec<Candle>, MarketDataError> {
+            let guard = self.controlled_delay(self.operation_delay).await;
+            guard.complete();
+            if self.fail_history {
+                Err(test_error(MarketDataErrorKind::Timeout))
+            } else {
+                Ok(vec![test_candle()])
+            }
+        }
+    }
+
+    #[async_trait]
+    impl QuoteSubscription for ControlledProvider {
+        async fn subscribe(&self, _: &[Instrument]) -> Result<QuoteStream, MarketDataError> {
+            Err(test_error(MarketDataErrorKind::Unavailable))
+        }
+    }
+
+    fn wait_for_counter(counter: &AtomicUsize, expected: usize) {
+        let started = Instant::now();
+        while counter.load(Ordering::SeqCst) < expected
+            && started.elapsed() < Duration::from_secs(1)
+        {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(counter.load(Ordering::SeqCst), expected);
+    }
+
+    fn test_error(kind: MarketDataErrorKind) -> MarketDataError {
+        MarketDataError {
+            kind,
+            message: "controlled provider failure".into(),
+            retry_after: None,
+        }
+    }
+
+    fn test_quote(instrument_id: InstrumentId, source: DataSource) -> Quote {
+        let timestamp = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp");
+        Quote {
+            instrument_id,
+            last: 100.0,
+            previous_close: Some(99.0),
+            open: None,
+            high: None,
+            low: None,
+            volume: None,
+            currency: "USD".into(),
+            source,
+            market_state: MarketState::Regular,
+            provider_timestamp: timestamp,
+            received_at: timestamp,
+            provider_delayed: false,
+        }
+    }
+
+    fn test_candle() -> Candle {
+        Candle {
+            starts_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp"),
+            open: 99.0,
+            high: 102.0,
+            low: 98.0,
+            close: 100.0,
+            volume: 1_000.0,
         }
     }
 

@@ -393,6 +393,49 @@ fn search_input_debounces_for_exactly_250_milliseconds(cx: &mut gpui::TestAppCon
 }
 
 #[gpui::test]
+fn closing_search_cancels_the_pending_debounce_task(cx: &mut gpui::TestAppContext) {
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        kabu_app::commands::init(cx);
+    });
+    let runtime = RuntimeHandle::default();
+    let model = cx.update(|cx| {
+        cx.new(|_| {
+            AppModel::new(
+                PersistedState::starter(),
+                CachedMarketState::default(),
+                runtime.clone(),
+            )
+        })
+    });
+    let executor = cx.executor();
+    let shell_slot = Rc::new(RefCell::new(None));
+    let shell_capture = shell_slot.clone();
+    let (_, window_cx) = cx.add_window_view(move |window, cx| {
+        let shell = cx.new(|cx| AppShell::with_model(model.clone(), window, cx));
+        *shell_capture.borrow_mut() = Some(shell.clone());
+        Root::new(shell, window, cx)
+    });
+    let shell: Entity<AppShell> = shell_slot.borrow().clone().expect("shell");
+
+    window_cx.simulate_keystrokes("cmd-k");
+    window_cx.refresh().expect("render search overlay");
+    window_cx.simulate_input("nv");
+    window_cx.run_until_parked();
+    window_cx.simulate_keystrokes("escape");
+    window_cx.run_until_parked();
+    executor.advance_clock(Duration::from_millis(250));
+    window_cx.run_until_parked();
+
+    assert!(runtime.recorded_commands().is_empty());
+    let model = shell.update(window_cx, |shell, _| shell.model());
+    model.read_with(window_cx, |model, _| {
+        assert!(model.search().query().is_empty());
+        assert!(!model.search().is_loading());
+    });
+}
+
+#[gpui::test]
 fn arrows_and_return_select_an_existing_result_and_close_search(cx: &mut gpui::TestAppContext) {
     cx.update(|cx| {
         gpui_component::init(cx);

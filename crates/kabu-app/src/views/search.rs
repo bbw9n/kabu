@@ -5,8 +5,8 @@ use crate::{
 use gpui::prelude::FluentBuilder;
 use gpui::{
     App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    InteractiveElement, IntoElement, ParentElement, Render, Styled, Subscription, Window, div, px,
-    size,
+    InteractiveElement, IntoElement, ParentElement, Render, Styled, Subscription, Task, Window,
+    div, px, size,
 };
 use gpui_component::{
     ActiveTheme as _, StyledExt as _,
@@ -29,6 +29,7 @@ pub struct SearchOverlay {
     model: Entity<AppModel>,
     input: Entity<InputState>,
     selected_index: usize,
+    search_debounce_task: Task<()>,
     _input_subscription: Subscription,
 }
 
@@ -51,6 +52,7 @@ impl SearchOverlay {
             model,
             input,
             selected_index: 0,
+            search_debounce_task: Task::ready(()),
             _input_subscription: input_subscription,
         }
     }
@@ -64,13 +66,18 @@ impl SearchOverlay {
     }
 
     fn input_changed(&mut self, input: &Entity<InputState>, cx: &mut Context<Self>) {
+        self.search_debounce_task = Task::ready(());
         let query = input.read(cx).value();
         let generation = self
             .model
             .update(cx, |model, _| model.set_search_query(query.as_str()));
         self.selected_index = 0;
+        if query.trim().is_empty() {
+            cx.notify();
+            return;
+        }
         let debounce = cx.background_executor().timer(SEARCH_DEBOUNCE);
-        cx.spawn(async move |overlay, cx| {
+        self.search_debounce_task = cx.spawn(async move |overlay, cx| {
             debounce.await;
             _ = cx.update(|cx| {
                 if let Some(overlay) = overlay.upgrade() {
@@ -82,9 +89,16 @@ impl SearchOverlay {
                     });
                 }
             });
-        })
-        .detach();
+        });
         cx.notify();
+    }
+
+    pub fn cancel_pending_search(&mut self, cx: &mut Context<Self>) {
+        self.search_debounce_task = Task::ready(());
+        self.model.update(cx, |model, cx| {
+            model.cancel_pending_search();
+            cx.notify();
+        });
     }
 
     fn select_previous(&mut self, cx: &mut Context<Self>) {
@@ -185,6 +199,8 @@ impl Render for SearchOverlay {
             search.results().len()
         ]);
         let warnings = search.provider_warnings().to_vec();
+        let terminal_error = search.terminal_error().map(str::to_string);
+        let has_terminal_error = terminal_error.is_some();
 
         div()
             .id("search-overlay")
@@ -233,6 +249,16 @@ impl Render for SearchOverlay {
                             .text_color(cx.theme().warning)
                             .child(warning.message)
                     }))
+                    .children(terminal_error.map(|message| {
+                        div()
+                            .rounded_md()
+                            .bg(cx.theme().danger.opacity(0.12))
+                            .px_3()
+                            .py_2()
+                            .text_sm()
+                            .text_color(cx.theme().danger)
+                            .child(message)
+                    }))
                     .when(search.is_loading(), |this| {
                         this.child(div().flex().flex_col().gap_2().children(
                             (0..3).map(|_| Skeleton::new().h(px(SEARCH_ROW_HEIGHT)).w_full()),
@@ -241,7 +267,8 @@ impl Render for SearchOverlay {
                     .when(
                         !search.is_loading()
                             && !search.query().is_empty()
-                            && search.results().is_empty(),
+                            && search.results().is_empty()
+                            && !has_terminal_error,
                         |this| {
                             this.child(
                                 div()

@@ -1,11 +1,11 @@
 use kabu_app::{
     app_model::{AppModel, AppModelError, clamp_window_size_to_display},
-    runtime::{ProviderWarning, RuntimeCommand, RuntimeHandle},
+    runtime::{ProviderWarning, RuntimeCommand, RuntimeEvent, RuntimeHandle},
 };
 use kabu_core::{
-    CachedMarketState, ChartPeriod, DataSource, Instrument, InstrumentId, MarketDataErrorKind,
-    MarketState, PersistedState, PersistenceError, Quote, SearchResult, StateRepository,
-    ThemePreference, Watchlist,
+    CachedMarketState, Candle, ChartPeriod, ChartRequestKey, DataSource, Instrument, InstrumentId,
+    MarketDataError, MarketDataErrorKind, MarketState, PersistedState, PersistenceError, Quote,
+    SearchResult, StateRepository, ThemePreference, Watchlist,
 };
 use std::{
     io,
@@ -411,6 +411,191 @@ fn add_persistence_failure_keeps_selection_and_still_requests_live_data() {
     ));
 }
 
+#[test]
+fn full_runtime_queue_finishes_search_with_a_sanitized_terminal_error() {
+    let runtime = RuntimeHandle::default();
+    for _ in 0..64 {
+        runtime
+            .send(RuntimeCommand::SetVisible(true))
+            .expect("fill recording queue");
+    }
+    let mut model = AppModel::new(
+        PersistedState::starter(),
+        CachedMarketState::default(),
+        runtime,
+    );
+
+    model.set_search_query("private-full-query");
+    model.advance_search_clock(Duration::from_millis(250));
+
+    assert!(!model.search().is_loading());
+    assert_eq!(
+        model.search().terminal_error(),
+        Some("Search is temporarily unavailable.")
+    );
+    assert!(
+        !model
+            .warnings()
+            .last()
+            .expect("runtime warning")
+            .message
+            .contains("private-full-query")
+    );
+}
+
+#[test]
+fn closed_runtime_finishes_search_with_a_sanitized_terminal_error() {
+    let runtime = RuntimeHandle::default();
+    runtime.shutdown();
+    let mut model = AppModel::new(
+        PersistedState::starter(),
+        CachedMarketState::default(),
+        runtime,
+    );
+
+    model.set_search_query("private-closed-query");
+    model.advance_search_clock(Duration::from_millis(250));
+
+    assert!(!model.search().is_loading());
+    assert_eq!(
+        model.search().terminal_error(),
+        Some("Search is temporarily unavailable.")
+    );
+    assert!(
+        !model
+            .warnings()
+            .last()
+            .expect("runtime warning")
+            .message
+            .contains("private-closed-query")
+    );
+}
+
+#[test]
+fn current_history_completion_populates_the_matching_chart_cache() {
+    let mut model = AppModel::new(
+        PersistedState::starter(),
+        CachedMarketState::default(),
+        fake_runtime(),
+    );
+    let instrument = model.selected().expect("selected instrument").clone();
+    let generation = model.request_history(instrument.clone(), ChartPeriod::OneMonth);
+    let key = ChartRequestKey {
+        instrument_id: instrument.id,
+        period: ChartPeriod::OneMonth,
+    };
+    let candles = vec![history_candle(101.0)];
+
+    model.apply_runtime_event(RuntimeEvent::HistoryCompleted {
+        generation,
+        key: key.clone(),
+        candles: candles.clone(),
+    });
+
+    assert_eq!(
+        model.charts().get(&key).expect("cached chart").candles,
+        candles
+    );
+}
+
+#[test]
+fn superseded_history_completion_and_failure_are_ignored() {
+    let mut model = AppModel::new(
+        PersistedState::starter(),
+        CachedMarketState::default(),
+        fake_runtime(),
+    );
+    let instrument = model.selected().expect("selected instrument").clone();
+    let old = model.request_history(instrument.clone(), ChartPeriod::OneDay);
+    let old_key = ChartRequestKey {
+        instrument_id: instrument.id.clone(),
+        period: ChartPeriod::OneDay,
+    };
+    let _current = model.request_history(instrument, ChartPeriod::OneWeek);
+
+    model.apply_runtime_event(RuntimeEvent::HistoryCompleted {
+        generation: old,
+        key: old_key.clone(),
+        candles: vec![history_candle(99.0)],
+    });
+    model.apply_runtime_event(RuntimeEvent::HistoryFailed {
+        generation: old,
+        key: old_key.clone(),
+        error: market_error(MarketDataErrorKind::Timeout),
+    });
+
+    assert!(!model.charts().contains_key(&old_key));
+    assert!(model.warnings().is_empty());
+}
+
+#[test]
+fn current_history_failure_finishes_without_mutating_cached_chart() {
+    let mut cache = CachedMarketState::default();
+    let instrument = PersistedState::starter()
+        .watchlist
+        .selected()
+        .expect("starter selection")
+        .clone();
+    let key = ChartRequestKey {
+        instrument_id: instrument.id.clone(),
+        period: ChartPeriod::OneYear,
+    };
+    let original = kabu_core::CachedChart {
+        candles: vec![history_candle(88.0)],
+        fetched_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp"),
+    };
+    cache.charts.insert(key.clone(), original.clone());
+    let mut model = AppModel::new(PersistedState::starter(), cache, fake_runtime());
+    let generation = model.request_history(instrument, ChartPeriod::OneYear);
+
+    model.apply_runtime_event(RuntimeEvent::HistoryFailed {
+        generation,
+        key: key.clone(),
+        error: market_error(MarketDataErrorKind::Unavailable),
+    });
+
+    assert_eq!(model.charts().get(&key), Some(&original));
+    assert_eq!(
+        model.warnings().last().expect("history warning").message,
+        "Chart history is temporarily unavailable."
+    );
+}
+
+#[test]
+fn adding_new_crypto_requests_snapshot_complete_crypto_watchlist_and_one_day_history() {
+    let runtime = RuntimeHandle::default();
+    let mut model = AppModel::new(
+        PersistedState::starter(),
+        CachedMarketState::default(),
+        runtime.clone(),
+    );
+    let generation = model.begin_search("sol");
+    let result = sol_result();
+    model.apply_search_results(generation, vec![result.clone()], Vec::new());
+
+    model.add_search_result(0).expect("add SOL");
+
+    let commands = runtime.recorded_commands();
+    assert!(matches!(
+        &commands[0],
+        RuntimeCommand::Snapshot { instruments }
+            if instruments.last().map(|instrument| &instrument.id) == Some(&result.instrument.id)
+    ));
+    assert!(matches!(
+        &commands[1],
+        RuntimeCommand::SetCryptoWatchlist(instruments)
+            if instruments
+                .iter()
+                .map(|instrument| instrument.id.canonical_symbol())
+                .collect::<Vec<_>>() == ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
+    ));
+    assert!(matches!(
+        &commands[2],
+        RuntimeCommand::History { instrument, period: ChartPeriod::OneDay, .. }
+            if instrument.id == result.instrument.id
+    ));
+}
+
 fn fake_runtime() -> RuntimeHandle {
     RuntimeHandle::default()
 }
@@ -456,6 +641,33 @@ fn msft_result() -> SearchResult {
         instrument: Instrument::equity("MSFT", Some("NASDAQ"), "Microsoft", "USD").expect("MSFT"),
         source: DataSource::Yahoo,
         venue_label: "NASDAQ".into(),
+    }
+}
+
+fn sol_result() -> SearchResult {
+    SearchResult {
+        instrument: Instrument::crypto("SOL", "USDT", "Solana").expect("SOL"),
+        source: DataSource::Binance,
+        venue_label: "Binance".into(),
+    }
+}
+
+fn history_candle(close: f64) -> Candle {
+    Candle {
+        starts_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp"),
+        open: close - 1.0,
+        high: close + 1.0,
+        low: close - 2.0,
+        close,
+        volume: 1_000.0,
+    }
+}
+
+fn market_error(kind: MarketDataErrorKind) -> MarketDataError {
+    MarketDataError {
+        kind,
+        message: "controlled history error".into(),
+        retry_after: None,
     }
 }
 

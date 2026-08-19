@@ -1,4 +1,6 @@
-use crate::runtime::{ProviderWarning, RuntimeCommand, RuntimeEvent, RuntimeHandle};
+use crate::runtime::{
+    ProviderWarning, RuntimeCommand, RuntimeEvent, RuntimeHandle, RuntimeSendError,
+};
 use kabu_core::{
     AddOutcome, AssetClass, CachedChart, CachedMarketState, ChartPeriod, ChartRequestKey,
     Generation, GenerationId, Instrument, InstrumentId, PersistedState, PersistenceError, Quote,
@@ -40,6 +42,7 @@ pub struct SearchState {
     query: String,
     results: Vec<SearchResult>,
     provider_warnings: Vec<ProviderWarning>,
+    terminal_error: Option<String>,
     loading: bool,
 }
 
@@ -58,6 +61,10 @@ impl SearchState {
 
     pub fn provider_warnings(&self) -> &[ProviderWarning] {
         &self.provider_warnings
+    }
+
+    pub fn terminal_error(&self) -> Option<&str> {
+        self.terminal_error.as_deref()
     }
 }
 
@@ -84,6 +91,7 @@ pub struct AppModel {
     search: SearchState,
     search_generation: Generation,
     history_generation: Generation,
+    current_history: Option<(GenerationId, ChartRequestKey)>,
     pending_search: Option<PendingSearch>,
     runtime: RuntimeHandle,
     repository: Option<Arc<dyn StateRepository>>,
@@ -155,6 +163,7 @@ impl AppModel {
             search: SearchState::default(),
             search_generation: Generation::default(),
             history_generation: Generation::default(),
+            current_history: None,
             pending_search: None,
             runtime,
             repository,
@@ -243,8 +252,13 @@ impl AppModel {
         self.search.query = query.as_ref().trim().to_string();
         self.search.results.clear();
         self.search.provider_warnings.clear();
+        self.search.terminal_error = None;
         self.search.loading = !self.search.query.is_empty();
         generation
+    }
+
+    pub fn cancel_pending_search(&mut self) {
+        self.begin_search("");
     }
 
     pub fn advance_search_clock(&mut self, elapsed: Duration) {
@@ -269,10 +283,16 @@ impl AppModel {
             self.pending_search = Some(pending);
             return;
         }
-        self.send_runtime(RuntimeCommand::Search {
-            generation,
-            query: pending.query,
-        });
+        if self
+            .send_runtime(RuntimeCommand::Search {
+                generation,
+                query: pending.query,
+            })
+            .is_err()
+        {
+            self.search.loading = false;
+            self.search.terminal_error = Some("Search is temporarily unavailable.".into());
+        }
     }
 
     pub fn apply_search_results(
@@ -286,6 +306,7 @@ impl AppModel {
         }
         self.search.results = results;
         self.search.provider_warnings = warnings;
+        self.search.terminal_error = None;
         self.search.loading = false;
     }
 
@@ -305,11 +326,11 @@ impl AppModel {
         let persistence_result = self.persist_state();
 
         if matches!(outcome, AddOutcome::Added { .. }) {
-            self.send_runtime(RuntimeCommand::Snapshot {
+            _ = self.send_runtime(RuntimeCommand::Snapshot {
                 instruments: self.watchlist.instruments().to_vec(),
             });
             if result.instrument.id.asset_class() == AssetClass::Crypto {
-                self.send_runtime(RuntimeCommand::SetCryptoWatchlist(
+                _ = self.send_runtime(RuntimeCommand::SetCryptoWatchlist(
                     self.watchlist
                         .instruments()
                         .iter()
@@ -319,13 +340,28 @@ impl AppModel {
                 ));
             }
         }
-        let generation = self.history_generation.next();
-        self.send_runtime(RuntimeCommand::History {
-            generation,
-            instrument: result.instrument,
-            period: ChartPeriod::OneDay,
-        });
+        self.request_history(result.instrument, ChartPeriod::OneDay);
         persistence_result
+    }
+
+    pub fn request_history(&mut self, instrument: Instrument, period: ChartPeriod) -> GenerationId {
+        let generation = self.history_generation.next();
+        let key = ChartRequestKey {
+            instrument_id: instrument.id.clone(),
+            period,
+        };
+        self.current_history = Some((generation, key));
+        if self
+            .send_runtime(RuntimeCommand::History {
+                generation,
+                instrument,
+                period,
+            })
+            .is_err()
+        {
+            self.current_history = None;
+        }
+        generation
     }
 
     pub fn apply_runtime_event(&mut self, event: RuntimeEvent) {
@@ -349,10 +385,32 @@ impl AppModel {
                     message: "Some quotes are temporarily unavailable.".into(),
                 });
             }
-            RuntimeEvent::HistoryCompleted { .. } => {}
-            RuntimeEvent::HistoryFailed { .. } => self.warnings.push(AppWarning {
-                message: "Chart history is temporarily unavailable.".into(),
-            }),
+            RuntimeEvent::HistoryCompleted {
+                generation,
+                key,
+                candles,
+            } => {
+                if self.history_is_current(generation, &key) {
+                    self.charts.insert(
+                        key,
+                        CachedChart {
+                            candles,
+                            fetched_at: chrono::Utc::now(),
+                        },
+                    );
+                    self.current_history = None;
+                }
+            }
+            RuntimeEvent::HistoryFailed {
+                generation, key, ..
+            } => {
+                if self.history_is_current(generation, &key) {
+                    self.current_history = None;
+                    self.warnings.push(AppWarning {
+                        message: "Chart history is temporarily unavailable.".into(),
+                    });
+                }
+            }
             RuntimeEvent::StreamStatus(_) => {}
         }
     }
@@ -487,12 +545,20 @@ impl AppModel {
         }
     }
 
-    fn send_runtime(&mut self, command: RuntimeCommand) {
-        if self.runtime.send(command).is_err() {
+    fn history_is_current(&self, generation: GenerationId, key: &ChartRequestKey) -> bool {
+        self.current_history
+            .as_ref()
+            .is_some_and(|current| current.0 == generation && &current.1 == key)
+    }
+
+    fn send_runtime(&mut self, command: RuntimeCommand) -> Result<(), RuntimeSendError> {
+        let result = self.runtime.send(command);
+        if result.is_err() {
             self.warnings.push(AppWarning {
                 message: "Background market-data work is temporarily unavailable.".into(),
             });
         }
+        result
     }
 }
 

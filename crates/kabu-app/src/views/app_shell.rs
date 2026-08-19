@@ -198,6 +198,8 @@ impl AppShell {
     fn close_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.search_open = false;
         self.focus_search_on_render = false;
+        self.search_overlay
+            .update(cx, |overlay, cx| overlay.cancel_pending_search(cx));
         self.watchlist_focus.focus(window);
         cx.notify();
     }
