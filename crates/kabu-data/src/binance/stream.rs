@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
-use async_channel::Sender;
+use async_channel::{Receiver, Sender};
 use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
 use kabu_core::{
@@ -13,6 +13,9 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 use super::{BinanceClient, catalog::wire_symbol};
 
 const STREAM_ENDPOINT: &str = "Binance stream";
+const QUOTE_CHANNEL_CAPACITY: usize = 256;
+
+type StreamEvent = Result<Quote, MarketDataError>;
 
 #[async_trait::async_trait]
 trait Sleeper: Send + Sync {
@@ -60,7 +63,7 @@ fn subscribe_with_runtime(
 ) -> Result<QuoteStream, MarketDataError> {
     let subscriptions = subscriptions(instruments)?;
     let url = stream_url(client, &subscriptions)?;
-    let (sender, receiver) = async_channel::unbounded();
+    let (sender, receiver) = quote_channel();
     tokio::spawn(run_stream(url, subscriptions, sender, sleeper, jitter));
     Ok(Box::pin(receiver))
 }
@@ -110,7 +113,7 @@ fn stream_url(
 async fn run_stream(
     url: String,
     subscriptions: BTreeMap<String, Instrument>,
-    sender: Sender<Result<Quote, MarketDataError>>,
+    sender: Sender<StreamEvent>,
     sleeper: Arc<dyn Sleeper>,
     jitter: Arc<dyn JitterSource>,
 ) {
@@ -131,20 +134,20 @@ async fn run_stream(
                     Some(Ok(Message::Text(text))) => match decode_ticker(&text, &subscriptions) {
                         Ok(Some(quote)) => {
                             attempt = 0;
-                            if sender.send(Ok(quote)).await.is_err() {
+                            if !send_event(&sender, Ok(quote)).await {
                                 return;
                             }
                         }
                         Ok(None) => {}
                         Err(error) => {
-                            if sender.send(Err(error)).await.is_err() {
+                            if !send_event(&sender, Err(error)).await {
                                 return;
                             }
                         }
                     },
                     Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
                     Some(Ok(Message::Binary(_))) => {
-                        if sender.send(Err(malformed_error())).await.is_err() {
+                        if !send_event(&sender, Err(malformed_error())).await {
                             return;
                         }
                     }
@@ -165,20 +168,28 @@ async fn run_stream(
 }
 
 async fn wait_to_reconnect(
-    sender: &Sender<Result<Quote, MarketDataError>>,
+    sender: &Sender<StreamEvent>,
     retry: &RetryPolicy,
     attempt: usize,
     sleeper: &dyn Sleeper,
     jitter: &dyn JitterSource,
 ) -> Option<Duration> {
     let delay = jittered_delay(retry.base_delay(attempt), jitter.sample());
-    if sender.send(Err(disconnected_error(delay))).await.is_err() {
+    if !send_event(sender, Err(disconnected_error(delay))).await {
         return None;
     }
     tokio::select! {
         _ = sender.closed() => None,
         _ = sleeper.sleep(delay) => Some(delay),
     }
+}
+
+fn quote_channel() -> (Sender<StreamEvent>, Receiver<StreamEvent>) {
+    async_channel::bounded(QUOTE_CHANNEL_CAPACITY)
+}
+
+async fn send_event(sender: &Sender<StreamEvent>, event: StreamEvent) -> bool {
+    sender.send(event).await.is_ok()
 }
 
 fn decode_ticker(
@@ -314,6 +325,60 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn quote_delivery_queue_has_fixed_capacity() {
+        let (sender, _receiver) = quote_channel();
+
+        for _ in 0..256 {
+            sender
+                .try_send(Err(malformed_error()))
+                .expect("queue has remaining capacity");
+        }
+
+        assert_eq!(sender.capacity(), Some(256));
+        assert!(matches!(
+            sender.try_send(Err(malformed_error())),
+            Err(async_channel::TrySendError::Full(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn dropping_backpressured_receiver_stops_producer() {
+        let (sender, receiver) = quote_channel();
+        for _ in 0..256 {
+            sender
+                .try_send(Err(malformed_error()))
+                .expect("queue has remaining capacity");
+        }
+        let observer = sender.clone();
+        let sleeper = Arc::new(RecordingSleeper::default());
+        let task_sleeper = Arc::clone(&sleeper);
+        let jitter = Arc::new(SignalingJitter::default());
+        let task_jitter = Arc::clone(&jitter);
+        let producer = tokio::spawn(async move {
+            run_stream(
+                "not a websocket URL".into(),
+                BTreeMap::new(),
+                sender,
+                task_sleeper,
+                task_jitter,
+            )
+            .await;
+        });
+        jitter.sampled.notified().await;
+        tokio::task::yield_now().await;
+        assert_eq!(observer.len(), 256);
+        assert!(sleeper.delays().is_empty());
+        assert!(!producer.is_finished());
+
+        drop(receiver);
+
+        tokio::time::timeout(Duration::from_secs(1), producer)
+            .await
+            .expect("producer stopped")
+            .expect("producer joined");
+    }
+
     #[tokio::test]
     async fn reconnect_wait_uses_exact_crypto_policy_jitter_and_cancellation() {
         let sleeper = RecordingSleeper::default();
@@ -399,6 +464,18 @@ mod tests {
     impl JitterSource for FixedJitter {
         fn sample(&self) -> f64 {
             self.0
+        }
+    }
+
+    #[derive(Default)]
+    struct SignalingJitter {
+        sampled: Notify,
+    }
+
+    impl JitterSource for SignalingJitter {
+        fn sample(&self) -> f64 {
+            self.sampled.notify_one();
+            0.5
         }
     }
 
