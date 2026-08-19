@@ -96,12 +96,31 @@ impl JsonRepository {
     }
 
     fn back_up_corrupt_file(&self, path: &Path, file_name: &str) -> Result<(), PersistenceError> {
-        let timestamp = Utc::now().format("%Y%m%dT%H%M%SZ");
-        fs::rename(
-            path,
-            self.directory
-                .join(format!("{file_name}.corrupt-{timestamp}")),
-        )?;
+        let timestamp = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+        self.back_up_corrupt_file_at(path, file_name, &timestamp)
+    }
+
+    fn back_up_corrupt_file_at(
+        &self,
+        path: &Path,
+        file_name: &str,
+        timestamp: &str,
+    ) -> Result<(), PersistenceError> {
+        let prefix = format!("{file_name}.corrupt-{timestamp}");
+        let mut suffix = 0_u64;
+        let backup_path = loop {
+            let candidate = match suffix {
+                0 => self.directory.join(&prefix),
+                _ => self.directory.join(format!("{prefix}-{suffix}")),
+            };
+            if !candidate.exists() {
+                break candidate;
+            }
+            suffix = suffix
+                .checked_add(1)
+                .expect("corrupt backup suffixes exhausted");
+        };
+        fs::rename(path, backup_path)?;
         Ok(())
     }
 }
@@ -137,5 +156,38 @@ impl HasSchemaVersion for PersistedState {
 impl HasSchemaVersion for CachedMarketState {
     fn schema_version(&self) -> u32 {
         self.schema_version
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::JsonRepository;
+
+    #[test]
+    fn corrupt_backup_uses_an_incremented_name_when_the_timestamped_path_exists() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state_path = temp.path().join("state.json");
+        std::fs::write(&state_path, b"not json").expect("write corrupt state");
+        std::fs::write(
+            temp.path().join("state.json.corrupt-20260819T010203Z"),
+            b"earlier backup",
+        )
+        .expect("write existing backup");
+        let repo = JsonRepository::at(temp.path());
+
+        repo.back_up_corrupt_file_at(&state_path, "state.json", "20260819T010203Z")
+            .expect("back up corrupt state");
+
+        assert!(!state_path.is_file());
+        assert!(
+            temp.path()
+                .join("state.json.corrupt-20260819T010203Z")
+                .is_file()
+        );
+        assert!(
+            temp.path()
+                .join("state.json.corrupt-20260819T010203Z-1")
+                .is_file()
+        );
     }
 }
