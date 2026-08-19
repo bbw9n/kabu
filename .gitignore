@@ -1,3 +1,4 @@
 .superpowers/
+.worktrees/
 target/
 .DS_Store
