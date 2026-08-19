@@ -46,6 +46,29 @@ pub enum KabuTheme {
     Signal,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ThemeSelection {
+    preference: ThemePreference,
+}
+
+impl ThemeSelection {
+    pub const fn new(preference: ThemePreference) -> Self {
+        Self { preference }
+    }
+
+    pub const fn preference(self) -> ThemePreference {
+        self.preference
+    }
+
+    pub fn set_preference(&mut self, preference: ThemePreference) {
+        self.preference = preference;
+    }
+
+    pub fn resolve(self, appearance: WindowAppearance) -> KabuTheme {
+        KabuTheme::resolve(self.preference, appearance)
+    }
+}
+
 impl KabuTheme {
     pub fn resolve(preference: ThemePreference, appearance: WindowAppearance) -> Self {
         match preference {

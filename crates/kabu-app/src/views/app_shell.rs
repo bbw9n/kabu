@@ -1,10 +1,13 @@
-use gpui::{App, Context, IntoElement, ParentElement as _, Render, Styled as _, Window, div, px};
+use gpui::{
+    App, Context, IntoElement, ParentElement as _, Render, Styled as _, Subscription, Window,
+    WindowAppearance, div, px,
+};
 use gpui_component::{ActiveTheme as _, IconName, StyledExt as _, TitleBar, button::Button};
 use kabu_core::ThemePreference;
 
 use crate::{
-    commands::{SelectGraphiteTheme, SelectMidnightTheme, SelectSignalTheme},
-    theme::{KabuTheme, apply_theme},
+    commands::{clear_theme_action_target, register_theme_action_target},
+    theme::{KabuTheme, ThemeSelection, apply_theme},
     views::ThemeSwitcher,
 };
 
@@ -17,49 +20,67 @@ pub const SIDEBAR_WIDTH: f32 = 280.0;
 type IconButton = Button;
 
 pub struct AppShell {
+    theme_selection: ThemeSelection,
     active_theme: KabuTheme,
+    window_appearance: WindowAppearance,
+    _appearance_subscription: Subscription,
+    _action_target_subscription: Subscription,
 }
 
 impl AppShell {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let active_theme = KabuTheme::resolve(ThemePreference::System, window.appearance());
+        let theme_selection = ThemeSelection::new(ThemePreference::System);
+        let window_appearance = window.appearance();
+        let active_theme = theme_selection.resolve(window_appearance);
         apply_theme(active_theme, Some(window), cx);
 
-        let shell = cx.entity().downgrade();
-        std::borrow::BorrowMut::<App>::borrow_mut(cx).on_action(
-            move |_: &SelectGraphiteTheme, cx| {
-                _ = shell.update(cx, |shell, cx| {
-                    shell.select_theme(KabuTheme::Graphite, cx);
-                });
-            },
+        let appearance_subscription = cx.observe_window_appearance(window, |shell, window, cx| {
+            shell.window_appearance_changed(window, cx);
+        });
+        let target_generation = register_theme_action_target(
+            cx.entity().downgrade(),
+            std::borrow::BorrowMut::<App>::borrow_mut(cx),
         );
-        let shell = cx.entity().downgrade();
-        std::borrow::BorrowMut::<App>::borrow_mut(cx).on_action(
-            move |_: &SelectMidnightTheme, cx| {
-                _ = shell.update(cx, |shell, cx| {
-                    shell.select_theme(KabuTheme::Midnight, cx);
-                });
-            },
-        );
-        let shell = cx.entity().downgrade();
-        std::borrow::BorrowMut::<App>::borrow_mut(cx).on_action(
-            move |_: &SelectSignalTheme, cx| {
-                _ = shell.update(cx, |shell, cx| {
-                    shell.select_theme(KabuTheme::Signal, cx);
-                });
-            },
-        );
+        let action_target_subscription = cx.on_release(move |_, cx| {
+            clear_theme_action_target(target_generation, cx);
+        });
 
-        Self { active_theme }
+        Self {
+            theme_selection,
+            active_theme,
+            window_appearance,
+            _appearance_subscription: appearance_subscription,
+            _action_target_subscription: action_target_subscription,
+        }
+    }
+
+    pub const fn theme_preference(&self) -> ThemePreference {
+        self.theme_selection.preference()
     }
 
     pub const fn active_theme(&self) -> KabuTheme {
         self.active_theme
     }
 
-    fn select_theme(&mut self, theme: KabuTheme, cx: &mut Context<Self>) {
-        self.active_theme = theme;
-        apply_theme(theme, None, cx);
+    pub(crate) fn select_theme_preference(
+        &mut self,
+        preference: ThemePreference,
+        cx: &mut Context<Self>,
+    ) {
+        self.theme_selection.set_preference(preference);
+        self.active_theme = self.theme_selection.resolve(self.window_appearance);
+        apply_theme(self.active_theme, None, cx);
+        cx.notify();
+    }
+
+    fn window_appearance_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.window_appearance = window.appearance();
+        if self.theme_preference() != ThemePreference::System {
+            return;
+        }
+
+        self.active_theme = self.theme_selection.resolve(self.window_appearance);
+        apply_theme(self.active_theme, Some(window), cx);
         cx.notify();
     }
 
@@ -78,7 +99,7 @@ impl AppShell {
                         .tooltip("Search instruments")
                         .on_click(|_, _, _| {}),
                 )
-                .child(ThemeSwitcher::new(self.active_theme)),
+                .child(ThemeSwitcher::new(self.theme_preference())),
         )
     }
 }
