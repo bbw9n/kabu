@@ -1,5 +1,6 @@
-use gpui::{AppContext as _, Modifiers, WindowAppearance, px, size};
-use kabu_app::runtime::RuntimeHandle;
+use gpui::{AppContext as _, Entity, Modifiers, WindowAppearance, px, size};
+use gpui_component::Root;
+use kabu_app::runtime::{RuntimeCommand, RuntimeHandle};
 use kabu_app::{
     app_model::AppModel,
     commands::{
@@ -13,11 +14,11 @@ use kabu_app::{
     },
 };
 use kabu_core::{
-    CachedMarketState, DataSource, InstrumentId, MarketState, PersistedState, Quote,
-    StateRepository, ThemePreference,
+    CachedMarketState, DataSource, Instrument, InstrumentId, MarketState, PersistedState, Quote,
+    SearchResult, StateRepository, ThemePreference,
 };
 use kabu_data::JsonRepository;
-use std::{sync::Arc, time::Duration};
+use std::{cell::RefCell, rc::Rc, sync::Arc, time::Duration};
 
 #[test]
 fn window_shell_uses_approved_geometry() {
@@ -324,6 +325,159 @@ fn theme_action_target_moves_to_recreated_shell_and_clears_on_release(
     });
 }
 
+#[gpui::test]
+fn command_k_opens_search_and_focuses_its_input(cx: &mut gpui::TestAppContext) {
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        kabu_app::commands::init(cx);
+    });
+    let shell_slot = Rc::new(RefCell::new(None));
+    let shell_capture = shell_slot.clone();
+    let (_, cx) = cx.add_window_view(move |window, cx| {
+        let shell = cx.new(|cx| AppShell::new(window, cx));
+        *shell_capture.borrow_mut() = Some(shell.clone());
+        Root::new(shell, window, cx)
+    });
+    let shell: Entity<AppShell> = shell_slot.borrow().clone().expect("shell");
+
+    cx.simulate_keystrokes("cmd-k");
+    cx.refresh().expect("render search overlay");
+
+    shell.update(cx, |shell, _| assert!(shell.search_is_open()));
+    cx.update(|window, cx| {
+        let focus = shell.update(cx, |shell, cx| shell.search_input_focus_handle(cx));
+        assert!(focus.is_focused(window));
+    });
+    assert!(cx.debug_bounds("search-overlay").is_some());
+}
+
+#[gpui::test]
+fn search_input_debounces_for_exactly_250_milliseconds(cx: &mut gpui::TestAppContext) {
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        kabu_app::commands::init(cx);
+    });
+    let runtime = RuntimeHandle::default();
+    let model = cx.update(|cx| {
+        cx.new(|_| {
+            AppModel::new(
+                PersistedState::starter(),
+                CachedMarketState::default(),
+                runtime.clone(),
+            )
+        })
+    });
+    let executor = cx.executor();
+    let shell_slot = Rc::new(RefCell::new(None));
+    let shell_capture = shell_slot.clone();
+    let (_, window_cx) = cx.add_window_view(move |window, cx| {
+        let shell = cx.new(|cx| AppShell::with_model(model.clone(), window, cx));
+        *shell_capture.borrow_mut() = Some(shell.clone());
+        Root::new(shell, window, cx)
+    });
+
+    window_cx.simulate_keystrokes("cmd-k");
+    window_cx.refresh().expect("render search overlay");
+    window_cx.simulate_input("nv");
+    window_cx.run_until_parked();
+    executor.advance_clock(Duration::from_millis(249));
+    window_cx.run_until_parked();
+    assert!(runtime.recorded_commands().is_empty());
+
+    executor.advance_clock(Duration::from_millis(1));
+    window_cx.run_until_parked();
+    assert!(matches!(
+        runtime.recorded_commands().last(),
+        Some(RuntimeCommand::Search { query, .. }) if query == "nv"
+    ));
+}
+
+#[gpui::test]
+fn arrows_and_return_select_an_existing_result_and_close_search(cx: &mut gpui::TestAppContext) {
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        kabu_app::commands::init(cx);
+    });
+    let runtime = RuntimeHandle::default();
+    let model = cx.update(|cx| {
+        cx.new(|_| {
+            let mut model = AppModel::new(
+                PersistedState::starter(),
+                CachedMarketState::default(),
+                runtime.clone(),
+            );
+            model.select_index(2).expect("select BTC first");
+            let generation = model.begin_search("n");
+            model.apply_search_results(generation, vec![aapl_result(), nvda_result()], Vec::new());
+            model
+        })
+    });
+    let shell_slot = Rc::new(RefCell::new(None));
+    let shell_capture = shell_slot.clone();
+    let (_, cx) = cx.add_window_view(move |window, cx| {
+        let shell = cx.new(|cx| AppShell::with_model(model.clone(), window, cx));
+        *shell_capture.borrow_mut() = Some(shell.clone());
+        Root::new(shell, window, cx)
+    });
+    let shell: Entity<AppShell> = shell_slot.borrow().clone().expect("shell");
+    let model = shell.update(cx, |shell, _| shell.model());
+
+    cx.simulate_keystrokes("cmd-k down enter");
+    cx.run_until_parked();
+
+    shell.update(cx, |shell, _| assert!(!shell.search_is_open()));
+    model.read_with(cx, |model, _| {
+        assert_eq!(model.watchlist().len(), 4);
+        assert_eq!(
+            model
+                .selected()
+                .expect("existing NVDA selected")
+                .id
+                .canonical_symbol(),
+            "NVDA"
+        );
+    });
+    assert_eq!(runtime.recorded_commands().len(), 1);
+    assert!(matches!(
+        runtime.recorded_commands().first(),
+        Some(RuntimeCommand::History { instrument, .. })
+            if instrument.id.canonical_symbol() == "NVDA"
+    ));
+}
+
+#[gpui::test]
+fn escape_closes_search_and_restores_watchlist_focus(cx: &mut gpui::TestAppContext) {
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        kabu_app::commands::init(cx);
+    });
+    let shell_slot = Rc::new(RefCell::new(None));
+    let shell_capture = shell_slot.clone();
+    let (_, cx) = cx.add_window_view(move |window, cx| {
+        let shell = cx.new(|cx| AppShell::new(window, cx));
+        *shell_capture.borrow_mut() = Some(shell.clone());
+        Root::new(shell, window, cx)
+    });
+    let shell: Entity<AppShell> = shell_slot.borrow().clone().expect("shell");
+
+    cx.simulate_keystrokes("cmd-k escape");
+    cx.run_until_parked();
+
+    shell.update(cx, |shell, _| assert!(!shell.search_is_open()));
+    cx.dispatch_action(SelectNextWatchlist);
+    let model = shell.update(cx, |shell, _| shell.model());
+    model.read_with(cx, |model, _| {
+        assert_eq!(
+            model
+                .selected()
+                .expect("watchlist focus restored")
+                .id
+                .canonical_symbol(),
+            "NVDA"
+        );
+    });
+}
+
 fn cached_watchlist_model(cx: &mut gpui::TestAppContext) -> gpui::Entity<AppModel> {
     let aapl = InstrumentId::equity("AAPL", Some("NASDAQ")).expect("AAPL id");
     let nvda = InstrumentId::equity("NVDA", Some("NASDAQ")).expect("NVDA id");
@@ -355,5 +509,21 @@ fn cached_quote(instrument_id: InstrumentId, last: f64, previous_close: f64) -> 
         provider_timestamp: timestamp,
         received_at: timestamp,
         provider_delayed: false,
+    }
+}
+
+fn aapl_result() -> SearchResult {
+    SearchResult {
+        instrument: Instrument::equity("AAPL", Some("NASDAQ"), "Apple", "USD").expect("AAPL"),
+        source: DataSource::Yahoo,
+        venue_label: "NASDAQ".into(),
+    }
+}
+
+fn nvda_result() -> SearchResult {
+    SearchResult {
+        instrument: Instrument::equity("NVDA", Some("NASDAQ"), "NVIDIA", "USD").expect("NVDA"),
+        source: DataSource::Yahoo,
+        venue_label: "NASDAQ".into(),
     }
 }

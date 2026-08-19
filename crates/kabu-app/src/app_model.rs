@@ -1,13 +1,16 @@
-use crate::runtime::RuntimeHandle;
+use crate::runtime::{ProviderWarning, RuntimeCommand, RuntimeEvent, RuntimeHandle};
 use kabu_core::{
-    CachedChart, CachedMarketState, ChartRequestKey, Instrument, InstrumentId, PersistedState,
-    PersistenceError, Quote, QuoteState, SearchResult, StateRepository, ThemePreference, Watchlist,
-    WatchlistError,
+    AddOutcome, AssetClass, CachedChart, CachedMarketState, ChartPeriod, ChartRequestKey,
+    Generation, GenerationId, Instrument, InstrumentId, PersistedState, PersistenceError, Quote,
+    QuoteState, SearchResult, StateRepository, ThemePreference, Watchlist, WatchlistError,
 };
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
+    time::Duration,
 };
+
+const SEARCH_DEBOUNCE: Duration = Duration::from_millis(250);
 
 pub const DEFAULT_WINDOW_WIDTH: f32 = 980.0;
 pub const DEFAULT_WINDOW_HEIGHT: f32 = 640.0;
@@ -23,6 +26,8 @@ pub enum AppModelError {
     Persistence(#[from] PersistenceError),
     #[error(transparent)]
     Watchlist(#[from] WatchlistError),
+    #[error("search result index {index} is outside a result set of length {len}")]
+    SearchResultOutOfBounds { index: usize, len: usize },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -34,6 +39,7 @@ pub struct AppWarning {
 pub struct SearchState {
     query: String,
     results: Vec<SearchResult>,
+    provider_warnings: Vec<ProviderWarning>,
     loading: bool,
 }
 
@@ -49,6 +55,17 @@ impl SearchState {
     pub const fn is_loading(&self) -> bool {
         self.loading
     }
+
+    pub fn provider_warnings(&self) -> &[ProviderWarning] {
+        &self.provider_warnings
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PendingSearch {
+    generation: GenerationId,
+    query: String,
+    remaining: Duration,
 }
 
 pub struct AppModel {
@@ -65,6 +82,9 @@ pub struct AppModel {
     committed_window_width: f32,
     committed_window_height: f32,
     search: SearchState,
+    search_generation: Generation,
+    history_generation: Generation,
+    pending_search: Option<PendingSearch>,
     runtime: RuntimeHandle,
     repository: Option<Arc<dyn StateRepository>>,
     warnings: Vec<AppWarning>,
@@ -133,6 +153,9 @@ impl AppModel {
             committed_window_width: window_width,
             committed_window_height: window_height,
             search: SearchState::default(),
+            search_generation: Generation::default(),
+            history_generation: Generation::default(),
+            pending_search: None,
             runtime,
             repository,
             warnings,
@@ -197,6 +220,141 @@ impl AppModel {
 
     pub fn warnings(&self) -> &[AppWarning] {
         &self.warnings
+    }
+
+    pub fn set_search_query(&mut self, query: impl AsRef<str>) -> GenerationId {
+        let generation = self.begin_search(query);
+        if self.search.query.is_empty() {
+            self.search.loading = false;
+            self.pending_search = None;
+        } else {
+            self.pending_search = Some(PendingSearch {
+                generation,
+                query: self.search.query.clone(),
+                remaining: SEARCH_DEBOUNCE,
+            });
+        }
+        generation
+    }
+
+    pub fn begin_search(&mut self, query: impl AsRef<str>) -> GenerationId {
+        let generation = self.search_generation.next();
+        self.pending_search = None;
+        self.search.query = query.as_ref().trim().to_string();
+        self.search.results.clear();
+        self.search.provider_warnings.clear();
+        self.search.loading = !self.search.query.is_empty();
+        generation
+    }
+
+    pub fn advance_search_clock(&mut self, elapsed: Duration) {
+        let Some(pending) = self.pending_search.as_mut() else {
+            return;
+        };
+        pending.remaining = pending.remaining.saturating_sub(elapsed);
+        if pending.remaining.is_zero() {
+            let generation = pending.generation;
+            self.dispatch_pending_search(generation);
+        }
+    }
+
+    pub fn dispatch_pending_search(&mut self, generation: GenerationId) {
+        if !self.search_generation.is_current(generation) {
+            return;
+        }
+        let Some(pending) = self.pending_search.take() else {
+            return;
+        };
+        if pending.generation != generation {
+            self.pending_search = Some(pending);
+            return;
+        }
+        self.send_runtime(RuntimeCommand::Search {
+            generation,
+            query: pending.query,
+        });
+    }
+
+    pub fn apply_search_results(
+        &mut self,
+        generation: GenerationId,
+        results: Vec<SearchResult>,
+        warnings: Vec<ProviderWarning>,
+    ) {
+        if !self.search_generation.is_current(generation) {
+            return;
+        }
+        self.search.results = results;
+        self.search.provider_warnings = warnings;
+        self.search.loading = false;
+    }
+
+    pub fn add_search_result(&mut self, index: usize) -> Result<(), AppModelError> {
+        let result = self.search.results.get(index).cloned().ok_or(
+            AppModelError::SearchResultOutOfBounds {
+                index,
+                len: self.search.results.len(),
+            },
+        )?;
+        let outcome = self.watchlist.add(result.instrument.clone());
+        let selected_index = match outcome {
+            AddOutcome::Added { index } | AddOutcome::AlreadyPresent { index } => index,
+        };
+        self.watchlist.select(selected_index)?;
+        self.sync_selected_identity();
+        let persistence_result = self.persist_state();
+
+        if matches!(outcome, AddOutcome::Added { .. }) {
+            self.send_runtime(RuntimeCommand::Snapshot {
+                instruments: self.watchlist.instruments().to_vec(),
+            });
+            if result.instrument.id.asset_class() == AssetClass::Crypto {
+                self.send_runtime(RuntimeCommand::SetCryptoWatchlist(
+                    self.watchlist
+                        .instruments()
+                        .iter()
+                        .filter(|instrument| instrument.id.asset_class() == AssetClass::Crypto)
+                        .cloned()
+                        .collect(),
+                ));
+            }
+        }
+        let generation = self.history_generation.next();
+        self.send_runtime(RuntimeCommand::History {
+            generation,
+            instrument: result.instrument,
+            period: ChartPeriod::OneDay,
+        });
+        persistence_result
+    }
+
+    pub fn apply_runtime_event(&mut self, event: RuntimeEvent) {
+        match event {
+            RuntimeEvent::SearchCompleted {
+                generation,
+                results,
+                warnings,
+            } => self.apply_search_results(generation, results, warnings),
+            RuntimeEvent::Quotes(quotes) => {
+                for quote in quotes {
+                    self.loading_quotes.remove(&quote.instrument_id);
+                    self.quotes.merge(quote);
+                }
+            }
+            RuntimeEvent::QuoteError { instrument_ids, .. } => {
+                for instrument_id in instrument_ids {
+                    self.loading_quotes.remove(&instrument_id);
+                }
+                self.warnings.push(AppWarning {
+                    message: "Some quotes are temporarily unavailable.".into(),
+                });
+            }
+            RuntimeEvent::HistoryCompleted { .. } => {}
+            RuntimeEvent::HistoryFailed { .. } => self.warnings.push(AppWarning {
+                message: "Chart history is temporarily unavailable.".into(),
+            }),
+            RuntimeEvent::StreamStatus(_) => {}
+        }
     }
 
     pub fn select_index(&mut self, index: usize) -> Result<(), AppModelError> {
@@ -326,6 +484,14 @@ impl AppModel {
             window_height: self.committed_window_height,
             sidebar_width: self.committed_sidebar_width,
             theme: self.theme,
+        }
+    }
+
+    fn send_runtime(&mut self, command: RuntimeCommand) {
+        if self.runtime.send(command).is_err() {
+            self.warnings.push(AppWarning {
+                message: "Background market-data work is temporarily unavailable.".into(),
+            });
         }
     }
 }

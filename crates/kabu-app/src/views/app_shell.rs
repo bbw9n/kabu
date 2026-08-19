@@ -1,7 +1,8 @@
 use gpui::{
     App, AppContext as _, Context, DragMoveEvent, Empty, Entity, FocusHandle, FontFeatures,
     InteractiveElement as _, IntoElement, ParentElement as _, Render,
-    StatefulInteractiveElement as _, Styled as _, Subscription, Window, WindowAppearance, div, px,
+    StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window, WindowAppearance,
+    div, px,
 };
 use gpui_component::{
     ActiveTheme as _, IconName, StyledExt as _, TitleBar, button::Button, skeleton::Skeleton,
@@ -14,7 +15,7 @@ use crate::{
     commands::{clear_theme_action_target, register_theme_action_target},
     runtime::RuntimeHandle,
     theme::{KabuTheme, ThemeSelection, apply_theme},
-    views::{ThemeSwitcher, WatchlistPane},
+    views::{SearchOverlay, SearchOverlayEvent, ThemeSwitcher, WatchlistPane},
 };
 
 type IconButton = Button;
@@ -50,6 +51,9 @@ impl Render for SidebarDrag {
 pub struct AppShell {
     model: Entity<AppModel>,
     watchlist_focus: FocusHandle,
+    search_overlay: Entity<SearchOverlay>,
+    search_open: bool,
+    focus_search_on_render: bool,
     theme_selection: ThemeSelection,
     active_theme: KabuTheme,
     window_appearance: WindowAppearance,
@@ -58,6 +62,9 @@ pub struct AppShell {
     _appearance_subscription: Subscription,
     _bounds_subscription: Subscription,
     _action_target_subscription: Subscription,
+    _search_subscription: Subscription,
+    _runtime_event_forwarder: Task<()>,
+    _runtime_event_task: Task<()>,
 }
 
 impl AppShell {
@@ -91,6 +98,42 @@ impl AppShell {
         let bounds_subscription = cx.observe_window_bounds(window, |shell, window, cx| {
             shell.window_bounds_changed(window, cx);
         });
+        let search_overlay = cx.new(|cx| SearchOverlay::new(model.clone(), window, cx));
+        let search_subscription = cx.subscribe_in(
+            &search_overlay,
+            window,
+            |shell, _, event: &SearchOverlayEvent, window, cx| match event {
+                SearchOverlayEvent::Dismissed => shell.close_search(window, cx),
+            },
+        );
+        let runtime_events = model.read(cx).runtime().events();
+        let (main_event_sender, main_events) = async_channel::bounded(32);
+        let runtime_event_forwarder = cx.background_spawn(async move {
+            while let Ok(event) = runtime_events.recv().await {
+                if main_event_sender.send(event).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let runtime_event_task = cx.spawn(async move |shell, cx| {
+            while let Ok(event) = main_events.recv().await {
+                if cx
+                    .update(|cx| {
+                        if let Some(shell) = shell.upgrade() {
+                            shell.update(cx, |shell, cx| {
+                                shell.model.update(cx, |model, cx| {
+                                    model.apply_runtime_event(event);
+                                    cx.notify();
+                                });
+                            });
+                        }
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
         let target_generation =
             register_theme_action_target(cx.entity().downgrade(), BorrowMut::<App>::borrow_mut(cx));
         let action_target_subscription = cx.on_release(move |_, cx| {
@@ -113,6 +156,9 @@ impl AppShell {
         Self {
             model,
             watchlist_focus: cx.focus_handle(),
+            search_overlay,
+            search_open: false,
+            focus_search_on_render: false,
             theme_selection,
             active_theme,
             window_appearance,
@@ -121,6 +167,9 @@ impl AppShell {
             _appearance_subscription: appearance_subscription,
             _bounds_subscription: bounds_subscription,
             _action_target_subscription: action_target_subscription,
+            _search_subscription: search_subscription,
+            _runtime_event_forwarder: runtime_event_forwarder,
+            _runtime_event_task: runtime_event_task,
         }
     }
 
@@ -130,6 +179,27 @@ impl AppShell {
 
     pub fn focus_watchlist(&self, window: &mut Window) {
         self.watchlist_focus.focus(window);
+    }
+
+    pub const fn search_is_open(&self) -> bool {
+        self.search_open
+    }
+
+    pub fn search_input_focus_handle(&self, cx: &App) -> FocusHandle {
+        self.search_overlay.read(cx).focus_handle(cx)
+    }
+
+    pub(crate) fn open_search(&mut self, cx: &mut Context<Self>) {
+        self.search_open = true;
+        self.focus_search_on_render = true;
+        cx.notify();
+    }
+
+    fn close_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.search_open = false;
+        self.focus_search_on_render = false;
+        self.watchlist_focus.focus(window);
+        cx.notify();
     }
 
     pub fn selected_quote_header(&self, cx: &App) -> SelectedQuoteHeader {
@@ -271,7 +341,7 @@ impl AppShell {
         });
     }
 
-    fn title_bar(&self) -> impl IntoElement {
+    fn title_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         TitleBar::new().child(
             div()
                 .flex()
@@ -284,7 +354,7 @@ impl AppShell {
                     IconButton::new("search")
                         .icon(IconName::Search)
                         .tooltip("Search instruments")
-                        .on_click(|_, _, _| {}),
+                        .on_click(cx.listener(|shell, _, _, cx| shell.open_search(cx))),
                 )
                 .child(ThemeSwitcher::new(self.theme_preference())),
         )
@@ -292,7 +362,12 @@ impl AppShell {
 }
 
 impl Render for AppShell {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.search_open && self.focus_search_on_render {
+            self.search_overlay
+                .update(cx, |overlay, cx| overlay.focus(window, cx));
+            self.focus_search_on_render = false;
+        }
         let sidebar_width = self.model.read(cx).sidebar_width();
         let selected_header = self.selected_quote_header(cx);
         let warning = self
@@ -308,7 +383,7 @@ impl Render for AppShell {
             .size_full()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
-            .child(self.title_bar())
+            .child(self.title_bar(cx))
             .children(warning.map(|message| {
                 div()
                     .border_b_1()
@@ -375,6 +450,7 @@ impl Render for AppShell {
                         shell.persist_sidebar_width(cx);
                     })),
             )
+            .children(self.search_open.then(|| self.search_overlay.clone()))
     }
 }
 

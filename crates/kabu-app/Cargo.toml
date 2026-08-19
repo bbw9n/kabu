@@ -20,6 +20,7 @@ objc2.workspace = true
 objc2-app-kit.workspace = true
 raw-window-handle.workspace = true
 [dev-dependencies]
+async-trait.workspace = true
 chrono.workspace = true
 gpui = { workspace = true, features = ["test-support"] }
 tempfile.workspace = true

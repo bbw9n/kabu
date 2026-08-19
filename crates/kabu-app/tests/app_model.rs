@@ -1,14 +1,16 @@
 use kabu_app::{
     app_model::{AppModel, AppModelError, clamp_window_size_to_display},
-    runtime::RuntimeHandle,
+    runtime::{ProviderWarning, RuntimeCommand, RuntimeHandle},
 };
 use kabu_core::{
-    CachedMarketState, DataSource, InstrumentId, MarketState, PersistedState, PersistenceError,
-    Quote, StateRepository, ThemePreference, Watchlist,
+    CachedMarketState, ChartPeriod, DataSource, Instrument, InstrumentId, MarketDataErrorKind,
+    MarketState, PersistedState, PersistenceError, Quote, SearchResult, StateRepository,
+    ThemePreference, Watchlist,
 };
 use std::{
     io,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 #[test]
@@ -220,6 +222,195 @@ fn persistence_failure_keeps_the_action_and_enqueues_a_warning() {
     assert!(model.warnings()[0].message.contains("could not save"));
 }
 
+#[test]
+fn search_waits_exactly_250_milliseconds() {
+    let runtime = RuntimeHandle::default();
+    let mut model = AppModel::new(
+        PersistedState::starter(),
+        CachedMarketState::default(),
+        runtime.clone(),
+    );
+
+    model.set_search_query("nv");
+    model.advance_search_clock(Duration::from_millis(249));
+    assert!(runtime.recorded_commands().is_empty());
+
+    model.advance_search_clock(Duration::from_millis(1));
+    assert!(matches!(
+        runtime.recorded_commands().last(),
+        Some(RuntimeCommand::Search { query, .. }) if query == "nv"
+    ));
+}
+
+#[test]
+fn empty_search_cancels_a_pending_provider_call_and_clears_results() {
+    let runtime = RuntimeHandle::default();
+    let mut model = AppModel::new(
+        PersistedState::starter(),
+        CachedMarketState::default(),
+        runtime.clone(),
+    );
+    let generation = model.begin_search("nv");
+    model.apply_search_results(generation, vec![nvda_result()], Vec::new());
+
+    model.set_search_query("new query");
+    model.set_search_query("   ");
+    model.advance_search_clock(Duration::from_secs(1));
+
+    assert!(runtime.recorded_commands().is_empty());
+    assert!(model.search().results().is_empty());
+    assert!(!model.search().is_loading());
+}
+
+#[test]
+fn old_search_generation_cannot_replace_new_results() {
+    let mut model = AppModel::new(
+        PersistedState::starter(),
+        CachedMarketState::default(),
+        fake_runtime(),
+    );
+
+    let old = model.begin_search("nv");
+    let current = model.begin_search("btc");
+    model.apply_search_results(old, vec![nvda_result()], Vec::new());
+    assert!(model.search().results().is_empty());
+
+    model.apply_search_results(current, vec![btc_result()], Vec::new());
+    assert_eq!(
+        model.search().results()[0].instrument.id.canonical_symbol(),
+        "BTC/USDT"
+    );
+}
+
+#[test]
+fn current_search_completion_replaces_results_and_provider_warning() {
+    let mut model = AppModel::new(
+        PersistedState::starter(),
+        CachedMarketState::default(),
+        fake_runtime(),
+    );
+    let generation = model.begin_search("nv");
+    let warning = ProviderWarning {
+        source: DataSource::Binance,
+        kind: MarketDataErrorKind::Unavailable,
+        message: "Binance search is temporarily unavailable.".into(),
+    };
+
+    model.apply_search_results(generation, vec![nvda_result()], vec![warning.clone()]);
+
+    assert_eq!(model.search().results(), &[nvda_result()]);
+    assert_eq!(model.search().provider_warnings(), &[warning]);
+    assert!(!model.search().is_loading());
+}
+
+#[test]
+fn adding_search_result_appends_selects_persists_and_requests_market_data() {
+    let repository = RecordingRepository::starter();
+    let runtime = RuntimeHandle::default();
+    let mut model = AppModel::with_repository(repository.clone(), runtime.clone());
+    let generation = model.begin_search("msft");
+    let result = msft_result();
+    model.apply_search_results(generation, vec![result.clone()], Vec::new());
+
+    model.add_search_result(0).expect("add MSFT");
+
+    assert_eq!(model.watchlist().len(), 5);
+    assert_eq!(
+        model.selected().expect("selected MSFT").id,
+        result.instrument.id
+    );
+    assert_eq!(
+        repository
+            .saved_states()
+            .last()
+            .expect("persisted add")
+            .watchlist
+            .selected_index(),
+        Some(4)
+    );
+    let commands = runtime.recorded_commands();
+    assert!(matches!(
+        &commands[0],
+        RuntimeCommand::Snapshot { instruments } if instruments.len() == 5
+    ));
+    assert!(matches!(
+        &commands[1],
+        RuntimeCommand::History {
+            instrument,
+            period: ChartPeriod::OneDay,
+            ..
+        } if instrument.id == result.instrument.id
+    ));
+}
+
+#[test]
+fn adding_duplicate_selects_existing_without_reordering_or_refreshing_watchlists() {
+    let repository = RecordingRepository::starter();
+    let runtime = RuntimeHandle::default();
+    let mut model = AppModel::with_repository(repository.clone(), runtime.clone());
+    model.select_index(2).expect("select BTC first");
+    let generation = model.begin_search("nvda");
+    model.apply_search_results(generation, vec![nvda_result()], Vec::new());
+
+    model.add_search_result(0).expect("select existing NVDA");
+
+    assert_eq!(model.watchlist().len(), 4);
+    assert_eq!(
+        model
+            .watchlist()
+            .instruments()
+            .iter()
+            .map(|instrument| instrument.id.canonical_symbol())
+            .collect::<Vec<_>>(),
+        ["AAPL", "NVDA", "BTC/USDT", "ETH/USDT"]
+    );
+    assert_eq!(model.watchlist().selected_index(), Some(1));
+    assert_eq!(
+        repository
+            .saved_states()
+            .last()
+            .expect("persisted duplicate selection")
+            .watchlist
+            .selected_index(),
+        Some(1)
+    );
+    let commands = runtime.recorded_commands();
+    assert_eq!(commands.len(), 1);
+    assert!(matches!(
+        &commands[0],
+        RuntimeCommand::History { instrument, .. }
+            if instrument.id.canonical_symbol() == "NVDA"
+    ));
+}
+
+#[test]
+fn add_persistence_failure_keeps_selection_and_still_requests_live_data() {
+    let repository = RecordingRepository::failing();
+    let runtime = RuntimeHandle::default();
+    let mut model = AppModel::with_repository(repository, runtime.clone());
+    let generation = model.begin_search("msft");
+    model.apply_search_results(generation, vec![msft_result()], Vec::new());
+
+    let error = model.add_search_result(0).expect_err("save failure");
+
+    assert!(matches!(error, AppModelError::Persistence(_)));
+    assert_eq!(
+        model
+            .selected()
+            .expect("session selection retained")
+            .id
+            .canonical_symbol(),
+        "MSFT"
+    );
+    assert!(matches!(
+        runtime.recorded_commands().as_slice(),
+        [
+            RuntimeCommand::Snapshot { .. },
+            RuntimeCommand::History { .. }
+        ]
+    ));
+}
+
 fn fake_runtime() -> RuntimeHandle {
     RuntimeHandle::default()
 }
@@ -240,6 +431,31 @@ fn cached_quote(instrument_id: InstrumentId, last: f64, previous_close: f64) -> 
         provider_timestamp: timestamp,
         received_at: timestamp,
         provider_delayed: false,
+    }
+}
+
+fn nvda_result() -> SearchResult {
+    SearchResult {
+        instrument: Instrument::equity("NVDA", Some("NASDAQ"), "NVIDIA Corporation", "USD")
+            .expect("NVDA"),
+        source: DataSource::Yahoo,
+        venue_label: "NASDAQ".into(),
+    }
+}
+
+fn btc_result() -> SearchResult {
+    SearchResult {
+        instrument: Instrument::crypto("BTC", "USDT", "Bitcoin").expect("BTC"),
+        source: DataSource::Binance,
+        venue_label: "Binance".into(),
+    }
+}
+
+fn msft_result() -> SearchResult {
+    SearchResult {
+        instrument: Instrument::equity("MSFT", Some("NASDAQ"), "Microsoft", "USD").expect("MSFT"),
+        source: DataSource::Yahoo,
+        venue_label: "NASDAQ".into(),
     }
 }
 
