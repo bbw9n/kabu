@@ -1,5 +1,6 @@
 mod catalog;
 mod rest;
+mod stream;
 mod wire;
 
 use std::sync::{Arc, RwLock};
@@ -10,13 +11,12 @@ use reqwest::Url;
 use crate::http::client;
 
 const REST_BASE: &str = "https://data-api.binance.vision/";
-const STREAM_BASE: &str = "wss://stream.binance.vision/ws/";
+const STREAM_BASE: &str = "wss://data-stream.binance.vision";
 
 #[derive(Clone, Debug)]
 pub struct BinanceClient {
     pub(super) http: reqwest::Client,
     pub(super) rest_base: Url,
-    #[allow(dead_code)] // Reserved for the Binance WebSocket adapter.
     pub(super) stream_base: Url,
     pub(super) catalog: Arc<RwLock<Option<CachedInstrumentCatalog>>>,
 }
