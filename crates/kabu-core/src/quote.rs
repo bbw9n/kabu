@@ -15,9 +15,9 @@ impl ChartPeriod {
     pub fn cache_ttl(self) -> Duration {
         match self {
             Self::OneDay => Duration::from_secs(60),
-            Self::OneWeek => Duration::from_secs(120),
+            Self::OneWeek => Duration::from_secs(300),
             Self::OneMonth => Duration::from_secs(300),
-            Self::ThreeMonths => Duration::from_secs(900),
+            Self::ThreeMonths => Duration::from_secs(1800),
             Self::OneYear => Duration::from_secs(1800),
         }
     }
@@ -80,7 +80,12 @@ mod tests {
     #[test]
     fn chart_periods_have_exact_cache_ttls() {
         assert_eq!(ChartPeriod::OneDay.cache_ttl(), Duration::from_secs(60));
+        assert_eq!(ChartPeriod::OneWeek.cache_ttl(), Duration::from_secs(300));
         assert_eq!(ChartPeriod::OneMonth.cache_ttl(), Duration::from_secs(300));
+        assert_eq!(
+            ChartPeriod::ThreeMonths.cache_ttl(),
+            Duration::from_secs(1800)
+        );
         assert_eq!(ChartPeriod::OneYear.cache_ttl(), Duration::from_secs(1800));
     }
     #[test]

@@ -86,7 +86,11 @@ pub struct Generation {
 impl Generation {
     #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> GenerationId {
-        self.current.0 = self.current.0.wrapping_add(1);
+        self.current.0 = self
+            .current
+            .0
+            .checked_add(1)
+            .unwrap_or_else(|| panic!("generation IDs exhausted"));
         self.current
     }
 
@@ -158,10 +162,28 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "generation IDs exhausted")]
+    fn generation_exhaustion_does_not_wrap_and_revalidate_old_tokens() {
+        let mut generation = Generation {
+            current: GenerationId(u64::MAX),
+        };
+        generation.next();
+    }
+
+    #[test]
     fn persisted_state_starts_with_the_default_schema_and_watchlist() {
         let state = PersistedState::starter();
         assert_eq!(state.schema_version, 1);
         assert_eq!(state.watchlist.instruments().len(), 4);
+    }
+
+    #[test]
+    fn cached_market_state_defaults_to_an_empty_current_schema() {
+        let state = CachedMarketState::default();
+        assert_eq!(state.schema_version, STATE_SCHEMA_VERSION);
+        assert!(state.quotes.is_empty());
+        assert!(state.charts.is_empty());
+        assert_eq!(state.instrument_catalog, None);
     }
 
     fn equity_quote_at(timestamp: chrono::DateTime<Utc>) -> Quote {

@@ -78,6 +78,12 @@ mod tests {
         assert_eq!(classify_freshness(&quote, ts(2_001)), Freshness::Stale);
     }
 
+    #[test]
+    fn future_timestamps_are_clamped_to_a_live_zero_age() {
+        let quote = crypto_quote_at(ts(2_000));
+        assert_eq!(classify_freshness(&quote, ts(1_000)), Freshness::Live);
+    }
+
     fn crypto_quote_at(timestamp: chrono::DateTime<Utc>) -> Quote {
         quote_at(
             timestamp,

@@ -44,6 +44,15 @@ mod tests {
     }
 
     #[test]
+    fn stock_poll_retry_schedule_is_capped() {
+        let policy = RetryPolicy::stock_poll();
+        let seconds: Vec<u64> = (0..5)
+            .map(|attempt| policy.base_delay(attempt).as_secs())
+            .collect();
+        assert_eq!(seconds, vec![15, 30, 60, 120, 120]);
+    }
+
+    #[test]
     fn jitter_is_clamped_to_a_deterministic_twenty_percent_range() {
         let base = std::time::Duration::from_secs(100);
         assert_eq!(
