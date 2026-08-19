@@ -280,8 +280,9 @@ impl RenderOnce for QuoteDetail {
                                     .child(format!("{} · {}", data.asset_class, data.venue)),
                             ),
                     )
-                    .child(if quote_loading {
+                    .child(if quote_loading && quote.is_none() {
                         div()
+                            .debug_selector(|| "quote-loading-skeleton".into())
                             .flex()
                             .flex_col()
                             .items_end()
@@ -295,13 +296,26 @@ impl RenderOnce for QuoteDetail {
                             .flex_col()
                             .items_end()
                             .font(tabular_font())
-                            .child(div().text_2xl().font_semibold().child(data.price.clone()))
+                            .child(
+                                div()
+                                    .debug_selector(|| "quote-detail-price".into())
+                                    .text_2xl()
+                                    .font_semibold()
+                                    .child(data.price.clone()),
+                            )
                             .child(
                                 div()
                                     .text_sm()
                                     .text_color(change_color)
                                     .child(data.change.clone()),
                             )
+                            .children(quote_loading.then(|| {
+                                div()
+                                    .debug_selector(|| "quote-refreshing-indicator".into())
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child("Refreshing…")
+                            }))
                             .into_any_element()
                     }),
             )

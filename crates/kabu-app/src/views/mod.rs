@@ -17,4 +17,4 @@ pub use price_chart::{
 pub use quote_detail::{QuoteDetail, QuoteDetailData, freshness_label};
 pub use search::{SEARCH_OVERLAY_KEY_CONTEXT, SearchOverlay, SearchOverlayEvent};
 pub use theme_switcher::ThemeSwitcher;
-pub use watchlist::{WATCHLIST_KEY_CONTEXT, WatchlistPane};
+pub use watchlist::{WATCHLIST_KEY_CONTEXT, WatchlistPane, watchlist_quote_status};

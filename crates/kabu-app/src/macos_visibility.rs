@@ -69,17 +69,18 @@ mod appkit {
 
     impl MacOsVisibilityProbe {
         pub fn new(window: &Window) -> Result<Self, VisibilityProbeError> {
+            let main_thread = MainThreadMarker::new().ok_or(VisibilityProbeError::NotMainThread)?;
             let handle = HasWindowHandle::window_handle(window)
                 .map_err(|_| VisibilityProbeError::HandleUnavailable)?;
             let RawWindowHandle::AppKit(handle) = handle.as_raw() else {
                 return Err(VisibilityProbeError::NotAppKit);
             };
             // SAFETY: GPUI's AppKit raw handle is a non-null NSView owned by this live
-            // GPUI Window. Construction is performed on the GPUI main thread, and the
-            // returned NSWindow is retained before the borrowed raw-handle lifetime ends.
+            // GPUI Window. `MainThreadMarker::new()` has mechanically rejected off-main
+            // construction above, and the returned NSWindow is retained before the
+            // borrowed raw-handle lifetime ends.
             let view = unsafe { handle.ns_view.cast::<NSView>().as_ref() };
             let appkit_window = view.window().ok_or(VisibilityProbeError::DetachedView)?;
-            let main_thread = MainThreadMarker::new().ok_or(VisibilityProbeError::NotMainThread)?;
             let application = NSApplication::sharedApplication(main_thread);
             Ok(Self {
                 window: appkit_window,
@@ -131,5 +132,21 @@ mod tests {
         assert_eq!(tracker.poll(), None);
         visible.set(true);
         assert_eq!(tracker.poll(), Some(true));
+    }
+
+    #[test]
+    fn main_thread_check_precedes_the_single_unsafe_appkit_conversion() {
+        let source = include_str!("macos_visibility.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production module");
+        let main_thread_check = production
+            .find("MainThreadMarker::new()")
+            .expect("main-thread check");
+        let unsafe_conversion = production.find("unsafe {").expect("unsafe conversion");
+
+        assert!(main_thread_check < unsafe_conversion);
+        assert_eq!(production.matches("unsafe {").count(), 1);
     }
 }

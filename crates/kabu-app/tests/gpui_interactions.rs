@@ -278,6 +278,39 @@ fn quote_detail_renders_metrics_chart_and_dispatches_period_clicks(cx: &mut gpui
 }
 
 #[gpui::test]
+fn quote_retry_keeps_last_good_price_visible_with_refreshing_indicator(
+    cx: &mut gpui::TestAppContext,
+) {
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        kabu_app::commands::init(cx);
+    });
+    let state = PersistedState::starter();
+    let instrument = state
+        .watchlist
+        .selected()
+        .expect("starter selection")
+        .clone();
+    let mut cache = CachedMarketState::default();
+    cache.quotes.insert(
+        instrument.id.clone(),
+        cached_quote(instrument.id.clone(), 105.0, 100.0),
+    );
+    let model = cx.update(|cx| cx.new(|_| AppModel::new(state, cache, RuntimeHandle::default())));
+    model.update(cx, |model, cx| {
+        model.set_quote_loading(instrument.id, true);
+        cx.notify();
+    });
+    let (_, cx) =
+        cx.add_window_view(move |window, cx| AppShell::with_model(model.clone(), window, cx));
+    cx.refresh().expect("render refreshing quote");
+
+    assert!(cx.debug_bounds("quote-detail-price").is_some());
+    assert!(cx.debug_bounds("quote-refreshing-indicator").is_some());
+    assert!(cx.debug_bounds("quote-loading-skeleton").is_none());
+}
+
+#[gpui::test]
 fn quote_detail_keeps_chart_loading_and_unavailable_states_outside_the_painter(
     cx: &mut gpui::TestAppContext,
 ) {

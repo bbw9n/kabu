@@ -9,7 +9,14 @@ use gpui_component::{
     notification::Notification,
 };
 use kabu_core::{CachedMarketState, PersistedState, Quote, ThemePreference};
-use std::{borrow::BorrowMut, time::Duration};
+use std::{
+    borrow::BorrowMut,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use crate::{
     app_model::{AppModel, DEFAULT_SIDEBAR_WIDTH},
@@ -205,17 +212,42 @@ impl AppShell {
         });
 
         let close_model = model.downgrade();
+        let close_started = Arc::new(AtomicBool::new(false));
         window.on_window_should_close(cx, move |window, cx| {
-            if let Some(model) = close_model.upgrade() {
-                let size = window.window_bounds().get_bounds().size;
-                model.update(cx, |model, cx| {
-                    model.preview_window_geometry(f32::from(size.width), f32::from(size.height));
-                    _ = model.persist_window_geometry();
-                    model.flush_and_shutdown();
-                    cx.notify();
-                });
+            let Some(model) = close_model.upgrade() else {
+                return true;
+            };
+            let runtime = model.read(cx).runtime().clone();
+            if runtime.is_shutdown_complete() {
+                return true;
             }
-            true
+            if close_started.swap(true, Ordering::SeqCst) {
+                return false;
+            }
+            let size = window.window_bounds().get_bounds().size;
+            model.update(cx, |model, cx| {
+                model.preview_window_geometry(f32::from(size.width), f32::from(size.height));
+                _ = model.persist_window_geometry();
+                model.begin_flush_and_shutdown();
+                cx.notify();
+            });
+            if runtime.is_shutdown_complete() {
+                return true;
+            }
+            let mut async_window = window.to_async(cx);
+            let shutdown_wait = cx.background_spawn(async move {
+                loop {
+                    if runtime.wait_for_shutdown(Duration::from_secs(2)) {
+                        break;
+                    }
+                }
+            });
+            cx.spawn(async move |_| {
+                shutdown_wait.await;
+                _ = async_window.update(|window, _| window.remove_window());
+            })
+            .detach();
+            false
         });
 
         Self {

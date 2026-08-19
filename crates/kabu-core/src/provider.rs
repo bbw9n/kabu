@@ -1,7 +1,12 @@
 use crate::{
     CachedMarketState, Candle, ChartPeriod, Instrument, PersistedState, Quote, SearchResult,
 };
-use std::{pin::Pin, time::Duration};
+use std::{
+    future::Future,
+    pin::Pin,
+    task::{Context, Poll},
+    time::Duration,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MarketDataErrorKind {
@@ -32,8 +37,54 @@ pub enum PersistenceError {
     UnsupportedSchema(u32),
 }
 
-pub type QuoteStream =
+type QuoteEventStream =
     Pin<Box<dyn futures_util::Stream<Item = Result<Quote, MarketDataError>> + Send>>;
+type QuoteStreamCompletion = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+/// An owned quote-stream session. Dropping the event receiver asks the producer
+/// to stop; [`Self::cancel`] additionally waits until that producer has exited.
+pub struct QuoteStream {
+    events: Option<QuoteEventStream>,
+    completion: Option<QuoteStreamCompletion>,
+}
+
+impl QuoteStream {
+    pub fn new(
+        events: impl futures_util::Stream<Item = Result<Quote, MarketDataError>> + Send + 'static,
+    ) -> Self {
+        Self {
+            events: Some(Box::pin(events)),
+            completion: None,
+        }
+    }
+
+    pub fn with_completion(
+        events: impl futures_util::Stream<Item = Result<Quote, MarketDataError>> + Send + 'static,
+        completion: impl Future<Output = ()> + Send + 'static,
+    ) -> Self {
+        Self {
+            events: Some(Box::pin(events)),
+            completion: Some(Box::pin(completion)),
+        }
+    }
+
+    pub async fn cancel(mut self) {
+        self.events.take();
+        if let Some(completion) = self.completion.take() {
+            completion.await;
+        }
+    }
+}
+
+impl futures_util::Stream for QuoteStream {
+    type Item = Result<Quote, MarketDataError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.events
+            .as_mut()
+            .map_or(Poll::Ready(None), |events| events.as_mut().poll_next(cx))
+    }
+}
 
 #[async_trait::async_trait]
 pub trait InstrumentSearch: Send + Sync {

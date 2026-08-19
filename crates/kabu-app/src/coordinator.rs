@@ -1,5 +1,5 @@
 use crate::runtime::{ProviderSet, RuntimeEvent, StreamStatus};
-use async_channel::Sender;
+use async_channel::{Receiver, Sender};
 use futures_util::StreamExt as _;
 use kabu_core::{
     AssetClass, Instrument, InstrumentId, MarketDataError, MarketDataErrorKind, RetryPolicy,
@@ -17,8 +17,13 @@ pub struct Coordinator {
     visible: bool,
     equities: Vec<Instrument>,
     crypto: Vec<Instrument>,
-    stock_job: Option<JoinHandle<()>>,
-    crypto_job: Option<JoinHandle<()>>,
+    stock_job: Option<CoordinatorJob>,
+    crypto_job: Option<CoordinatorJob>,
+}
+
+struct CoordinatorJob {
+    cancel: Sender<()>,
+    join: JoinHandle<()>,
 }
 
 impl Coordinator {
@@ -63,8 +68,7 @@ impl Coordinator {
             send_event(
                 &self.events,
                 RuntimeEvent::StreamStatus(StreamStatus::Paused),
-            )
-            .await;
+            );
         }
     }
 
@@ -81,7 +85,14 @@ impl Coordinator {
         }
         if self.visible && crypto_changed {
             stop_job(&mut self.crypto_job).await;
-            self.start_crypto_job();
+            if self.crypto.is_empty() {
+                send_event(
+                    &self.events,
+                    RuntimeEvent::StreamStatus(StreamStatus::Paused),
+                );
+            } else {
+                self.start_crypto_job();
+            }
         }
     }
 
@@ -98,8 +109,7 @@ impl Coordinator {
         send_event(
             &self.events,
             RuntimeEvent::StreamStatus(StreamStatus::Stopped),
-        )
-        .await;
+        );
     }
 
     fn start_stock_job(&mut self) {
@@ -110,9 +120,11 @@ impl Coordinator {
         let provider = self.providers.equities.clone();
         let events = self.events.clone();
         let jitter = self.jitter.clone();
-        self.stock_job = Some(tokio::spawn(async move {
-            run_stock_polls(instruments, provider, events, jitter).await;
-        }));
+        let (cancel, cancelled) = async_channel::bounded(1);
+        let join = tokio::spawn(async move {
+            run_stock_polls(instruments, provider, events, jitter, cancelled).await;
+        });
+        self.stock_job = Some(CoordinatorJob { cancel, join });
     }
 
     fn start_crypto_job(&mut self) {
@@ -123,9 +135,11 @@ impl Coordinator {
         let provider = self.providers.crypto.clone();
         let events = self.events.clone();
         let jitter = self.jitter.clone();
-        self.crypto_job = Some(tokio::spawn(async move {
-            run_crypto_stream(instruments, provider, events, jitter).await;
-        }));
+        let (cancel, cancelled) = async_channel::bounded(1);
+        let join = tokio::spawn(async move {
+            run_crypto_stream(instruments, provider, events, jitter, cancelled).await;
+        });
+        self.crypto_job = Some(CoordinatorJob { cancel, join });
     }
 }
 
@@ -134,25 +148,35 @@ async fn run_stock_polls(
     provider: Arc<dyn crate::runtime::EquityProvider>,
     events: Sender<RuntimeEvent>,
     jitter: Jitter,
+    cancelled: Receiver<()>,
 ) {
     let retry = RetryPolicy::stock_poll();
     let mut failures = 0usize;
     loop {
-        match provider.snapshots(&instruments).await {
+        let snapshots = tokio::select! {
+            biased;
+            _ = cancelled.recv() => return,
+            snapshots = provider.snapshots(&instruments) => snapshots,
+        };
+        match snapshots {
             Ok(quotes) => {
                 failures = 0;
                 if !quotes.is_empty() {
-                    send_event(&events, RuntimeEvent::Quotes(quotes)).await;
+                    send_event(&events, RuntimeEvent::Quotes(quotes));
                 }
             }
             Err(error) => {
-                send_quote_error(&events, &instruments, error).await;
+                send_quote_error(&events, &instruments, error);
                 failures = failures.saturating_add(1);
             }
         }
         let attempt = failures.saturating_sub(1);
         let delay = jittered_delay(retry.base_delay(attempt), jitter());
-        tokio::time::sleep(delay).await;
+        tokio::select! {
+            biased;
+            _ = cancelled.recv() => return,
+            _ = tokio::time::sleep(delay) => {}
+        }
     }
 }
 
@@ -161,48 +185,73 @@ async fn run_crypto_stream(
     provider: Arc<dyn crate::runtime::CryptoProvider>,
     events: Sender<RuntimeEvent>,
     jitter: Jitter,
+    cancelled: Receiver<()>,
 ) {
     send_event(
         &events,
         RuntimeEvent::StreamStatus(StreamStatus::Connecting),
-    )
-    .await;
-    reconcile_crypto(&instruments, provider.as_ref(), &events).await;
+    );
+    if !reconcile_crypto(&instruments, provider.as_ref(), &events, &cancelled).await {
+        return;
+    }
 
     let retry = RetryPolicy::crypto_stream();
     let mut subscribe_attempt = 0usize;
     loop {
-        let stream = provider.subscribe(&instruments).await;
+        let stream = tokio::select! {
+            biased;
+            _ = cancelled.recv() => return,
+            stream = provider.subscribe(&instruments) => stream,
+        };
         let mut stream = match stream {
             Ok(stream) => {
                 subscribe_attempt = 0;
-                send_event(&events, RuntimeEvent::StreamStatus(StreamStatus::Live)).await;
+                send_event(&events, RuntimeEvent::StreamStatus(StreamStatus::Live));
                 stream
             }
             Err(error) => {
-                send_quote_error(&events, &instruments, error).await;
+                send_quote_error(&events, &instruments, error);
                 send_event(
                     &events,
                     RuntimeEvent::StreamStatus(StreamStatus::Reconnecting),
-                )
-                .await;
+                );
                 let delay = jittered_delay(retry.base_delay(subscribe_attempt), jitter());
                 subscribe_attempt = subscribe_attempt.saturating_add(1);
-                tokio::time::sleep(delay).await;
+                tokio::select! {
+                    biased;
+                    _ = cancelled.recv() => return,
+                    _ = tokio::time::sleep(delay) => {}
+                }
                 continue;
             }
         };
 
         let mut reconcile_after_disconnect = false;
-        while let Some(item) = stream.next().await {
+        loop {
+            let item = tokio::select! {
+                biased;
+                _ = cancelled.recv() => {
+                    stream.cancel().await;
+                    return;
+                }
+                item = stream.next() => item,
+            };
+            let Some(item) = item else {
+                break;
+            };
             match item {
                 Ok(quote) => {
                     if reconcile_after_disconnect {
-                        reconcile_crypto(&instruments, provider.as_ref(), &events).await;
-                        send_event(&events, RuntimeEvent::StreamStatus(StreamStatus::Live)).await;
+                        if !reconcile_crypto(&instruments, provider.as_ref(), &events, &cancelled)
+                            .await
+                        {
+                            stream.cancel().await;
+                            return;
+                        }
+                        send_event(&events, RuntimeEvent::StreamStatus(StreamStatus::Live));
                         reconcile_after_disconnect = false;
                     }
-                    send_event(&events, RuntimeEvent::Quotes(vec![quote])).await;
+                    send_event(&events, RuntimeEvent::Quotes(vec![quote]));
                 }
                 Err(error) => {
                     if error.kind == MarketDataErrorKind::Disconnected {
@@ -210,23 +259,29 @@ async fn run_crypto_stream(
                         send_event(
                             &events,
                             RuntimeEvent::StreamStatus(StreamStatus::Reconnecting),
-                        )
-                        .await;
+                        );
                     }
-                    send_quote_error(&events, &instruments, error).await;
+                    send_quote_error(&events, &instruments, error);
                 }
             }
         }
 
+        stream.cancel().await;
+
         send_event(
             &events,
             RuntimeEvent::StreamStatus(StreamStatus::Reconnecting),
-        )
-        .await;
+        );
         let delay = jittered_delay(retry.base_delay(subscribe_attempt), jitter());
         subscribe_attempt = subscribe_attempt.saturating_add(1);
-        tokio::time::sleep(delay).await;
-        reconcile_crypto(&instruments, provider.as_ref(), &events).await;
+        tokio::select! {
+            biased;
+            _ = cancelled.recv() => return,
+            _ = tokio::time::sleep(delay) => {}
+        }
+        if !reconcile_crypto(&instruments, provider.as_ref(), &events, &cancelled).await {
+            return;
+        }
     }
 }
 
@@ -234,15 +289,22 @@ async fn reconcile_crypto(
     instruments: &[Instrument],
     provider: &dyn crate::runtime::CryptoProvider,
     events: &Sender<RuntimeEvent>,
-) {
-    match provider.snapshots(instruments).await {
-        Ok(quotes) if !quotes.is_empty() => send_event(events, RuntimeEvent::Quotes(quotes)).await,
+    cancelled: &Receiver<()>,
+) -> bool {
+    let snapshots = tokio::select! {
+        biased;
+        _ = cancelled.recv() => return false,
+        snapshots = provider.snapshots(instruments) => snapshots,
+    };
+    match snapshots {
+        Ok(quotes) if !quotes.is_empty() => send_event(events, RuntimeEvent::Quotes(quotes)),
         Ok(_) => {}
-        Err(error) => send_quote_error(events, instruments, error).await,
+        Err(error) => send_quote_error(events, instruments, error),
     }
+    true
 }
 
-async fn send_quote_error(
+fn send_quote_error(
     events: &Sender<RuntimeEvent>,
     instruments: &[Instrument],
     error: MarketDataError,
@@ -256,18 +318,17 @@ async fn send_quote_error(
                 .collect(),
             error,
         },
-    )
-    .await;
+    );
 }
 
-async fn send_event(events: &Sender<RuntimeEvent>, event: RuntimeEvent) {
-    _ = events.send(event).await;
+fn send_event(events: &Sender<RuntimeEvent>, event: RuntimeEvent) {
+    _ = events.try_send(event);
 }
 
-async fn stop_job(job: &mut Option<JoinHandle<()>>) {
+async fn stop_job(job: &mut Option<CoordinatorJob>) {
     if let Some(job) = job.take() {
-        job.abort();
-        _ = job.await;
+        _ = job.cancel.try_send(());
+        _ = job.join.await;
     }
 }
 
@@ -392,7 +453,7 @@ mod tests {
         let yahoo = Arc::new(FakeProvider::new(DataSource::Yahoo, std::iter::empty()));
         let binance = Arc::new(FakeProvider::with_stream(
             DataSource::Binance,
-            Ok(Box::pin(stream_receiver)),
+            Ok(QuoteStream::new(stream_receiver)),
         ));
         let harness = CoordinatorHarness::with_providers(vec![btc_instrument()], yahoo, binance);
 
@@ -434,6 +495,49 @@ mod tests {
         harness.advance(Duration::from_secs(60)).await;
 
         assert_eq!(harness.binance_subscribe_calls(), 1);
+        assert_eq!(
+            harness.stream_statuses().last(),
+            Some(&StreamStatus::Paused)
+        );
+        harness.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hiding_awaits_the_owned_stream_producer() {
+        let active_producers = Arc::new(AtomicUsize::new(0));
+        let (sender, receiver) = async_channel::bounded(1);
+        let producer_active = active_producers.clone();
+        let producer = tokio::spawn(async move {
+            producer_active.fetch_add(1, Ordering::SeqCst);
+            sender.closed().await;
+            producer_active.fetch_sub(1, Ordering::SeqCst);
+        });
+        let stream = QuoteStream::with_completion(receiver, async move {
+            _ = producer.await;
+        });
+        let yahoo = Arc::new(FakeProvider::new(DataSource::Yahoo, std::iter::empty()));
+        let binance = Arc::new(FakeProvider::with_stream(DataSource::Binance, Ok(stream)));
+        let harness = CoordinatorHarness::with_providers(vec![btc_instrument()], yahoo, binance);
+
+        harness.set_visible(true).await;
+        harness.settle().await;
+        assert_eq!(active_producers.load(Ordering::SeqCst), 1);
+
+        harness.set_visible(false).await;
+
+        assert_eq!(active_producers.load(Ordering::SeqCst), 0);
+        harness.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn removing_the_final_crypto_instrument_emits_paused() {
+        let harness = CoordinatorHarness::with_watchlist(vec![btc_instrument()]);
+        harness.set_visible(true).await;
+        harness.settle().await;
+        assert_eq!(harness.stream_statuses().last(), Some(&StreamStatus::Live));
+
+        harness.set_watchlist(Vec::new()).await;
+
         assert_eq!(
             harness.stream_statuses().last(),
             Some(&StreamStatus::Paused)
@@ -615,7 +719,7 @@ mod tests {
                 .lock()
                 .expect("stream results lock")
                 .pop_front()
-                .unwrap_or_else(|| Ok(Box::pin(stream::pending())))
+                .unwrap_or_else(|| Ok(QuoteStream::new(stream::pending())))
         }
     }
 

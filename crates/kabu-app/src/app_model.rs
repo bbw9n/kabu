@@ -2,10 +2,10 @@ use crate::runtime::{
     ProviderWarning, RuntimeCommand, RuntimeEvent, RuntimeHandle, RuntimeSendError, StreamStatus,
 };
 use kabu_core::{
-    AddOutcome, CachedChart, CachedMarketState, ChartPeriod, ChartRequestKey, Freshness,
-    Generation, GenerationId, Instrument, InstrumentId, MarketDataErrorKind, MergeOutcome,
-    PersistedState, PersistenceError, Quote, QuoteState, SearchResult, StateRepository,
-    ThemePreference, Watchlist, WatchlistError, classify_freshness,
+    AddOutcome, CachedChart, CachedMarketState, ChartPeriod, ChartRequestKey, DataSource,
+    Freshness, Generation, GenerationId, Instrument, InstrumentId, MarketDataErrorKind,
+    MergeOutcome, PersistedState, PersistenceError, Quote, QuoteState, SearchResult,
+    StateRepository, ThemePreference, Watchlist, WatchlistError, classify_freshness,
 };
 use kabu_data::Recovery;
 use std::{
@@ -38,6 +38,7 @@ pub enum AppModelError {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AppWarning {
     pub message: String,
+    key: WarningKey,
     startup_notification: bool,
 }
 
@@ -45,6 +46,19 @@ impl AppWarning {
     pub const fn is_startup_notification(&self) -> bool {
         self.startup_notification
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WarningKey {
+    StateRecovery,
+    CacheRecovery,
+    StateLoad,
+    CacheLoad,
+    History,
+    Persistence,
+    Background,
+    CacheWrite,
+    Catalog,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -85,6 +99,13 @@ struct PendingSearch {
     remaining: Duration,
 }
 
+#[derive(Clone, Debug)]
+struct HistoryError {
+    generation: GenerationId,
+    key: ChartRequestKey,
+    message: String,
+}
+
 pub struct AppModel {
     watchlist: Watchlist,
     selected_identity: Option<InstrumentId>,
@@ -105,15 +126,19 @@ pub struct AppModel {
     history_generation: Generation,
     selected_chart_period: ChartPeriod,
     current_history: Option<(GenerationId, ChartRequestKey)>,
-    history_error: Option<String>,
+    history_error: Option<HistoryError>,
     pending_search: Option<PendingSearch>,
     runtime: RuntimeHandle,
     repository: Option<Arc<dyn StateRepository>>,
     warnings: Vec<AppWarning>,
+    catalog_warning: Option<ProviderWarning>,
     instrument_catalog: Option<kabu_core::CachedInstrumentCatalog>,
     cache_dirty: bool,
     last_cache_write: Option<chrono::DateTime<chrono::Utc>>,
     visible: bool,
+    last_visibility_dispatch: Option<bool>,
+    control_sync_pending: bool,
+    refresh_history_on_restore: bool,
     stream_status: StreamStatus,
 }
 
@@ -136,10 +161,10 @@ impl AppModel {
     ) -> Self {
         let mut warnings = Vec::new();
         if state.recovered_from_corruption {
-            warnings.push(recovery_warning("state.json"));
+            warnings.push(recovery_warning(WarningKey::StateRecovery, "state.json"));
         }
         if cache.recovered_from_corruption {
-            warnings.push(recovery_warning("cache.json"));
+            warnings.push(recovery_warning(WarningKey::CacheRecovery, "cache.json"));
         }
         Self::from_parts(state.value, cache.value, runtime, None, warnings)
     }
@@ -157,11 +182,15 @@ impl AppModel {
     ) -> Self {
         let mut warnings = Vec::new();
         let state = repository.load_state().unwrap_or_else(|error| {
-            warnings.push(load_warning("settings", &error));
+            warnings.push(load_warning(WarningKey::StateLoad, "settings", &error));
             PersistedState::starter()
         });
         let cache = repository.load_cache().unwrap_or_else(|error| {
-            warnings.push(load_warning("cached market data", &error));
+            warnings.push(load_warning(
+                WarningKey::CacheLoad,
+                "cached market data",
+                &error,
+            ));
             CachedMarketState::default()
         });
         Self::from_parts(state, cache, runtime, Some(repository), warnings)
@@ -216,10 +245,14 @@ impl AppModel {
             runtime,
             repository,
             warnings,
+            catalog_warning: None,
             instrument_catalog: cache.instrument_catalog,
             cache_dirty: false,
             last_cache_write: None,
             visible: false,
+            last_visibility_dispatch: None,
+            control_sync_pending: false,
+            refresh_history_on_restore: false,
             stream_status: StreamStatus::Paused,
         }
     }
@@ -256,7 +289,13 @@ impl AppModel {
     }
 
     pub fn history_error_message(&self) -> Option<&str> {
-        self.history_error.as_deref()
+        let selected_key = self.selected_chart_key()?;
+        self.history_error
+            .as_ref()
+            .filter(|error| {
+                error.key == selected_key && self.history_generation.is_current(error.generation)
+            })
+            .map(|error| error.message.as_str())
     }
 
     pub const fn stream_status(&self) -> StreamStatus {
@@ -328,11 +367,21 @@ impl AppModel {
             period,
         };
         if self
+            .history_error
+            .as_ref()
+            .is_some_and(|error| error.key != key)
+        {
+            self.history_error = None;
+            self.clear_warning(WarningKey::History);
+        }
+        if self
             .charts
             .get(&key)
             .is_some_and(|chart| chart_is_fresh(chart, period, now))
         {
             self.current_history = None;
+            self.history_error = None;
+            self.clear_warning(WarningKey::History);
             return None;
         }
         Some(self.request_history(instrument, period))
@@ -382,7 +431,7 @@ impl AppModel {
         self.pending_search = None;
         self.search.query = query.as_ref().trim().to_string();
         self.search.results.clear();
-        self.search.provider_warnings.clear();
+        self.search.provider_warnings = self.catalog_warning.iter().cloned().collect();
         self.search.terminal_error = None;
         self.search.loading = !self.search.query.is_empty();
         generation
@@ -430,12 +479,16 @@ impl AppModel {
         &mut self,
         generation: GenerationId,
         results: Vec<SearchResult>,
-        warnings: Vec<ProviderWarning>,
+        mut warnings: Vec<ProviderWarning>,
     ) {
         if !self.search_generation.is_current(generation) {
             return;
         }
         self.search.results = results;
+        if let Some(catalog_warning) = &self.catalog_warning {
+            warnings.retain(|warning| warning.source != DataSource::Binance);
+            warnings.push(catalog_warning.clone());
+        }
         self.search.provider_warnings = warnings;
         self.search.terminal_error = None;
         self.search.loading = false;
@@ -553,6 +606,7 @@ impl AppModel {
                     );
                     self.current_history = None;
                     self.history_error = None;
+                    self.clear_warning(WarningKey::History);
                     self.mark_cache_dirty_at(now);
                 }
             }
@@ -563,23 +617,63 @@ impl AppModel {
             } => {
                 if self.history_is_current(generation, &key) {
                     self.current_history = None;
-                    self.history_error = Some(market_data_error_message(error.kind).into());
-                    if self.warnings.last().is_none_or(|warning| {
-                        warning.message != "Chart history is temporarily unavailable."
-                    }) {
-                        self.warnings.push(AppWarning {
-                            message: "Chart history is temporarily unavailable.".into(),
-                            startup_notification: false,
-                        });
-                    }
+                    self.history_error = Some(HistoryError {
+                        generation,
+                        key,
+                        message: market_data_error_message(error.kind).into(),
+                    });
+                    self.upsert_warning(
+                        WarningKey::History,
+                        "Chart history is temporarily unavailable.",
+                        false,
+                    );
                 }
             }
+            RuntimeEvent::CatalogRefresh {
+                result,
+                catalog_available,
+            } => match result {
+                Ok(()) => {
+                    if let Some(previous) = self.catalog_warning.take() {
+                        self.search
+                            .provider_warnings
+                            .retain(|warning| warning != &previous);
+                    }
+                    self.clear_warning(WarningKey::Catalog);
+                }
+                Err(kind) => {
+                    let warning = ProviderWarning {
+                        source: DataSource::Binance,
+                        kind,
+                        message: catalog_refresh_message(kind, catalog_available).into(),
+                    };
+                    if let Some(previous) = self.catalog_warning.replace(warning.clone()) {
+                        self.search
+                            .provider_warnings
+                            .retain(|candidate| candidate != &previous);
+                    }
+                    self.search.provider_warnings.retain(|candidate| {
+                        candidate.source != DataSource::Binance || candidate == &warning
+                    });
+                    if !self.search.provider_warnings.contains(&warning) {
+                        self.search.provider_warnings.push(warning);
+                    }
+                    self.upsert_warning(
+                        WarningKey::Catalog,
+                        "The Binance instrument catalog could not be refreshed.",
+                        false,
+                    );
+                }
+            },
             RuntimeEvent::StreamStatus(status) => self.stream_status = status,
         }
     }
 
     pub fn set_visible_at(&mut self, visible: bool, now: chrono::DateTime<chrono::Utc>) {
         if self.visible == visible {
+            if self.last_visibility_dispatch != Some(visible) {
+                self.send_visibility(visible);
+            }
             return;
         }
         self.visible = visible;
@@ -588,12 +682,31 @@ impl AppModel {
             _ = self.send_runtime(RuntimeCommand::SetWatchlist(
                 self.watchlist.instruments().to_vec(),
             ));
+            self.send_visibility(true);
+            if self.refresh_history_on_restore {
+                self.refresh_history_on_restore = false;
+                self.select_period_at(self.selected_chart_period, now);
+            }
         } else {
+            let search_was_pending = self.search.loading || self.pending_search.is_some();
+            self.search_generation.next();
+            self.pending_search = None;
+            self.search.loading = false;
+            if search_was_pending {
+                self.search.terminal_error = Some("Search paused while Kabu is hidden.".into());
+            }
+            self.refresh_history_on_restore = self.current_history.is_some()
+                || self.selected_chart_key().is_some_and(|key| {
+                    self.charts
+                        .get(&key)
+                        .is_none_or(|chart| !chart_is_fresh(chart, key.period, now))
+                });
+            self.history_generation.next();
             self.current_history = None;
             self.loading_quotes.clear();
             self.flush_cache_at(now, true);
+            self.send_visibility(false);
         }
-        _ = self.send_runtime(RuntimeCommand::SetVisible(visible));
     }
 
     pub fn recompute_freshness_at(&mut self, now: chrono::DateTime<chrono::Utc>) -> bool {
@@ -609,22 +722,47 @@ impl AppModel {
     }
 
     pub fn tick_at(&mut self, now: chrono::DateTime<chrono::Utc>) -> bool {
-        let changed = self.visible && self.recompute_freshness_at(now);
+        if self.control_sync_pending {
+            if self.runtime.control_state_is_synchronized() {
+                self.control_sync_pending = false;
+            } else {
+                self.runtime.retry_control_state();
+            }
+        }
+        if self.visible {
+            self.recompute_freshness_at(now);
+        }
+        let should_repaint_quote_ages = self.visible && !self.quotes.quotes().is_empty();
         self.flush_cache_at(now, false);
-        changed
+        should_repaint_quote_ages
     }
 
     pub fn retry_selected_quote(&mut self) {
         let Some(instrument) = self.selected().cloned() else {
             return;
         };
-        self.loading_quotes.insert(instrument.id.clone());
-        _ = self.send_runtime(RuntimeCommand::Snapshot {
-            instruments: vec![instrument],
-        });
+        let instrument_id = instrument.id.clone();
+        if self
+            .send_runtime(RuntimeCommand::Snapshot {
+                instruments: vec![instrument],
+            })
+            .is_ok()
+        {
+            self.loading_quotes.insert(instrument_id);
+        } else {
+            self.loading_quotes.remove(&instrument_id);
+        }
     }
 
     pub fn retry_selected_history(&mut self) {
+        let Some(error) = self.history_error.as_ref() else {
+            return;
+        };
+        if !self.history_generation.is_current(error.generation)
+            || self.selected_chart_key().as_ref() != Some(&error.key)
+        {
+            return;
+        }
         let Some(instrument) = self.selected().cloned() else {
             return;
         };
@@ -632,10 +770,16 @@ impl AppModel {
     }
 
     pub fn flush_and_shutdown(&mut self) {
+        self.begin_flush_and_shutdown();
+        _ = self.runtime.wait_for_shutdown(Duration::from_secs(2));
+    }
+
+    pub fn begin_flush_and_shutdown(&mut self) {
+        self.visible = false;
         let state = self.persisted_state();
         let cache = self.cached_market_state();
         self.cache_dirty = false;
-        self.runtime.shutdown_with_flush(state, cache);
+        self.runtime.begin_shutdown_with_flush(state, cache);
     }
 
     pub fn select_index(&mut self, index: usize) -> Result<(), AppModelError> {
@@ -781,13 +925,14 @@ impl AppModel {
         };
         let state = self.persisted_state();
         if let Err(error) = repository.save_state(&state) {
-            self.warnings.push(AppWarning {
-                message: "Your change is kept in this session, but Kabu could not save it to disk."
-                    .into(),
-                startup_notification: false,
-            });
+            self.upsert_warning(
+                WarningKey::Persistence,
+                "Your change is kept in this session, but Kabu could not save it to disk.",
+                false,
+            );
             return Err(error.into());
         }
+        self.clear_warning(WarningKey::Persistence);
         Ok(())
     }
 
@@ -816,14 +961,53 @@ impl AppModel {
     }
 
     fn send_runtime(&mut self, command: RuntimeCommand) -> Result<(), RuntimeSendError> {
+        let is_control = matches!(
+            &command,
+            RuntimeCommand::SetVisible(_)
+                | RuntimeCommand::SetWatchlist(_)
+                | RuntimeCommand::SetCryptoWatchlist(_)
+        );
         let result = self.runtime.send(command);
         if result.is_err() {
-            self.warnings.push(AppWarning {
-                message: "Background market-data work is temporarily unavailable.".into(),
-                startup_notification: false,
-            });
+            self.upsert_warning(
+                WarningKey::Background,
+                "Background market-data work is temporarily unavailable.",
+                false,
+            );
+        } else {
+            self.clear_warning(WarningKey::Background);
+            if is_control {
+                self.control_sync_pending = !self.runtime.control_state_is_synchronized();
+            }
         }
         result
+    }
+
+    fn send_visibility(&mut self, visible: bool) {
+        if self
+            .send_runtime(RuntimeCommand::SetVisible(visible))
+            .is_ok()
+        {
+            self.last_visibility_dispatch = Some(visible);
+        }
+    }
+
+    fn upsert_warning(&mut self, key: WarningKey, message: impl Into<String>, startup: bool) {
+        let message = message.into();
+        if let Some(warning) = self.warnings.iter_mut().find(|warning| warning.key == key) {
+            warning.message = message;
+            warning.startup_notification = startup;
+        } else {
+            self.warnings.push(AppWarning {
+                message,
+                key,
+                startup_notification: startup,
+            });
+        }
+    }
+
+    fn clear_warning(&mut self, key: WarningKey) {
+        self.warnings.retain(|warning| warning.key != key);
     }
 
     fn mark_cache_dirty_at(&mut self, now: chrono::DateTime<chrono::Utc>) {
@@ -846,13 +1030,26 @@ impl AppModel {
             return;
         }
         let cache = self.cached_market_state();
-        if self
-            .send_runtime(RuntimeCommand::PersistMarketCache { cache })
-            .is_ok()
-        {
+        if self.send_cache_runtime(cache).is_ok() {
             self.cache_dirty = false;
             self.last_cache_write = Some(now);
         }
+    }
+
+    fn send_cache_runtime(&mut self, cache: CachedMarketState) -> Result<(), RuntimeSendError> {
+        let result = self
+            .runtime
+            .send(RuntimeCommand::PersistMarketCache { cache });
+        if result.is_err() {
+            self.upsert_warning(
+                WarningKey::CacheWrite,
+                "Cached market data could not be queued for saving.",
+                false,
+            );
+        } else {
+            self.clear_warning(WarningKey::CacheWrite);
+        }
+        result
     }
 
     fn cached_market_state(&self) -> CachedMarketState {
@@ -915,18 +1112,20 @@ fn clamp_to_display(value: f32, display_extent: f32, minimum: f32) -> f32 {
     }
 }
 
-fn load_warning(category: &str, error: &PersistenceError) -> AppWarning {
+fn load_warning(key: WarningKey, category: &str, _error: &PersistenceError) -> AppWarning {
     AppWarning {
-        message: format!("Kabu could not load {category}; safe defaults are in use ({error})."),
+        message: format!("Kabu could not load {category}; safe defaults are in use."),
+        key,
         startup_notification: false,
     }
 }
 
-fn recovery_warning(file_name: &str) -> AppWarning {
+fn recovery_warning(key: WarningKey, file_name: &str) -> AppWarning {
     AppWarning {
         message: format!(
             "Kabu recovered {file_name} from corruption; the original file was preserved."
         ),
+        key,
         startup_notification: true,
     }
 }
@@ -948,5 +1147,27 @@ pub fn market_data_error_message(kind: MarketDataErrorKind) -> &'static str {
             "This instrument is not supported by the selected provider."
         }
         MarketDataErrorKind::Internal => "Market data is temporarily unavailable.",
+    }
+}
+
+fn catalog_refresh_message(kind: MarketDataErrorKind, catalog_available: bool) -> &'static str {
+    if catalog_available {
+        return "Binance catalog refresh failed; cached crypto search remains available.";
+    }
+    match kind {
+        MarketDataErrorKind::RateLimited => {
+            "Binance is rate limiting catalog refresh. Crypto search may be incomplete."
+        }
+        MarketDataErrorKind::MalformedResponse => {
+            "Binance returned an unreadable instrument catalog. Crypto search may be incomplete."
+        }
+        MarketDataErrorKind::Timeout
+        | MarketDataErrorKind::Unavailable
+        | MarketDataErrorKind::Disconnected => {
+            "Binance instrument catalog is unavailable. Check your connection; crypto search may be incomplete."
+        }
+        MarketDataErrorKind::UnsupportedInstrument | MarketDataErrorKind::Internal => {
+            "Binance instrument catalog is temporarily unavailable. Crypto search may be incomplete."
+        }
     }
 }

@@ -213,6 +213,22 @@ async fn dropping_stream_cancels_pending_websocket_handshake() {
     server.wait_for_client_disconnect().await;
 }
 
+#[tokio::test]
+async fn cancelling_session_awaits_the_real_adapter_producer() {
+    let server = TestWebSocketServer::hold_connection_open().await;
+    let client = binance_with_stream_url(server.url());
+
+    let stream = client
+        .subscribe(&[btc_instrument()])
+        .await
+        .expect("subscribe");
+    server.wait_for_connections(1).await;
+
+    stream.cancel().await;
+
+    server.wait_for_client_disconnect().await;
+}
+
 struct TestWebSocketServer {
     url: String,
     paths: Arc<Mutex<Vec<String>>>,

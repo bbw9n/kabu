@@ -1,5 +1,6 @@
 use kabu_app::views::{
     ChartDirection, QuoteDetailData, freshness_label, normalize_closes, series_direction,
+    watchlist_quote_status,
 };
 use kabu_core::{Candle, DataSource, Freshness, Instrument, MarketState, Quote};
 use std::time::Duration;
@@ -105,6 +106,45 @@ fn quote_detail_uses_em_dashes_for_missing_metrics() {
     assert_eq!(data.low, "—");
     assert_eq!(data.previous_close, "—");
     assert_eq!(data.volume, "—");
+}
+
+#[test]
+fn watchlist_age_text_advances_on_consecutive_same_freshness_seconds() {
+    let instrument =
+        Instrument::equity("AAPL", Some("NASDAQ"), "Apple", "USD").expect("instrument");
+    let timestamp = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp");
+    let quote = Quote {
+        instrument_id: instrument.id,
+        last: 101.5,
+        previous_close: Some(100.0),
+        open: None,
+        high: None,
+        low: None,
+        volume: None,
+        currency: "USD".into(),
+        source: DataSource::Yahoo,
+        market_state: MarketState::Regular,
+        provider_timestamp: timestamp,
+        received_at: timestamp,
+        provider_delayed: false,
+    };
+
+    assert_eq!(
+        watchlist_quote_status(
+            &quote,
+            Freshness::Fresh,
+            timestamp + chrono::Duration::seconds(1)
+        ),
+        "Fresh · 1s"
+    );
+    assert_eq!(
+        watchlist_quote_status(
+            &quote,
+            Freshness::Fresh,
+            timestamp + chrono::Duration::seconds(2)
+        ),
+        "Fresh · 2s"
+    );
 }
 
 fn candle(close: f64) -> Candle {

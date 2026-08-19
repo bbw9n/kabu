@@ -146,7 +146,7 @@ fn render_row(
         selected,
     } = row;
     let symbol = instrument.id.canonical_symbol();
-    let (price, change, status, change_color) = quote
+    let (price, change, mut status, change_color) = quote
         .as_ref()
         .map(|quote| quote_text(quote, freshness, chrono::Utc::now(), cx))
         .unwrap_or_else(|| {
@@ -157,8 +157,11 @@ fn render_row(
                 cx.theme().muted_foreground,
             )
         });
+    if loading && quote.is_some() {
+        status = format!("Refreshing · {status}").into();
+    }
 
-    let value = if loading {
+    let value = if loading && quote.is_none() {
         compact_quote_skeleton().into_any_element()
     } else {
         div()
@@ -229,13 +232,20 @@ fn quote_text(
     (
         price.into(),
         change.into(),
-        format!(
-            "{} · {}",
-            watchlist_freshness_label(freshness),
-            format_age(quote_age(quote, now))
-        )
-        .into(),
+        watchlist_quote_status(quote, freshness, now).into(),
         color,
+    )
+}
+
+pub fn watchlist_quote_status(
+    quote: &Quote,
+    freshness: Freshness,
+    now: chrono::DateTime<chrono::Utc>,
+) -> String {
+    format!(
+        "{} · {}",
+        watchlist_freshness_label(freshness),
+        format_age(quote_age(quote, now))
     )
 }
 

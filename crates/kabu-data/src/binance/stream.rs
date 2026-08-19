@@ -64,8 +64,10 @@ fn subscribe_with_runtime(
     let subscriptions = subscriptions(instruments)?;
     let url = stream_url(client, &subscriptions)?;
     let (sender, receiver) = quote_channel();
-    tokio::spawn(run_stream(url, subscriptions, sender, sleeper, jitter));
-    Ok(Box::pin(receiver))
+    let producer = tokio::spawn(run_stream(url, subscriptions, sender, sleeper, jitter));
+    Ok(QuoteStream::with_completion(receiver, async move {
+        _ = producer.await;
+    }))
 }
 
 fn subscriptions(

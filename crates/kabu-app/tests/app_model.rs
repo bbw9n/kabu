@@ -461,7 +461,7 @@ fn full_runtime_queue_finishes_search_with_a_sanitized_terminal_error() {
     let mut model = AppModel::new(
         PersistedState::starter(),
         CachedMarketState::default(),
-        runtime,
+        runtime.clone(),
     );
 
     model.set_search_query("private-full-query");
@@ -785,7 +785,7 @@ fn failed_history_send_after_same_row_reselection_is_terminal_and_not_loading() 
         model.selected_chart_availability(),
         ChartAvailability::Unavailable
     );
-    assert_eq!(model.warnings().len(), 2);
+    assert_eq!(model.warnings().len(), 1);
 }
 
 #[test]
@@ -1114,6 +1114,98 @@ fn freshness_timer_reclassifies_only_while_visible() {
 }
 
 #[test]
+fn initial_hidden_probe_dispatches_even_when_model_already_desires_hidden() {
+    let runtime = RuntimeHandle::default();
+    let mut model = AppModel::new(
+        PersistedState::starter(),
+        CachedMarketState::default(),
+        runtime.clone(),
+    );
+
+    model.set_visible_at(false, ts(1_000));
+
+    assert!(matches!(
+        runtime.recorded_commands().as_slice(),
+        [RuntimeCommand::SetVisible(false)]
+    ));
+}
+
+#[test]
+fn visible_ticks_request_repaint_on_consecutive_seconds_within_one_freshness_class() {
+    let mut model = AppModel::new(
+        PersistedState::starter(),
+        CachedMarketState::default(),
+        fake_runtime(),
+    );
+    let aapl = InstrumentId::equity("AAPL", Some("NASDAQ")).expect("AAPL");
+    let mut quote = cached_quote(aapl, 100.0, 99.0);
+    quote.provider_timestamp = ts(1_000);
+    quote.received_at = ts(1_000);
+    model.apply_runtime_event_at(RuntimeEvent::Quotes(vec![quote]), ts(1_000));
+    model.set_visible_at(true, ts(1_000));
+
+    assert!(model.tick_at(ts(1_001)));
+    assert!(model.tick_at(ts(1_002)));
+    model.set_visible_at(false, ts(1_002));
+    assert!(!model.tick_at(ts(1_003)));
+}
+
+#[test]
+fn hiding_terminalizes_search_and_rejects_its_late_completion() {
+    let mut model = AppModel::new(
+        PersistedState::starter(),
+        CachedMarketState::default(),
+        fake_runtime(),
+    );
+    model.set_visible_at(true, ts(1_000));
+    let generation = model.set_search_query("private-query");
+    model.advance_search_clock(Duration::from_millis(250));
+    assert!(model.search().is_loading());
+
+    model.set_visible_at(false, ts(1_001));
+    model.apply_search_results(generation, vec![nvda_result()], Vec::new());
+
+    assert!(!model.search().is_loading());
+    assert!(model.search().results().is_empty());
+    assert_eq!(
+        model.search().terminal_error(),
+        Some("Search paused while Kabu is hidden.")
+    );
+}
+
+#[test]
+fn restore_reissues_one_missing_selected_chart_but_never_duplicates_it() {
+    let runtime = RuntimeHandle::default();
+    let mut model = AppModel::new(
+        state_with_one_instrument(),
+        CachedMarketState::default(),
+        runtime.clone(),
+    );
+    model.set_visible_at(true, ts(1_000));
+    model.select_period_at(ChartPeriod::OneDay, ts(1_000));
+    assert_eq!(history_command_count(&runtime), 1);
+
+    model.set_visible_at(false, ts(1_001));
+    model.set_visible_at(true, ts(1_002));
+    model.set_visible_at(true, ts(1_003));
+
+    assert_eq!(history_command_count(&runtime), 2);
+}
+
+#[test]
+fn restore_does_not_request_a_selected_chart_that_is_still_fresh() {
+    let (mut model, runtime, now) =
+        model_with_cached_chart(ChartPeriod::OneDay, Duration::from_secs(30));
+    model.set_visible_at(true, now);
+    model.select_period_at(ChartPeriod::OneDay, now);
+
+    model.set_visible_at(false, now + chrono::Duration::seconds(1));
+    model.set_visible_at(true, now + chrono::Duration::seconds(2));
+
+    assert_eq!(history_command_count(&runtime), 0);
+}
+
+#[test]
 fn market_cache_writes_are_batched_for_two_seconds_and_finally_flushed() {
     let runtime = RuntimeHandle::default();
     let mut model = AppModel::new(
@@ -1215,11 +1307,207 @@ fn repeated_quote_errors_have_stable_sanitized_text_without_toast_spam_and_retry
     ));
 }
 
+#[test]
+fn history_error_is_hidden_after_selection_change_and_retry_cannot_target_the_old_key() {
+    let runtime = RuntimeHandle::default();
+    let mut model = AppModel::new(
+        PersistedState::starter(),
+        CachedMarketState::default(),
+        runtime.clone(),
+    );
+    let instrument = model.selected().expect("selection").clone();
+    let generation = model.request_history(instrument.clone(), ChartPeriod::OneYear);
+    let key = ChartRequestKey {
+        instrument_id: instrument.id,
+        period: ChartPeriod::OneYear,
+    };
+    model.apply_runtime_event(RuntimeEvent::HistoryFailed {
+        generation,
+        key,
+        error: market_error(MarketDataErrorKind::Timeout),
+    });
+    assert!(model.history_error_message().is_some());
+
+    model.select_index(1).expect("select another instrument");
+    let before_retry = history_command_count(&runtime);
+    model.retry_selected_history();
+
+    assert!(model.history_error_message().is_none());
+    assert_eq!(history_command_count(&runtime), before_retry);
+}
+
+#[test]
+fn successful_history_clears_its_operational_warning() {
+    let mut model = AppModel::new(
+        PersistedState::starter(),
+        CachedMarketState::default(),
+        fake_runtime(),
+    );
+    let instrument = model.selected().expect("selection").clone();
+    let generation = model.request_history(instrument.clone(), ChartPeriod::OneMonth);
+    let key = ChartRequestKey {
+        instrument_id: instrument.id.clone(),
+        period: ChartPeriod::OneMonth,
+    };
+    model.apply_runtime_event(RuntimeEvent::HistoryFailed {
+        generation,
+        key: key.clone(),
+        error: market_error(MarketDataErrorKind::Timeout),
+    });
+    assert_eq!(model.warnings().len(), 1);
+    let retry = model.request_history(instrument, ChartPeriod::OneMonth);
+
+    model.apply_runtime_event_at(
+        RuntimeEvent::HistoryCompleted {
+            generation: retry,
+            key,
+            candles: vec![history_candle(101.0)],
+        },
+        ts(2_000),
+    );
+
+    assert!(model.warnings().is_empty());
+}
+
+#[test]
+fn quote_retry_queue_failure_is_terminal_and_preserves_last_good_quote() {
+    let runtime = RuntimeHandle::default();
+    for _ in 0..64 {
+        runtime
+            .send(RuntimeCommand::Snapshot {
+                instruments: Vec::new(),
+            })
+            .expect("fill recording queue");
+    }
+    let selected = PersistedState::starter()
+        .watchlist
+        .selected()
+        .expect("selected")
+        .id
+        .clone();
+    let mut cache = CachedMarketState::default();
+    cache.quotes.insert(
+        selected.clone(),
+        cached_quote(selected.clone(), 123.0, 120.0),
+    );
+    let mut model = AppModel::new(PersistedState::starter(), cache, runtime);
+
+    model.retry_selected_quote();
+
+    assert_eq!(model.quote(&selected).expect("last good").last, 123.0);
+    assert!(!model.quote_is_loading(&selected));
+    assert_eq!(model.warnings().len(), 1);
+}
+
+#[test]
+fn quote_retry_closed_runtime_is_terminal_without_loading() {
+    let runtime = RuntimeHandle::default();
+    runtime.shutdown();
+    let selected = PersistedState::starter()
+        .watchlist
+        .selected()
+        .expect("selected")
+        .id
+        .clone();
+    let mut model = AppModel::new(
+        PersistedState::starter(),
+        CachedMarketState::default(),
+        runtime,
+    );
+
+    model.retry_selected_quote();
+
+    assert!(!model.quote_is_loading(&selected));
+    assert_eq!(model.warnings().len(), 1);
+}
+
+#[test]
+fn sustained_cache_queue_saturation_keeps_warnings_bounded() {
+    let runtime = RuntimeHandle::default();
+    for _ in 0..64 {
+        runtime
+            .send(RuntimeCommand::Snapshot {
+                instruments: Vec::new(),
+            })
+            .expect("fill recording queue");
+    }
+    let mut model = AppModel::new(
+        PersistedState::starter(),
+        CachedMarketState::default(),
+        runtime.clone(),
+    );
+    let id = InstrumentId::equity("AAPL", Some("NASDAQ")).expect("AAPL");
+    let mut quote = cached_quote(id, 100.0, 99.0);
+    quote.provider_timestamp = ts(1_000);
+    quote.received_at = ts(1_000);
+    model.apply_runtime_event_at(RuntimeEvent::Quotes(vec![quote]), ts(1_000));
+
+    for seconds in 1..=500 {
+        model.tick_at(ts(1_000 + seconds * 2));
+    }
+
+    assert_eq!(model.warnings().len(), 1);
+    assert_eq!(runtime.take_recorded_commands().len(), 64);
+    model.tick_at(ts(2_002));
+    assert!(model.warnings().is_empty());
+    assert_eq!(persist_cache_count(&runtime), 1);
+}
+
+#[test]
+fn failed_startup_catalog_refresh_surfaces_sanitized_provider_kinds_without_spam() {
+    for kind in [
+        MarketDataErrorKind::Unavailable,
+        MarketDataErrorKind::RateLimited,
+        MarketDataErrorKind::MalformedResponse,
+    ] {
+        let mut model = AppModel::new(
+            PersistedState::starter(),
+            CachedMarketState::default(),
+            fake_runtime(),
+        );
+        for _ in 0..100 {
+            model.apply_runtime_event(RuntimeEvent::CatalogRefresh {
+                result: Err(kind),
+                catalog_available: false,
+            });
+        }
+        let generation = model.begin_search("private-catalog-query");
+        model.apply_runtime_event(RuntimeEvent::SearchCompleted {
+            generation,
+            results: vec![nvda_result()],
+            warnings: Vec::new(),
+        });
+
+        assert_eq!(model.search().results(), &[nvda_result()]);
+        assert_eq!(model.search().provider_warnings().len(), 1);
+        let warning = &model.search().provider_warnings()[0];
+        assert_eq!(warning.source, DataSource::Binance);
+        assert_eq!(warning.kind, kind);
+        assert!(!warning.message.contains("private-catalog-query"));
+        assert_eq!(model.warnings().len(), 1);
+
+        model.apply_runtime_event(RuntimeEvent::CatalogRefresh {
+            result: Ok(()),
+            catalog_available: true,
+        });
+        assert!(model.warnings().is_empty());
+        assert!(model.search().provider_warnings().is_empty());
+    }
+}
+
 fn persist_cache_count(runtime: &RuntimeHandle) -> usize {
     runtime
         .recorded_commands()
         .iter()
         .filter(|command| matches!(command, RuntimeCommand::PersistMarketCache { .. }))
+        .count()
+}
+
+fn history_command_count(runtime: &RuntimeHandle) -> usize {
+    runtime
+        .recorded_commands()
+        .iter()
+        .filter(|command| matches!(command, RuntimeCommand::History { .. }))
         .count()
 }
 
