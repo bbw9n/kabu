@@ -3279,6 +3279,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-channel 2.5.0",
+ "chrono",
  "gpui",
  "gpui-component",
  "gpui-component-assets",
@@ -3287,6 +3288,8 @@ dependencies = [
  "objc2",
  "objc2-app-kit",
  "raw-window-handle",
+ "tempfile",
+ "thiserror 2.0.20",
  "tokio",
  "tracing",
 ]

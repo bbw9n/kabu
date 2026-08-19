@@ -1,4 +1,4 @@
-use gpui::{App, Global, WeakEntity, actions};
+use gpui::{App, Global, KeyBinding, WeakEntity, actions};
 use kabu_core::ThemePreference;
 
 use crate::views::AppShell;
@@ -9,7 +9,10 @@ actions!(
         SelectSystemTheme,
         SelectGraphiteTheme,
         SelectMidnightTheme,
-        SelectSignalTheme
+        SelectSignalTheme,
+        SelectPreviousWatchlist,
+        SelectNextWatchlist,
+        RemoveSelectedInstrument
     ]
 );
 
@@ -26,6 +29,12 @@ pub fn init(cx: &mut App) {
         return;
     }
 
+    cx.bind_keys([
+        KeyBinding::new("up", SelectPreviousWatchlist, Some("Watchlist")),
+        KeyBinding::new("down", SelectNextWatchlist, Some("Watchlist")),
+        KeyBinding::new("backspace", RemoveSelectedInstrument, Some("Watchlist")),
+        KeyBinding::new("delete", RemoveSelectedInstrument, Some("Watchlist")),
+    ]);
     cx.set_global(ThemeActionTarget::default());
     cx.on_action(|_: &SelectSystemTheme, cx| {
         dispatch_theme(ThemePreference::System, cx);

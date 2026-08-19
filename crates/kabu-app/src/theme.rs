@@ -105,6 +105,8 @@ pub fn apply_theme(theme: KabuTheme, window: Option<&mut Window>, cx: &mut App) 
     colors.border = rgb(palette.border).into();
     colors.muted = rgb(palette.border).into();
     colors.primary = rgb(palette.gain).into();
+    colors.success = rgb(palette.gain).into();
+    colors.danger = rgb(palette.loss).into();
     colors.popover = rgb(palette.surface).into();
     colors.sidebar = rgb(palette.surface).into();
     colors.selection = rgb(palette.border).into();

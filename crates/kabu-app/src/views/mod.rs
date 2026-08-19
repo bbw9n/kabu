@@ -1,8 +1,11 @@
 mod app_shell;
 mod theme_switcher;
+mod watchlist;
 
-pub use app_shell::{
-    AppShell, DEFAULT_WINDOW_HEIGHT, DEFAULT_WINDOW_WIDTH, MIN_WINDOW_HEIGHT, MIN_WINDOW_WIDTH,
-    SIDEBAR_WIDTH,
+pub use crate::app_model::{
+    DEFAULT_SIDEBAR_WIDTH as SIDEBAR_WIDTH, DEFAULT_WINDOW_HEIGHT, DEFAULT_WINDOW_WIDTH,
+    MIN_WINDOW_HEIGHT, MIN_WINDOW_WIDTH,
 };
+pub use app_shell::AppShell;
 pub use theme_switcher::ThemeSwitcher;
+pub use watchlist::{WATCHLIST_KEY_CONTEXT, WatchlistPane};
