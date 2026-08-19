@@ -9,10 +9,13 @@ use kabu_app::{
     theme::{KabuTheme, ThemeSelection},
     views::{
         AppShell, DEFAULT_WINDOW_HEIGHT, DEFAULT_WINDOW_WIDTH, MIN_WINDOW_HEIGHT, MIN_WINDOW_WIDTH,
-        SIDEBAR_WIDTH,
+        SIDEBAR_WIDTH, SelectedQuoteAvailability,
     },
 };
-use kabu_core::{StateRepository, ThemePreference};
+use kabu_core::{
+    CachedMarketState, DataSource, InstrumentId, MarketState, PersistedState, Quote,
+    StateRepository, ThemePreference,
+};
 use kabu_data::JsonRepository;
 use std::{sync::Arc, time::Duration};
 
@@ -80,18 +83,97 @@ fn clicking_a_watchlist_row_selects_it(cx: &mut gpui::TestAppContext) {
         gpui_component::init(cx);
         kabu_app::commands::init(cx);
     });
-    let (shell, cx) = cx.add_window_view(AppShell::new);
+    let model = cached_watchlist_model(cx);
+    let (shell, cx) =
+        cx.add_window_view(move |window, cx| AppShell::with_model(model.clone(), window, cx));
     let model = shell.update(cx, |shell, _| shell.model());
     cx.refresh().expect("render shell");
 
-    let row = cx.debug_bounds("watchlist-row-2").expect("BTC row bounds");
+    shell.update(cx, |shell, cx| {
+        let header = shell.selected_quote_header(cx);
+        assert_eq!(header.symbol, "AAPL");
+        assert_eq!(header.price, "100.00 USD");
+    });
+
+    let row = cx.debug_bounds("watchlist-row-1").expect("NVDA row bounds");
     cx.simulate_click(row.center(), Modifiers::none());
 
     model.read_with(cx, |model, _| {
         assert_eq!(
             model.selected().expect("selection").id.canonical_symbol(),
-            "BTC/USDT"
+            "NVDA"
         );
+    });
+    shell.update(cx, |shell, cx| {
+        let header = shell.selected_quote_header(cx);
+        assert_eq!(header.symbol, "NVDA");
+        assert_eq!(header.price, "200.00 USD");
+        assert_eq!(header.change, "−10.00 (−4.76%)");
+        assert_eq!(header.source, "Yahoo");
+        assert_eq!(header.provider_timestamp, "2023-11-14T22:13:20+00:00");
+        assert_eq!(header.availability, SelectedQuoteAvailability::Available);
+    });
+}
+
+#[gpui::test]
+fn keyboard_selection_updates_the_cached_quote_header_without_runtime_work(
+    cx: &mut gpui::TestAppContext,
+) {
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        kabu_app::commands::init(cx);
+    });
+    let model = cached_watchlist_model(cx);
+    let (shell, cx) =
+        cx.add_window_view(move |window, cx| AppShell::with_model(model.clone(), window, cx));
+    cx.update(|window, cx| {
+        shell.update(cx, |shell, _| shell.focus_watchlist(window));
+    });
+    cx.refresh().expect("render focused cached shell");
+
+    cx.dispatch_action(SelectNextWatchlist);
+
+    shell.update(cx, |shell, cx| {
+        let header = shell.selected_quote_header(cx);
+        assert_eq!(header.symbol, "NVDA");
+        assert_eq!(header.price, "200.00 USD");
+        assert_eq!(header.change, "−10.00 (−4.76%)");
+        assert_eq!(header.source, "Yahoo");
+        assert_eq!(header.provider_timestamp, "2023-11-14T22:13:20+00:00");
+    });
+}
+
+#[gpui::test]
+fn selected_quote_header_distinguishes_missing_and_loading_without_zero_values(
+    cx: &mut gpui::TestAppContext,
+) {
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        kabu_app::commands::init(cx);
+    });
+    let (shell, cx) = cx.add_window_view(AppShell::new);
+    let model = shell.update(cx, |shell, _| shell.model());
+
+    shell.update(cx, |shell, cx| {
+        let header = shell.selected_quote_header(cx);
+        assert_eq!(header.price, "—");
+        assert_eq!(header.change, "—");
+        assert_eq!(header.status, "No cached quote");
+        assert_eq!(header.availability, SelectedQuoteAvailability::Unavailable);
+    });
+
+    model.update(cx, |model, cx| {
+        let selected = model.selected_identity().expect("selection").clone();
+        model.set_quote_loading(selected, true);
+        cx.notify();
+    });
+
+    shell.update(cx, |shell, cx| {
+        let header = shell.selected_quote_header(cx);
+        assert_eq!(header.price, "—");
+        assert_eq!(header.change, "—");
+        assert_eq!(header.status, "Loading quote");
+        assert_eq!(header.availability, SelectedQuoteAvailability::Loading);
     });
 }
 
@@ -240,4 +322,38 @@ fn theme_action_target_moves_to_recreated_shell_and_clears_on_release(
     first_shell.update(cx, |shell, _| {
         assert_eq!(shell.theme_preference(), ThemePreference::Signal);
     });
+}
+
+fn cached_watchlist_model(cx: &mut gpui::TestAppContext) -> gpui::Entity<AppModel> {
+    let aapl = InstrumentId::equity("AAPL", Some("NASDAQ")).expect("AAPL id");
+    let nvda = InstrumentId::equity("NVDA", Some("NASDAQ")).expect("NVDA id");
+    let mut cache = CachedMarketState::default();
+    cache
+        .quotes
+        .insert(aapl.clone(), cached_quote(aapl, 100.0, 95.0));
+    cache
+        .quotes
+        .insert(nvda.clone(), cached_quote(nvda, 200.0, 210.0));
+    cx.update(|cx| {
+        cx.new(|_| AppModel::new(PersistedState::starter(), cache, RuntimeHandle::default()))
+    })
+}
+
+fn cached_quote(instrument_id: InstrumentId, last: f64, previous_close: f64) -> Quote {
+    let timestamp = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp");
+    Quote {
+        instrument_id,
+        last,
+        previous_close: Some(previous_close),
+        open: None,
+        high: None,
+        low: None,
+        volume: None,
+        currency: "USD".into(),
+        source: DataSource::Yahoo,
+        market_state: MarketState::Regular,
+        provider_timestamp: timestamp,
+        received_at: timestamp,
+        provider_delayed: false,
+    }
 }

@@ -36,7 +36,7 @@ fn main() {
                         display_width,
                         display_height,
                     );
-                    model.preview_window_geometry(width, height);
+                    model.set_restored_window_geometry(width, height);
                     let bounds = Bounds::centered(None, size(px(width), px(height)), cx);
                     (cx.new(|_| model), bounds)
                 })?;

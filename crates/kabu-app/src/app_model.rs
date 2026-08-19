@@ -59,8 +59,11 @@ pub struct AppModel {
     charts: HashMap<ChartRequestKey, CachedChart>,
     theme: ThemePreference,
     sidebar_width: f32,
+    committed_sidebar_width: f32,
     window_width: f32,
     window_height: f32,
+    committed_window_width: f32,
+    committed_window_height: f32,
     search: SearchState,
     runtime: RuntimeHandle,
     repository: Option<Arc<dyn StateRepository>>,
@@ -107,6 +110,14 @@ impl AppModel {
             quotes.merge(quote);
         }
         let selected_identity = state.watchlist.selected().map(|item| item.id.clone());
+        let sidebar_width = clamp_sidebar_width(state.sidebar_width);
+        let window_width =
+            clamp_dimension(state.window_width, MIN_WINDOW_WIDTH, DEFAULT_WINDOW_WIDTH);
+        let window_height = clamp_dimension(
+            state.window_height,
+            MIN_WINDOW_HEIGHT,
+            DEFAULT_WINDOW_HEIGHT,
+        );
 
         Self {
             watchlist: state.watchlist,
@@ -115,17 +126,12 @@ impl AppModel {
             loading_quotes: HashSet::new(),
             charts: cache.charts,
             theme: state.theme,
-            sidebar_width: clamp_sidebar_width(state.sidebar_width),
-            window_width: clamp_dimension(
-                state.window_width,
-                MIN_WINDOW_WIDTH,
-                DEFAULT_WINDOW_WIDTH,
-            ),
-            window_height: clamp_dimension(
-                state.window_height,
-                MIN_WINDOW_HEIGHT,
-                DEFAULT_WINDOW_HEIGHT,
-            ),
+            sidebar_width,
+            committed_sidebar_width: sidebar_width,
+            window_width,
+            window_height,
+            committed_window_width: window_width,
+            committed_window_height: window_height,
             search: SearchState::default(),
             runtime,
             repository,
@@ -251,7 +257,7 @@ impl AppModel {
 
     pub fn set_sidebar_width(&mut self, width: f32) -> Result<(), AppModelError> {
         self.preview_sidebar_width(width);
-        self.persist_state()
+        self.persist_sidebar_width()
     }
 
     pub fn preview_sidebar_width(&mut self, width: f32) {
@@ -259,12 +265,13 @@ impl AppModel {
     }
 
     pub fn persist_sidebar_width(&mut self) -> Result<(), AppModelError> {
+        self.committed_sidebar_width = self.sidebar_width;
         self.persist_state()
     }
 
     pub fn set_window_geometry(&mut self, width: f32, height: f32) -> Result<(), AppModelError> {
         self.preview_window_geometry(width, height);
-        self.persist_state()
+        self.persist_window_geometry()
     }
 
     pub fn preview_window_geometry(&mut self, width: f32, height: f32) {
@@ -273,7 +280,15 @@ impl AppModel {
     }
 
     pub fn persist_window_geometry(&mut self) -> Result<(), AppModelError> {
+        self.committed_window_width = self.window_width;
+        self.committed_window_height = self.window_height;
         self.persist_state()
+    }
+
+    pub fn set_restored_window_geometry(&mut self, width: f32, height: f32) {
+        self.preview_window_geometry(width, height);
+        self.committed_window_width = self.window_width;
+        self.committed_window_height = self.window_height;
     }
 
     fn persist_if_selection_changed(&mut self, before: Option<usize>) -> Result<(), AppModelError> {
@@ -307,9 +322,9 @@ impl AppModel {
         PersistedState {
             schema_version: kabu_core::STATE_SCHEMA_VERSION,
             watchlist: self.watchlist.clone(),
-            window_width: self.window_width,
-            window_height: self.window_height,
-            sidebar_width: self.sidebar_width,
+            window_width: self.committed_window_width,
+            window_height: self.committed_window_height,
+            sidebar_width: self.committed_sidebar_width,
             theme: self.theme,
         }
     }

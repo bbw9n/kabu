@@ -4,7 +4,7 @@ use kabu_app::{
 };
 use kabu_core::{
     CachedMarketState, DataSource, InstrumentId, MarketState, PersistedState, PersistenceError,
-    Quote, StateRepository, ThemePreference,
+    Quote, StateRepository, ThemePreference, Watchlist,
 };
 use std::{
     io,
@@ -100,6 +100,92 @@ fn sidebar_drag_previews_live_and_persists_only_when_committed() {
 }
 
 #[test]
+fn selection_during_geometry_debounce_serializes_committed_geometry() {
+    let repo = RecordingRepository::starter();
+    let mut model = AppModel::with_repository(repo.clone(), fake_runtime());
+
+    model.preview_window_geometry(900.0, 580.0);
+    model.select_index(1).expect("select during resize");
+
+    let saved_states = repo.saved_states();
+    let selection_save = saved_states.last().expect("selection save");
+    assert_eq!(
+        (selection_save.window_width, selection_save.window_height),
+        (980.0, 640.0)
+    );
+    assert_eq!(model.window_geometry(), (900.0, 580.0));
+
+    model
+        .persist_window_geometry()
+        .expect("debounced geometry commit");
+    let saved_states = repo.saved_states();
+    let geometry_save = saved_states.last().expect("geometry save");
+    assert_eq!(
+        (geometry_save.window_width, geometry_save.window_height),
+        (900.0, 580.0)
+    );
+}
+
+#[test]
+fn theme_during_sidebar_drag_serializes_committed_sidebar_width() {
+    let repo = RecordingRepository::starter();
+    let mut model = AppModel::with_repository(repo.clone(), fake_runtime());
+
+    model.preview_sidebar_width(350.0);
+    model
+        .set_theme(ThemePreference::Signal)
+        .expect("theme during drag");
+
+    let saved_states = repo.saved_states();
+    let theme_save = saved_states.last().expect("theme save");
+    assert_eq!(theme_save.theme, ThemePreference::Signal);
+    assert_eq!(theme_save.sidebar_width, 280.0);
+    assert_eq!(model.sidebar_width(), 350.0);
+
+    model
+        .persist_sidebar_width()
+        .expect("mouse-up sidebar commit");
+    let saved_states = repo.saved_states();
+    assert_eq!(
+        saved_states.last().expect("sidebar save").sidebar_width,
+        350.0
+    );
+}
+
+#[test]
+fn repository_load_preserves_custom_order_and_non_first_selection() {
+    let starter = Watchlist::starter();
+    let mut custom = Watchlist::default();
+    for index in [2, 0, 3, 1] {
+        custom.add(starter.instruments()[index].clone());
+    }
+    custom.select(2).expect("select ETH");
+    let mut state = PersistedState::starter();
+    state.watchlist = custom;
+    let repo = RecordingRepository::with_state(state);
+
+    let model = AppModel::with_repository(repo, fake_runtime());
+
+    assert_eq!(
+        model
+            .watchlist()
+            .instruments()
+            .iter()
+            .map(|instrument| instrument.id.canonical_symbol())
+            .collect::<Vec<_>>(),
+        ["BTC/USDT", "AAPL", "ETH/USDT", "NVDA"]
+    );
+    assert_eq!(model.watchlist().selected_index(), Some(2));
+    assert_eq!(
+        model
+            .selected_identity()
+            .expect("selected identity")
+            .canonical_symbol(),
+        "ETH/USDT"
+    );
+}
+
+#[test]
 fn cached_quote_is_available_on_launch() {
     let aapl = InstrumentId::equity("AAPL", Some("NASDAQ")).expect("id");
     let quote = cached_quote(aapl.clone(), 201.25, 199.0);
@@ -176,6 +262,17 @@ impl RecordingRepository {
 
     fn failing() -> Self {
         Self::new(true)
+    }
+
+    fn with_state(state: PersistedState) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(RecordingState {
+                state,
+                cache: CachedMarketState::default(),
+                saved_states: Vec::new(),
+                fail_saves: false,
+            })),
+        }
     }
 
     fn new(fail_saves: bool) -> Self {

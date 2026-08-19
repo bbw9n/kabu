@@ -1,11 +1,13 @@
 use gpui::{
-    App, AppContext as _, Context, DragMoveEvent, Empty, Entity, FocusHandle,
+    App, AppContext as _, Context, DragMoveEvent, Empty, Entity, FocusHandle, FontFeatures,
     InteractiveElement as _, IntoElement, ParentElement as _, Render,
     StatefulInteractiveElement as _, Styled as _, Subscription, Window, WindowAppearance, div, px,
 };
-use gpui_component::{ActiveTheme as _, IconName, StyledExt as _, TitleBar, button::Button};
-use kabu_core::{CachedMarketState, PersistedState, ThemePreference};
-use std::{borrow::BorrowMut, time::Duration};
+use gpui_component::{
+    ActiveTheme as _, IconName, StyledExt as _, TitleBar, button::Button, skeleton::Skeleton,
+};
+use kabu_core::{CachedMarketState, PersistedState, Quote, ThemePreference};
+use std::{borrow::BorrowMut, sync::Arc, time::Duration};
 
 use crate::{
     app_model::{AppModel, DEFAULT_SIDEBAR_WIDTH},
@@ -16,6 +18,25 @@ use crate::{
 };
 
 type IconButton = Button;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SelectedQuoteAvailability {
+    Available,
+    Loading,
+    Unavailable,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SelectedQuoteHeader {
+    pub symbol: String,
+    pub display_name: String,
+    pub price: String,
+    pub change: String,
+    pub source: String,
+    pub provider_timestamp: String,
+    pub status: String,
+    pub availability: SelectedQuoteAvailability,
+}
 
 #[derive(Clone)]
 struct SidebarDrag;
@@ -109,6 +130,47 @@ impl AppShell {
 
     pub fn focus_watchlist(&self, window: &mut Window) {
         self.watchlist_focus.focus(window);
+    }
+
+    pub fn selected_quote_header(&self, cx: &App) -> SelectedQuoteHeader {
+        let model = self.model.read(cx);
+        let Some(instrument) = model.selected() else {
+            return SelectedQuoteHeader {
+                symbol: String::new(),
+                display_name: "No instrument selected".into(),
+                price: "—".into(),
+                change: "—".into(),
+                source: "—".into(),
+                provider_timestamp: "—".into(),
+                status: "Unavailable".into(),
+                availability: SelectedQuoteAvailability::Unavailable,
+            };
+        };
+
+        if let Some(quote) = model.quote(&instrument.id) {
+            return available_quote_header(instrument, quote);
+        }
+
+        let loading = model.quote_is_loading(&instrument.id);
+        SelectedQuoteHeader {
+            symbol: instrument.id.canonical_symbol(),
+            display_name: instrument.display_name.clone(),
+            price: "—".into(),
+            change: "—".into(),
+            source: if loading { "Loading" } else { "Unavailable" }.into(),
+            provider_timestamp: "—".into(),
+            status: if loading {
+                "Loading quote"
+            } else {
+                "No cached quote"
+            }
+            .into(),
+            availability: if loading {
+                SelectedQuoteAvailability::Loading
+            } else {
+                SelectedQuoteAvailability::Unavailable
+            },
+        }
     }
 
     pub const fn theme_preference(&self) -> ThemePreference {
@@ -232,18 +294,7 @@ impl AppShell {
 impl Render for AppShell {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let sidebar_width = self.model.read(cx).sidebar_width();
-        let selected_text = self
-            .model
-            .read(cx)
-            .selected()
-            .map(|instrument| {
-                format!(
-                    "{} · {}",
-                    instrument.id.canonical_symbol(),
-                    instrument.display_name
-                )
-            })
-            .unwrap_or_else(|| "No instrument selected".into());
+        let selected_header = self.selected_quote_header(cx);
         let warning = self
             .model
             .read(cx)
@@ -308,13 +359,12 @@ impl Render for AppShell {
                     .child(
                         div()
                             .flex()
+                            .flex_col()
                             .flex_1()
                             .h_full()
-                            .items_center()
-                            .justify_center()
                             .bg(cx.theme().background)
-                            .text_color(cx.theme().muted_foreground)
-                            .child(selected_text),
+                            .p_6()
+                            .child(render_selected_quote_header(selected_header, cx)),
                     )
                     .on_drag_move(cx.listener(
                         |shell, event: &DragMoveEvent<SidebarDrag>, _, cx| {
@@ -326,4 +376,130 @@ impl Render for AppShell {
                     })),
             )
     }
+}
+
+fn available_quote_header(
+    instrument: &kabu_core::Instrument,
+    quote: &Quote,
+) -> SelectedQuoteHeader {
+    SelectedQuoteHeader {
+        symbol: instrument.id.canonical_symbol(),
+        display_name: instrument.display_name.clone(),
+        price: format!("{:.2} {}", quote.last, quote.currency),
+        change: format_quote_change(quote),
+        source: format!("{:?}", quote.source),
+        provider_timestamp: quote.provider_timestamp.to_rfc3339(),
+        status: format!("{:?}", quote.market_state),
+        availability: SelectedQuoteAvailability::Available,
+    }
+}
+
+fn format_quote_change(quote: &Quote) -> String {
+    match (quote.absolute_change(), quote.percent_change()) {
+        (Some(absolute), Some(percent)) => {
+            format!("{} ({})", signed_value(absolute), signed_percent(percent))
+        }
+        (Some(absolute), None) => signed_value(absolute),
+        (None, _) => "—".into(),
+    }
+}
+
+fn signed_value(value: f64) -> String {
+    if value > 0.0 {
+        format!("+{value:.2}")
+    } else if value < 0.0 {
+        format!("−{:.2}", value.abs())
+    } else {
+        "0.00".into()
+    }
+}
+
+fn signed_percent(value: f64) -> String {
+    if value > 0.0 {
+        format!("+{value:.2}%")
+    } else if value < 0.0 {
+        format!("−{:.2}%", value.abs())
+    } else {
+        "0.00%".into()
+    }
+}
+
+fn render_selected_quote_header(header: SelectedQuoteHeader, cx: &App) -> gpui::AnyElement {
+    let metadata = format!("{} · {}", header.source, header.provider_timestamp);
+    let change_color = if header.change.starts_with('+') {
+        cx.theme().success
+    } else if header.change.starts_with('−') {
+        cx.theme().danger
+    } else {
+        cx.theme().muted_foreground
+    };
+
+    div()
+        .debug_selector(|| "selected-quote-header".into())
+        .flex()
+        .flex_col()
+        .gap_4()
+        .child(
+            div()
+                .flex()
+                .items_end()
+                .justify_between()
+                .gap_4()
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .child(div().text_2xl().font_semibold().child(header.symbol))
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(header.display_name),
+                        ),
+                )
+                .child(match header.availability {
+                    SelectedQuoteAvailability::Loading => div()
+                        .flex()
+                        .flex_col()
+                        .items_end()
+                        .gap_1()
+                        .child(Skeleton::new().h(px(24.0)).w(px(112.0)))
+                        .child(Skeleton::new().secondary().h(px(14.0)).w(px(80.0)))
+                        .into_any_element(),
+                    SelectedQuoteAvailability::Available
+                    | SelectedQuoteAvailability::Unavailable => div()
+                        .flex()
+                        .flex_col()
+                        .items_end()
+                        .font(tabular_font())
+                        .child(div().text_2xl().font_semibold().child(header.price))
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(change_color)
+                                .child(header.change),
+                        )
+                        .into_any_element(),
+                }),
+        )
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .border_t_1()
+                .border_color(cx.theme().border)
+                .pt_3()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(header.status)
+                .child(metadata),
+        )
+        .into_any_element()
+}
+
+fn tabular_font() -> gpui::Font {
+    let mut value = gpui::font(".SystemUIFont");
+    value.features = FontFeatures(Arc::new(vec![("tnum".into(), 1)]));
+    value
 }
