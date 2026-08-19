@@ -1,0 +1,29 @@
+{
+  "chart": {
+    "result": [
+      {
+        "meta": {
+          "currency": "USD",
+          "exchangeTimezoneName": "America/New_York",
+          "marketState": "REGULAR",
+          "regularMarketTime": 1724171400,
+          "dataGranularity": "1m",
+          "previousClose": 123.0
+        },
+        "timestamp": [1724171220, 1724171280, 1724171340, 1724171400],
+        "indicators": {
+          "quote": [
+            {
+              "open": [123.1, 123.2, 123.3, null],
+              "high": [123.5, 123.6, 123.7, null],
+              "low": [123.0, 123.1, 123.2, null],
+              "close": [123.4, 123.5, 123.6, null],
+              "volume": [100, 200, 300, null]
+            }
+          ]
+        }
+      }
+    ],
+    "error": null
+  }
+}

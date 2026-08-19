@@ -40,6 +40,13 @@ pub enum InstrumentError {
 }
 
 impl InstrumentId {
+    pub fn asset_class(&self) -> AssetClass {
+        match self {
+            Self::Equity { .. } => AssetClass::Equity,
+            Self::Crypto { .. } => AssetClass::Crypto,
+        }
+    }
+
     pub fn equity(symbol: &str, venue: Option<&str>) -> Result<Self, InstrumentError> {
         let symbol = normalize_asset(symbol, "symbol", false)?;
         let venue = venue.map(normalize_venue).transpose()?;
@@ -152,6 +159,15 @@ mod tests {
                 venue: Some("NYSE".into())
             }
         );
+    }
+
+    #[test]
+    fn identity_reports_its_asset_class() {
+        let equity = InstrumentId::equity("nvda", Some("NASDAQ")).expect("equity");
+        let crypto = InstrumentId::crypto("btc", "usdt").expect("crypto");
+
+        assert_eq!(equity.asset_class(), AssetClass::Equity);
+        assert_eq!(crypto.asset_class(), AssetClass::Crypto);
     }
     #[test]
     fn identity_constructors_reject_invalid_assets() {
