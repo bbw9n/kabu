@@ -5,10 +5,9 @@ use kabu_app::views::{
 };
 use kabu_app::{
     app_model::{AppModel, clamp_window_size_to_display},
-    runtime::RuntimeHandle,
+    macos_visibility::MacOsVisibilityProbe,
+    runtime::ProductionComponents,
 };
-use kabu_data::JsonRepository;
-use std::sync::Arc;
 
 fn main() {
     gpui::Application::new()
@@ -17,11 +16,10 @@ fn main() {
             gpui_component::init(cx);
             kabu_app::commands::init(cx);
             cx.spawn(async move |cx| {
+                let launch = ProductionComponents::production()?.start()?;
                 let (model, bounds) = cx.update(|cx| {
-                    let mut model = AppModel::with_shared_repository(
-                        Arc::new(JsonRepository::default_macos()),
-                        RuntimeHandle::default(),
-                    );
+                    let mut model =
+                        AppModel::from_recoveries(launch.state, launch.cache, launch.runtime);
                     let (persisted_width, persisted_height) = model.window_geometry();
                     let (display_width, display_height) = cx
                         .primary_display()
@@ -48,7 +46,16 @@ fn main() {
                         ..Default::default()
                     },
                     move |window, cx| {
-                        let shell = cx.new(|cx| AppShell::with_model(model.clone(), window, cx));
+                        let probe = MacOsVisibilityProbe::new(window)
+                            .expect("production GPUI window exposes an AppKit view");
+                        let shell = cx.new(|cx| {
+                            AppShell::with_model_and_visibility(
+                                model.clone(),
+                                Box::new(probe),
+                                window,
+                                cx,
+                            )
+                        });
                         cx.new(|cx| Root::new(shell, window, cx))
                     },
                 )?;

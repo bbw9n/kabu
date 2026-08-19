@@ -3,10 +3,11 @@ use kabu_app::{
     runtime::{ProviderWarning, RuntimeCommand, RuntimeEvent, RuntimeHandle},
 };
 use kabu_core::{
-    CachedMarketState, Candle, ChartPeriod, ChartRequestKey, DataSource, Instrument, InstrumentId,
-    MarketDataError, MarketDataErrorKind, MarketState, PersistedState, PersistenceError, Quote,
-    SearchResult, StateRepository, ThemePreference, Watchlist,
+    CachedMarketState, Candle, ChartPeriod, ChartRequestKey, DataSource, Freshness, Instrument,
+    InstrumentId, MarketDataError, MarketDataErrorKind, MarketState, PersistedState,
+    PersistenceError, Quote, SearchResult, StateRepository, ThemePreference, Watchlist,
 };
+use kabu_data::Recovery;
 use std::{
     io,
     sync::{Arc, Mutex},
@@ -331,7 +332,7 @@ fn adding_search_result_appends_selects_persists_and_requests_market_data() {
     let commands = runtime.recorded_commands();
     assert!(matches!(
         &commands[0],
-        RuntimeCommand::Snapshot { instruments } if instruments.len() == 5
+        RuntimeCommand::SetWatchlist(instruments) if instruments.len() == 5
     ));
     assert!(matches!(
         &commands[1],
@@ -376,7 +377,7 @@ fn search_selection_uses_fresh_one_day_cache_without_history_request() {
     );
     assert!(matches!(
         runtime.recorded_commands().as_slice(),
-        [RuntimeCommand::Snapshot { .. }]
+        [RuntimeCommand::SetWatchlist(_)]
     ));
 }
 
@@ -443,7 +444,7 @@ fn add_persistence_failure_keeps_selection_and_still_requests_live_data() {
     assert!(matches!(
         runtime.recorded_commands().as_slice(),
         [
-            RuntimeCommand::Snapshot { .. },
+            RuntimeCommand::SetWatchlist(_),
             RuntimeCommand::History { .. }
         ]
     ));
@@ -979,7 +980,7 @@ fn current_history_failure_finishes_without_mutating_cached_chart() {
 }
 
 #[test]
-fn adding_new_crypto_requests_snapshot_complete_crypto_watchlist_and_one_day_history() {
+fn adding_new_crypto_updates_complete_watchlist_and_requests_one_day_history() {
     let runtime = RuntimeHandle::default();
     let mut model = AppModel::new(
         PersistedState::starter(),
@@ -995,22 +996,231 @@ fn adding_new_crypto_requests_snapshot_complete_crypto_watchlist_and_one_day_his
     let commands = runtime.recorded_commands();
     assert!(matches!(
         &commands[0],
-        RuntimeCommand::Snapshot { instruments }
+        RuntimeCommand::SetWatchlist(instruments)
             if instruments.last().map(|instrument| &instrument.id) == Some(&result.instrument.id)
     ));
     assert!(matches!(
         &commands[1],
-        RuntimeCommand::SetCryptoWatchlist(instruments)
-            if instruments
-                .iter()
-                .map(|instrument| instrument.id.canonical_symbol())
-                .collect::<Vec<_>>() == ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
-    ));
-    assert!(matches!(
-        &commands[2],
         RuntimeCommand::History { instrument, period: ChartPeriod::OneDay, .. }
             if instrument.id == result.instrument.id
     ));
+}
+
+#[test]
+fn app_model_rejects_older_quotes_and_preserves_the_last_good_value_on_error() {
+    let mut model = AppModel::new(
+        PersistedState::starter(),
+        CachedMarketState::default(),
+        fake_runtime(),
+    );
+    let id = InstrumentId::equity("AAPL", Some("NASDAQ")).expect("AAPL");
+    let mut newest = cached_quote(id.clone(), 222.0, 200.0);
+    newest.provider_timestamp = ts(2_000);
+    newest.received_at = ts(2_000);
+    let mut older = cached_quote(id.clone(), 111.0, 100.0);
+    older.provider_timestamp = ts(1_000);
+    older.received_at = ts(2_001);
+
+    model.apply_runtime_event_at(RuntimeEvent::Quotes(vec![newest]), ts(2_000));
+    model.set_quote_loading(id.clone(), true);
+    model.apply_runtime_event_at(RuntimeEvent::Quotes(vec![older]), ts(2_001));
+    assert!(model.quote_is_loading(&id));
+    model.apply_runtime_event_at(
+        RuntimeEvent::QuoteError {
+            instrument_ids: vec![id.clone()],
+            error: market_error(MarketDataErrorKind::Timeout),
+        },
+        ts(2_002),
+    );
+
+    assert_eq!(model.quote(&id).expect("last good quote").last, 222.0);
+    assert_eq!(
+        model.quote_error_message(&id),
+        Some("The market-data request timed out. Kabu will retry.")
+    );
+}
+
+#[test]
+fn app_model_classifies_every_freshness_state() {
+    let now = ts(10_000);
+    let mut model = AppModel::new(
+        PersistedState::starter(),
+        CachedMarketState::default(),
+        fake_runtime(),
+    );
+    let aapl = InstrumentId::equity("AAPL", Some("NASDAQ")).expect("AAPL");
+    let btc = InstrumentId::crypto("BTC", "USDT").expect("BTC");
+    assert_eq!(model.freshness(&aapl), Freshness::Unavailable);
+
+    let mut equity = cached_quote(aapl.clone(), 100.0, 99.0);
+    equity.provider_timestamp = now;
+    equity.received_at = now;
+    model.apply_runtime_event_at(RuntimeEvent::Quotes(vec![equity.clone()]), now);
+    assert_eq!(model.freshness(&aapl), Freshness::Fresh);
+    model.recompute_freshness_at(now + chrono::Duration::seconds(31));
+    assert_eq!(model.freshness(&aapl), Freshness::Aging);
+    model.recompute_freshness_at(now + chrono::Duration::seconds(121));
+    assert_eq!(model.freshness(&aapl), Freshness::Stale);
+
+    equity.provider_delayed = true;
+    equity.provider_timestamp = now + chrono::Duration::seconds(200);
+    model.apply_runtime_event_at(
+        RuntimeEvent::Quotes(vec![equity.clone()]),
+        now + chrono::Duration::seconds(200),
+    );
+    assert_eq!(model.freshness(&aapl), Freshness::Delayed);
+    equity.provider_delayed = false;
+    equity.market_state = MarketState::Closed;
+    equity.provider_timestamp = now + chrono::Duration::seconds(201);
+    model.apply_runtime_event_at(
+        RuntimeEvent::Quotes(vec![equity]),
+        now + chrono::Duration::seconds(201),
+    );
+    assert_eq!(model.freshness(&aapl), Freshness::Closed);
+
+    let mut crypto = cached_quote(btc.clone(), 100.0, 99.0);
+    crypto.source = DataSource::Binance;
+    crypto.market_state = MarketState::Continuous;
+    crypto.provider_timestamp = now;
+    crypto.received_at = now;
+    model.apply_runtime_event_at(RuntimeEvent::Quotes(vec![crypto]), now);
+    assert_eq!(model.freshness(&btc), Freshness::Live);
+}
+
+#[test]
+fn freshness_timer_reclassifies_only_while_visible() {
+    let runtime = RuntimeHandle::default();
+    let mut model = AppModel::new(
+        PersistedState::starter(),
+        CachedMarketState::default(),
+        runtime,
+    );
+    let btc = InstrumentId::crypto("BTC", "USDT").expect("BTC");
+    let mut quote = cached_quote(btc.clone(), 100.0, 99.0);
+    quote.source = DataSource::Binance;
+    quote.market_state = MarketState::Continuous;
+    quote.provider_timestamp = ts(1_000);
+    quote.received_at = ts(1_000);
+    model.apply_runtime_event_at(RuntimeEvent::Quotes(vec![quote]), ts(1_000));
+
+    model.set_visible_at(true, ts(1_000));
+    model.tick_at(ts(1_006));
+    assert_eq!(model.freshness(&btc), Freshness::Aging);
+    model.set_visible_at(false, ts(1_006));
+    model.tick_at(ts(1_016));
+    assert_eq!(model.freshness(&btc), Freshness::Aging);
+    model.set_visible_at(true, ts(1_016));
+    assert_eq!(model.freshness(&btc), Freshness::Stale);
+}
+
+#[test]
+fn market_cache_writes_are_batched_for_two_seconds_and_finally_flushed() {
+    let runtime = RuntimeHandle::default();
+    let mut model = AppModel::new(
+        PersistedState::starter(),
+        CachedMarketState::default(),
+        runtime.clone(),
+    );
+    let id = InstrumentId::equity("AAPL", Some("NASDAQ")).expect("AAPL");
+    let mut first = cached_quote(id.clone(), 100.0, 99.0);
+    first.provider_timestamp = ts(1_000);
+    first.received_at = ts(1_000);
+    model.apply_runtime_event_at(RuntimeEvent::Quotes(vec![first]), ts(1_000));
+    let mut second = cached_quote(id, 101.0, 99.0);
+    second.provider_timestamp = ts(1_001);
+    second.received_at = ts(1_001);
+    model.apply_runtime_event_at(RuntimeEvent::Quotes(vec![second]), ts(1_001));
+    model.tick_at(ts(1_001));
+
+    assert_eq!(persist_cache_count(&runtime), 1);
+    model.tick_at(ts(1_002));
+    assert_eq!(persist_cache_count(&runtime), 2);
+
+    model.flush_and_shutdown();
+    assert_eq!(persist_cache_count(&runtime), 3);
+    assert!(matches!(
+        runtime.recorded_commands().last(),
+        Some(RuntimeCommand::Shutdown)
+    ));
+}
+
+#[test]
+fn recovery_notices_are_once_per_category_and_never_include_file_contents() {
+    let secret = "private-watchlist-json-content";
+    let model = AppModel::from_recoveries(
+        Recovery {
+            value: PersistedState::starter(),
+            recovered_from_corruption: true,
+        },
+        Recovery {
+            value: CachedMarketState::default(),
+            recovered_from_corruption: true,
+        },
+        fake_runtime(),
+    );
+
+    assert_eq!(model.warnings().len(), 2);
+    assert!(model.warnings()[0].message.contains("state.json"));
+    assert!(model.warnings()[1].message.contains("cache.json"));
+    assert!(!format!("{:?}", model.warnings()).contains(secret));
+}
+
+#[test]
+fn repeated_quote_errors_have_stable_sanitized_text_without_toast_spam_and_retry() {
+    let runtime = RuntimeHandle::default();
+    let mut model = AppModel::new(
+        PersistedState::starter(),
+        CachedMarketState::default(),
+        runtime.clone(),
+    );
+    let id = InstrumentId::equity("AAPL", Some("NASDAQ")).expect("AAPL");
+    let raw = "private body with AAPL and query=secret";
+    for kind in [
+        MarketDataErrorKind::RateLimited,
+        MarketDataErrorKind::Disconnected,
+        MarketDataErrorKind::MalformedResponse,
+        MarketDataErrorKind::Unavailable,
+        MarketDataErrorKind::Timeout,
+    ] {
+        model.apply_runtime_event(RuntimeEvent::QuoteError {
+            instrument_ids: vec![id.clone()],
+            error: MarketDataError {
+                kind,
+                message: raw.into(),
+                retry_after: None,
+            },
+        });
+        assert!(
+            !model
+                .quote_error_message(&id)
+                .expect("status")
+                .contains(raw)
+        );
+    }
+    model.apply_runtime_event(RuntimeEvent::QuoteError {
+        instrument_ids: vec![id.clone()],
+        error: MarketDataError {
+            kind: MarketDataErrorKind::Timeout,
+            message: raw.into(),
+            retry_after: None,
+        },
+    });
+
+    assert!(model.warnings().is_empty());
+    model.retry_selected_quote();
+    assert!(matches!(
+        runtime.recorded_commands().last(),
+        Some(RuntimeCommand::Snapshot { instruments })
+            if instruments.iter().map(|instrument| &instrument.id).eq([&id])
+    ));
+}
+
+fn persist_cache_count(runtime: &RuntimeHandle) -> usize {
+    runtime
+        .recorded_commands()
+        .iter()
+        .filter(|command| matches!(command, RuntimeCommand::PersistMarketCache { .. }))
+        .count()
 }
 
 fn fake_runtime() -> RuntimeHandle {

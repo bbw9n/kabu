@@ -8,8 +8,8 @@ use gpui::{
     Window, div, font, px,
 };
 use gpui_component::{ActiveTheme as _, StyledExt as _, list::ListItem, skeleton::Skeleton};
-use kabu_core::{Instrument, Quote};
-use std::sync::Arc;
+use kabu_core::{Freshness, Instrument, Quote};
+use std::{sync::Arc, time::Duration};
 
 pub const WATCHLIST_KEY_CONTEXT: &str = "Watchlist";
 
@@ -48,12 +48,14 @@ impl RenderOnce for WatchlistPane {
             .enumerate()
             .map(|(index, instrument)| {
                 let quote = self.model.read(cx).quote(&instrument.id).cloned();
+                let freshness = self.model.read(cx).freshness(&instrument.id);
                 let loading = self.model.read(cx).quote_is_loading(&instrument.id);
                 render_row(
                     RowSnapshot {
                         index,
                         instrument,
                         quote,
+                        freshness,
                         loading,
                         selected: selected_index == Some(index),
                     },
@@ -124,6 +126,7 @@ struct RowSnapshot {
     index: usize,
     instrument: Instrument,
     quote: Option<Quote>,
+    freshness: Freshness,
     loading: bool,
     selected: bool,
 }
@@ -138,13 +141,14 @@ fn render_row(
         index,
         instrument,
         quote,
+        freshness,
         loading,
         selected,
     } = row;
     let symbol = instrument.id.canonical_symbol();
     let (price, change, status, change_color) = quote
         .as_ref()
-        .map(|quote| quote_text(quote, cx))
+        .map(|quote| quote_text(quote, freshness, chrono::Utc::now(), cx))
         .unwrap_or_else(|| {
             (
                 SharedString::from("—"),
@@ -209,7 +213,12 @@ fn render_row(
         })
 }
 
-fn quote_text(quote: &Quote, cx: &App) -> (SharedString, SharedString, SharedString, gpui::Hsla) {
+fn quote_text(
+    quote: &Quote,
+    freshness: Freshness,
+    now: chrono::DateTime<chrono::Utc>,
+    cx: &App,
+) -> (SharedString, SharedString, SharedString, gpui::Hsla) {
     let price = format!("{:.2}", quote.last);
     let (change, color) = match quote.percent_change() {
         Some(value) if value > 0.0 => (format!("+{value:.2}%"), cx.theme().success),
@@ -220,9 +229,47 @@ fn quote_text(quote: &Quote, cx: &App) -> (SharedString, SharedString, SharedStr
     (
         price.into(),
         change.into(),
-        format!("{:?}", quote.market_state).into(),
+        format!(
+            "{} · {}",
+            watchlist_freshness_label(freshness),
+            format_age(quote_age(quote, now))
+        )
+        .into(),
         color,
     )
+}
+
+fn watchlist_freshness_label(freshness: Freshness) -> &'static str {
+    match freshness {
+        Freshness::Live => "Live",
+        Freshness::Fresh => "Fresh",
+        Freshness::Aging => "Aging",
+        Freshness::Delayed => "Delayed",
+        Freshness::Stale => "Stale",
+        Freshness::Closed => "Closed",
+        Freshness::Unavailable => "Unavailable",
+    }
+}
+
+fn quote_age(quote: &Quote, now: chrono::DateTime<chrono::Utc>) -> Duration {
+    let provider_age = now
+        .signed_duration_since(quote.provider_timestamp)
+        .to_std()
+        .unwrap_or_default();
+    let receipt_age = now
+        .signed_duration_since(quote.received_at)
+        .to_std()
+        .unwrap_or_default();
+    provider_age.max(receipt_age)
+}
+
+fn format_age(age: Duration) -> String {
+    let seconds = age.as_secs();
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else {
+        format!("{}m", seconds / 60)
+    }
 }
 
 fn tabular_font() -> gpui::Font {

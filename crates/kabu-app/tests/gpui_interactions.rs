@@ -1,5 +1,5 @@
 use gpui::{AppContext as _, Entity, Modifiers, WindowAppearance, px, size};
-use gpui_component::Root;
+use gpui_component::{Root, WindowExt as _};
 use kabu_app::runtime::{RuntimeCommand, RuntimeHandle};
 use kabu_app::{
     app_model::AppModel,
@@ -15,10 +15,10 @@ use kabu_app::{
 };
 use kabu_core::{
     CachedChart, CachedMarketState, Candle, ChartPeriod, ChartRequestKey, DataSource, Instrument,
-    InstrumentId, MarketState, PersistedState, Quote, SearchResult, StateRepository,
-    ThemePreference,
+    InstrumentId, MarketDataError, MarketDataErrorKind, MarketState, PersistedState, Quote,
+    SearchResult, StateRepository, ThemePreference,
 };
-use kabu_data::JsonRepository;
+use kabu_data::{JsonRepository, Recovery};
 use std::{cell::RefCell, rc::Rc, sync::Arc, time::Duration};
 
 #[test]
@@ -29,6 +29,39 @@ fn window_shell_uses_approved_geometry() {
     );
     assert_eq!((MIN_WINDOW_WIDTH, MIN_WINDOW_HEIGHT), (760.0, 500.0));
     assert_eq!(SIDEBAR_WIDTH, 280.0);
+}
+
+#[gpui::test]
+fn recovered_categories_each_produce_one_startup_notification(cx: &mut gpui::TestAppContext) {
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        kabu_app::commands::init(cx);
+    });
+    let runtime = RuntimeHandle::default();
+    let model = cx.update(|cx| {
+        cx.new(|_| {
+            AppModel::from_recoveries(
+                Recovery {
+                    value: PersistedState::starter(),
+                    recovered_from_corruption: true,
+                },
+                Recovery {
+                    value: CachedMarketState::default(),
+                    recovered_from_corruption: true,
+                },
+                runtime,
+            )
+        })
+    });
+    let (_, cx) = cx.add_window_view(move |window, cx| {
+        let shell = cx.new(|cx| AppShell::with_model(model.clone(), window, cx));
+        Root::new(shell, window, cx)
+    });
+
+    cx.run_until_parked();
+
+    let notification_count = cx.update(|window, cx| window.notifications(cx).len());
+    assert_eq!(notification_count, 2);
 }
 
 #[gpui::test]
@@ -270,6 +303,43 @@ fn quote_detail_keeps_chart_loading_and_unavailable_states_outside_the_painter(
 }
 
 #[gpui::test]
+fn quote_error_renders_an_inline_retry_that_dispatches_a_snapshot(cx: &mut gpui::TestAppContext) {
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        kabu_app::commands::init(cx);
+    });
+    let runtime = RuntimeHandle::default();
+    let mut app_model = AppModel::new(
+        PersistedState::starter(),
+        CachedMarketState::default(),
+        runtime.clone(),
+    );
+    let aapl = InstrumentId::equity("AAPL", Some("NASDAQ")).expect("AAPL");
+    app_model.apply_runtime_event(kabu_app::runtime::RuntimeEvent::QuoteError {
+        instrument_ids: vec![aapl],
+        error: MarketDataError {
+            kind: MarketDataErrorKind::Timeout,
+            message: "private provider response".into(),
+            retry_after: None,
+        },
+    });
+    let model = cx.update(|cx| cx.new(|_| app_model));
+    let (_shell, cx) =
+        cx.add_window_view(move |window, cx| AppShell::with_model(model.clone(), window, cx));
+    cx.refresh().expect("render error");
+
+    let retry = cx
+        .debug_bounds("quote-retry-button")
+        .expect("retry button bounds");
+    cx.simulate_click(retry.center(), Modifiers::none());
+
+    assert!(matches!(
+        runtime.recorded_commands().last(),
+        Some(RuntimeCommand::Snapshot { instruments }) if instruments.len() == 1
+    ));
+}
+
+#[gpui::test]
 fn window_geometry_persists_after_exactly_250_milliseconds(cx: &mut gpui::TestAppContext) {
     cx.update(|cx| {
         gpui_component::init(cx);
@@ -473,7 +543,12 @@ fn search_input_debounces_for_exactly_250_milliseconds(cx: &mut gpui::TestAppCon
     window_cx.run_until_parked();
     executor.advance_clock(Duration::from_millis(249));
     window_cx.run_until_parked();
-    assert!(runtime.recorded_commands().is_empty());
+    assert!(
+        !runtime
+            .recorded_commands()
+            .iter()
+            .any(|command| matches!(command, RuntimeCommand::Search { .. }))
+    );
 
     executor.advance_clock(Duration::from_millis(1));
     window_cx.run_until_parked();
@@ -518,7 +593,12 @@ fn closing_search_cancels_the_pending_debounce_task(cx: &mut gpui::TestAppContex
     executor.advance_clock(Duration::from_millis(250));
     window_cx.run_until_parked();
 
-    assert!(runtime.recorded_commands().is_empty());
+    assert!(
+        !runtime
+            .recorded_commands()
+            .iter()
+            .any(|command| matches!(command, RuntimeCommand::Search { .. }))
+    );
     let model = shell.update(window_cx, |shell, _| shell.model());
     model.read_with(window_cx, |model, _| {
         assert!(model.search().query().is_empty());
@@ -568,9 +648,14 @@ fn arrows_and_return_select_an_existing_result_and_close_search(cx: &mut gpui::T
             "NVDA"
         );
     });
-    assert_eq!(runtime.recorded_commands().len(), 1);
+    let history_commands: Vec<_> = runtime
+        .recorded_commands()
+        .into_iter()
+        .filter(|command| matches!(command, RuntimeCommand::History { .. }))
+        .collect();
+    assert_eq!(history_commands.len(), 1);
     assert!(matches!(
-        runtime.recorded_commands().first(),
+        history_commands.first(),
         Some(RuntimeCommand::History { instrument, .. })
             if instrument.id.canonical_symbol() == "NVDA"
     ));

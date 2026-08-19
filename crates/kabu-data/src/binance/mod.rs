@@ -52,4 +52,8 @@ impl BinanceClient {
     pub async fn refresh_catalog(&self) -> Result<(), MarketDataError> {
         catalog::refresh(self).await
     }
+
+    pub fn catalog(&self) -> Result<Option<CachedInstrumentCatalog>, MarketDataError> {
+        self.current_catalog()
+    }
 }

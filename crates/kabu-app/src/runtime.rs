@@ -1,15 +1,20 @@
+use crate::coordinator::Coordinator;
 use async_channel::{Receiver, Sender, TrySendError};
 use kabu_core::{
-    AssetClass, Candle, ChartHistory, ChartPeriod, ChartRequestKey, DataSource, GenerationId,
-    Instrument, InstrumentId, InstrumentSearch, MarketDataError, MarketDataErrorKind, Quote,
-    QuoteSnapshots, QuoteSubscription, SearchResult, StateRepository, rank_search_results,
+    AssetClass, CachedMarketState, Candle, ChartHistory, ChartPeriod, ChartRequestKey, DataSource,
+    GenerationId, Instrument, InstrumentId, InstrumentSearch, MarketDataError, MarketDataErrorKind,
+    PersistedState, PersistenceError, Quote, QuoteSnapshots, QuoteSubscription, SearchResult,
+    StateRepository, rank_search_results,
 };
+use kabu_data::{BinanceClient, JsonRepository, Recovery, YahooClient};
 use std::{
     collections::VecDeque,
     fmt, io,
+    path::Path,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
+        mpsc,
     },
     thread::{self, JoinHandle},
 };
@@ -33,7 +38,12 @@ pub enum RuntimeCommand {
         period: ChartPeriod,
     },
     SetVisible(bool),
+    SetWatchlist(Vec<Instrument>),
     SetCryptoWatchlist(Vec<Instrument>),
+    PersistState(PersistedState),
+    PersistMarketCache {
+        cache: CachedMarketState,
+    },
     Shutdown,
 }
 
@@ -101,6 +111,74 @@ pub struct ProviderSet {
     pub crypto: Arc<dyn CryptoProvider>,
 }
 
+pub struct ProductionComponents {
+    pub state: Recovery<PersistedState>,
+    pub cache: Recovery<CachedMarketState>,
+    yahoo: YahooClient,
+    binance: BinanceClient,
+    repository: Arc<JsonRepository>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ProductionStartError {
+    #[error(transparent)]
+    Persistence(#[from] PersistenceError),
+    #[error(transparent)]
+    Http(#[from] reqwest::Error),
+    #[error(transparent)]
+    Io(#[from] io::Error),
+}
+
+impl ProductionComponents {
+    pub fn production() -> Result<Self, ProductionStartError> {
+        Self::from_repository(JsonRepository::default_macos())
+    }
+
+    pub fn at(directory: impl AsRef<Path>) -> Result<Self, ProductionStartError> {
+        Self::from_repository(JsonRepository::at(directory.as_ref()))
+    }
+
+    fn from_repository(repository: JsonRepository) -> Result<Self, ProductionStartError> {
+        let state = repository.load_state_with_recovery()?;
+        let cache = repository.load_cache_with_recovery()?;
+        let yahoo = YahooClient::production()?;
+        let binance = BinanceClient::production(cache.value.instrument_catalog.clone())?;
+        Ok(Self {
+            state,
+            cache,
+            yahoo,
+            binance,
+            repository: Arc::new(repository),
+        })
+    }
+
+    pub fn start(self) -> Result<ProductionLaunch, ProductionStartError> {
+        let cache_for_runtime = self.cache.value.clone();
+        let binance = self.binance;
+        let providers = ProviderSet {
+            equities: Arc::new(self.yahoo),
+            crypto: Arc::new(binance.clone()),
+        };
+        let runtime = RuntimeHandle::start_inner(
+            providers,
+            self.repository,
+            cache_for_runtime,
+            Some(binance),
+        )?;
+        Ok(ProductionLaunch {
+            state: self.state,
+            cache: self.cache,
+            runtime,
+        })
+    }
+}
+
+pub struct ProductionLaunch {
+    pub state: Recovery<PersistedState>,
+    pub cache: Recovery<CachedMarketState>,
+    pub runtime: RuntimeHandle,
+}
+
 #[derive(Clone)]
 pub struct RuntimeHandle {
     mode: RuntimeMode,
@@ -123,8 +201,21 @@ struct LiveRuntime {
     commands: Sender<RuntimeCommand>,
     shutdown_signal: Sender<()>,
     events: Receiver<RuntimeEvent>,
+    final_flush: Arc<Mutex<Option<FinalFlush>>>,
+    completion: Mutex<mpsc::Receiver<()>>,
     join: Mutex<Option<JoinHandle<()>>>,
     shutdown: AtomicBool,
+}
+
+struct FinalFlush {
+    state: PersistedState,
+    cache: CachedMarketState,
+}
+
+struct RuntimeStorage {
+    repository: Arc<dyn StateRepository>,
+    cache: Arc<Mutex<CachedMarketState>>,
+    final_flush: Arc<Mutex<Option<FinalFlush>>>,
 }
 
 impl Default for RuntimeHandle {
@@ -158,9 +249,25 @@ impl fmt::Debug for RuntimeHandle {
 
 impl RuntimeHandle {
     pub fn start(providers: ProviderSet, repository: Arc<dyn StateRepository>) -> io::Result<Self> {
+        Self::start_inner(providers, repository, CachedMarketState::default(), None)
+    }
+
+    fn start_inner(
+        providers: ProviderSet,
+        repository: Arc<dyn StateRepository>,
+        initial_cache: CachedMarketState,
+        catalog_client: Option<BinanceClient>,
+    ) -> io::Result<Self> {
         let (commands, command_receiver) = async_channel::bounded(COMMAND_CAPACITY);
         let (event_sender, events) = async_channel::bounded(EVENT_CAPACITY);
         let (shutdown_signal, shutdown_receiver) = async_channel::bounded(1);
+        let (completion_sender, completion) = mpsc::sync_channel(1);
+        let final_flush = Arc::new(Mutex::new(None));
+        let storage = RuntimeStorage {
+            repository,
+            cache: Arc::new(Mutex::new(initial_cache)),
+            final_flush: final_flush.clone(),
+        };
         let join = thread::Builder::new()
             .name("kabu-network".into())
             .spawn(move || {
@@ -169,8 +276,10 @@ impl RuntimeHandle {
                     event_sender,
                     shutdown_receiver,
                     providers,
-                    repository,
+                    storage,
+                    catalog_client,
                 );
+                _ = completion_sender.send(());
             })?;
 
         Ok(Self {
@@ -178,6 +287,8 @@ impl RuntimeHandle {
                 commands,
                 shutdown_signal,
                 events,
+                final_flush,
+                completion: Mutex::new(completion),
                 join: Mutex::new(Some(join)),
                 shutdown: AtomicBool::new(false),
             })),
@@ -249,18 +360,50 @@ impl RuntimeHandle {
             return;
         }
 
-        _ = runtime.shutdown_signal.try_send(());
-        runtime.shutdown_signal.close();
+        let orderly = runtime.commands.try_send(RuntimeCommand::Shutdown).is_ok();
         runtime.commands.close();
         runtime.events.close();
-        if let Some(join) = runtime
+        if !orderly {
+            _ = runtime.shutdown_signal.try_send(());
+        }
+        let completed = runtime
+            .completion
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .is_ok();
+        if !completed {
+            _ = runtime.shutdown_signal.try_send(());
+        }
+        runtime.shutdown_signal.close();
+        let join = runtime
             .join
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take()
+            .take();
+        if let Some(join) = join
+            && (completed || join.is_finished())
         {
             _ = join.join();
         }
+    }
+
+    pub fn shutdown_with_flush(&self, state: PersistedState, cache: CachedMarketState) {
+        match &self.mode {
+            RuntimeMode::Recording(_) => {
+                _ = self.send(RuntimeCommand::PersistState(state));
+                _ = self.send(RuntimeCommand::PersistMarketCache { cache });
+                _ = self.send(RuntimeCommand::Shutdown);
+            }
+            RuntimeMode::Live(runtime) => {
+                *runtime
+                    .final_flush
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                    Some(FinalFlush { state, cache });
+            }
+        }
+        self.shutdown();
     }
 
     pub fn is_shutdown(&self) -> bool {
@@ -269,20 +412,39 @@ impl RuntimeHandle {
             RuntimeMode::Live(runtime) => runtime.shutdown.load(Ordering::SeqCst),
         }
     }
+
+    pub fn is_live(&self) -> bool {
+        matches!(self.mode, RuntimeMode::Live(_))
+    }
 }
 
 impl Drop for LiveRuntime {
     fn drop(&mut self) {
-        self.shutdown.store(true, Ordering::SeqCst);
-        _ = self.shutdown_signal.try_send(());
-        self.shutdown_signal.close();
+        if self.shutdown.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let orderly = self.commands.try_send(RuntimeCommand::Shutdown).is_ok();
         self.commands.close();
         self.events.close();
+        if !orderly {
+            _ = self.shutdown_signal.try_send(());
+        }
+        let completed = self
+            .completion
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .is_ok();
+        if !completed {
+            _ = self.shutdown_signal.try_send(());
+        }
+        self.shutdown_signal.close();
         if let Some(join) = self
             .join
             .get_mut()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take()
+            && (completed || join.is_finished())
         {
             _ = join.join();
         }
@@ -294,7 +456,8 @@ fn run_network(
     events: Sender<RuntimeEvent>,
     shutdown: Receiver<()>,
     providers: ProviderSet,
-    _repository: Arc<dyn StateRepository>,
+    storage: RuntimeStorage,
+    catalog_client: Option<BinanceClient>,
 ) {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -304,7 +467,14 @@ fn run_network(
     let Ok(runtime) = runtime else {
         return;
     };
-    runtime.block_on(run_dispatcher(commands, events, shutdown, providers));
+    runtime.block_on(run_dispatcher(
+        commands,
+        events,
+        shutdown,
+        providers,
+        storage,
+        catalog_client,
+    ));
 }
 
 async fn run_dispatcher(
@@ -312,11 +482,27 @@ async fn run_dispatcher(
     events: Sender<RuntimeEvent>,
     shutdown: Receiver<()>,
     providers: ProviderSet,
+    storage: RuntimeStorage,
+    catalog_client: Option<BinanceClient>,
 ) {
+    let RuntimeStorage {
+        repository,
+        cache: cache_state,
+        final_flush,
+    } = storage;
     let mut jobs = tokio::task::JoinSet::new();
     let mut search_job: Option<tokio::task::JoinHandle<()>> = None;
     let mut pending = VecDeque::with_capacity(COMMAND_CAPACITY);
     let mut other_in_flight = 0usize;
+    let mut visible = true;
+    let mut coordinator = Coordinator::new(providers.clone(), events.clone(), Vec::new());
+    let mut catalog_job = catalog_client.map(|client| {
+        tokio::spawn(refresh_catalog_cache(
+            client,
+            repository.clone(),
+            cache_state.clone(),
+        ))
+    });
 
     loop {
         while other_in_flight < MAX_CONCURRENT_OTHER_JOBS {
@@ -340,6 +526,9 @@ async fn run_dispatcher(
                 };
                 match command {
                     RuntimeCommand::Search { generation, query } => {
+                        if !visible {
+                            continue;
+                        }
                         if let Some(job) = search_job.take() {
                             job.abort();
                             _ = job.await;
@@ -351,14 +540,46 @@ async fn run_dispatcher(
                         }));
                     }
                     RuntimeCommand::Snapshot { .. } | RuntimeCommand::History { .. } => {
-                        if other_in_flight < MAX_CONCURRENT_OTHER_JOBS {
+                        if !visible {
+                            continue;
+                        } else if other_in_flight < MAX_CONCURRENT_OTHER_JOBS {
                             spawn_other_job(command, &mut jobs, &events, &providers);
                             other_in_flight += 1;
                         } else {
                             pending.push_back(command);
                         }
                     }
-                    RuntimeCommand::SetVisible(_) | RuntimeCommand::SetCryptoWatchlist(_) => {}
+                    RuntimeCommand::SetVisible(next_visible) => {
+                        visible = next_visible;
+                        coordinator.set_visible(next_visible).await;
+                        if !next_visible {
+                            if let Some(job) = search_job.take() {
+                                job.abort();
+                                _ = job.await;
+                            }
+                            pending.clear();
+                            jobs.abort_all();
+                            while jobs.join_next().await.is_some() {}
+                            other_in_flight = 0;
+                        }
+                    }
+                    RuntimeCommand::SetWatchlist(watchlist) => {
+                        coordinator.set_watchlist(watchlist).await;
+                    }
+                    RuntimeCommand::SetCryptoWatchlist(watchlist) => {
+                        coordinator.set_crypto_watchlist(watchlist).await;
+                    }
+                    RuntimeCommand::PersistState(state) => {
+                        _ = repository.save_state(&state);
+                    }
+                    RuntimeCommand::PersistMarketCache { cache } => {
+                        let mut current = cache_state
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        current.quotes = cache.quotes;
+                        current.charts = cache.charts;
+                        _ = repository.save_cache(&current);
+                    }
                     RuntimeCommand::Shutdown => break,
                 }
             }
@@ -371,6 +592,24 @@ async fn run_dispatcher(
     }
     jobs.abort_all();
     while jobs.join_next().await.is_some() {}
+    coordinator.shutdown().await;
+    if let Some(job) = catalog_job.take() {
+        job.abort();
+        _ = job.await;
+    }
+    if let Some(final_flush) = final_flush
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take()
+    {
+        _ = repository.save_state(&final_flush.state);
+        let mut current = cache_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        current.quotes = final_flush.cache.quotes;
+        current.charts = final_flush.cache.charts;
+        _ = repository.save_cache(&current);
+    }
 }
 
 fn spawn_other_job(
@@ -395,7 +634,10 @@ fn spawn_other_job(
             }
             RuntimeCommand::Search { .. }
             | RuntimeCommand::SetVisible(_)
+            | RuntimeCommand::SetWatchlist(_)
             | RuntimeCommand::SetCryptoWatchlist(_)
+            | RuntimeCommand::PersistState(_)
+            | RuntimeCommand::PersistMarketCache { .. }
             | RuntimeCommand::Shutdown => {}
         }
     });
@@ -516,9 +758,30 @@ async fn collect_snapshot_outcome(
     }
 }
 
+async fn refresh_catalog_cache(
+    client: BinanceClient,
+    repository: Arc<dyn StateRepository>,
+    cache: Arc<Mutex<CachedMarketState>>,
+) -> Result<(), MarketDataError> {
+    client.refresh_catalog().await?;
+    let catalog = client.catalog()?;
+    let mut cache = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    cache.instrument_catalog = catalog;
+    repository.save_cache(&cache).map_err(|_| MarketDataError {
+        kind: MarketDataErrorKind::Internal,
+        message: "Kabu could not save the Binance catalog cache".into(),
+        retry_after: None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ProviderSet, RuntimeCommand, RuntimeEvent, RuntimeHandle};
+    use super::{
+        ProductionComponents, ProviderSet, RuntimeCommand, RuntimeEvent, RuntimeHandle,
+        refresh_catalog_cache,
+    };
     use async_trait::async_trait;
     use kabu_core::{
         CachedMarketState, Candle, ChartHistory, ChartPeriod, DataSource, Instrument, InstrumentId,
@@ -528,11 +791,15 @@ mod tests {
     };
     use std::{
         sync::{
-            Arc,
+            Arc, Mutex,
             atomic::{AtomicUsize, Ordering},
         },
         thread,
         time::{Duration, Instant},
+    };
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{method, path},
     };
 
     #[test]
@@ -551,6 +818,136 @@ mod tests {
     }
 
     #[test]
+    fn production_components_construct_concrete_adapters_without_network_access() {
+        let directory = tempfile::tempdir().expect("tempdir");
+
+        let components = ProductionComponents::at(directory.path()).expect("components");
+
+        assert!(!components.state.recovered_from_corruption);
+        assert!(!components.cache.recovered_from_corruption);
+        assert!(components.cache.value.instrument_catalog.is_none());
+        assert_eq!(components.state.value.watchlist.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn missing_catalog_refresh_updates_active_catalog_and_persists_cache() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v3/exchangeInfo"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                include_str!("../../kabu-data/tests/fixtures/binance_exchange_info.json"),
+                "application/json",
+            ))
+            .mount(&server)
+            .await;
+        let directory = tempfile::tempdir().expect("tempdir");
+        let repository = Arc::new(kabu_data::JsonRepository::at(directory.path()));
+        let initial = CachedMarketState::default();
+        let client = kabu_data::BinanceClient::new(
+            reqwest::Client::new(),
+            server.uri().parse().expect("REST URL"),
+            server.uri().parse().expect("stream URL"),
+            None,
+        );
+        let cache = Arc::new(Mutex::new(initial));
+
+        refresh_catalog_cache(client, repository.clone(), cache)
+            .await
+            .expect("refresh");
+
+        let persisted = repository.load_cache().expect("persisted cache");
+        let catalog = persisted.instrument_catalog.expect("catalog");
+        assert!(
+            catalog
+                .instruments
+                .iter()
+                .any(|instrument| { instrument.id.canonical_symbol() == "BTC/USDC" })
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_catalog_refresh_updates_active_catalog_and_persists_cache() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v3/exchangeInfo"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                include_str!("../../kabu-data/tests/fixtures/binance_exchange_info.json"),
+                "application/json",
+            ))
+            .mount(&server)
+            .await;
+        let directory = tempfile::tempdir().expect("tempdir");
+        let repository = Arc::new(kabu_data::JsonRepository::at(directory.path()));
+        let initial = CachedMarketState {
+            instrument_catalog: Some(kabu_core::CachedInstrumentCatalog {
+                source: DataSource::Binance,
+                fetched_at: chrono::Utc::now() - chrono::Duration::hours(25),
+                instruments: vec![btc_instrument()],
+            }),
+            ..CachedMarketState::default()
+        };
+        repository.save_cache(&initial).expect("initial cache");
+        let client = kabu_data::BinanceClient::new(
+            reqwest::Client::new(),
+            server.uri().parse().expect("REST URL"),
+            server.uri().parse().expect("stream URL"),
+            initial.instrument_catalog.clone(),
+        );
+        let cache = Arc::new(Mutex::new(initial));
+
+        refresh_catalog_cache(client, repository.clone(), cache)
+            .await
+            .expect("refresh");
+
+        let persisted = repository.load_cache().expect("persisted cache");
+        let catalog = persisted.instrument_catalog.expect("catalog");
+        assert!(
+            catalog
+                .instruments
+                .iter()
+                .any(|instrument| { instrument.id.canonical_symbol() == "BTC/USDC" })
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_catalog_refresh_preserves_the_last_good_catalog() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v3/exchangeInfo"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        let directory = tempfile::tempdir().expect("tempdir");
+        let repository = Arc::new(kabu_data::JsonRepository::at(directory.path()));
+        let initial = CachedMarketState {
+            instrument_catalog: Some(kabu_core::CachedInstrumentCatalog {
+                source: DataSource::Binance,
+                fetched_at: chrono::Utc::now() - chrono::Duration::hours(25),
+                instruments: vec![btc_instrument()],
+            }),
+            ..CachedMarketState::default()
+        };
+        repository.save_cache(&initial).expect("initial cache");
+        let client = kabu_data::BinanceClient::new(
+            reqwest::Client::new(),
+            server.uri().parse().expect("REST URL"),
+            server.uri().parse().expect("stream URL"),
+            initial.instrument_catalog.clone(),
+        );
+        let cache = Arc::new(Mutex::new(initial));
+
+        assert!(
+            refresh_catalog_cache(client, repository.clone(), cache)
+                .await
+                .is_err()
+        );
+
+        let persisted = repository.load_cache().expect("persisted cache");
+        let catalog = persisted.instrument_catalog.expect("last good catalog");
+        assert_eq!(catalog.instruments, vec![btc_instrument()]);
+    }
+
+    #[test]
     fn shutdown_command_joins_the_network_thread() {
         let providers = ProviderSet {
             equities: Arc::new(FakeProvider::immediate(DataSource::Yahoo, Vec::new())),
@@ -563,6 +960,154 @@ mod tests {
             .expect("shutdown command");
 
         assert!(runtime.is_shutdown());
+    }
+
+    #[test]
+    fn orderly_shutdown_flushes_queued_state_and_cache_before_bounded_acknowledgement() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let repository = Arc::new(kabu_data::JsonRepository::at(directory.path()));
+        let providers = ProviderSet {
+            equities: Arc::new(FakeProvider::immediate(DataSource::Yahoo, Vec::new())),
+            crypto: Arc::new(FakeProvider::immediate(DataSource::Binance, Vec::new())),
+        };
+        let runtime = RuntimeHandle::start(providers, repository.clone()).expect("runtime");
+        let mut state = PersistedState::starter();
+        state.theme = kabu_core::ThemePreference::Signal;
+        let mut cache = CachedMarketState::default();
+        let instrument = aapl_instrument();
+        cache.quotes.insert(
+            instrument.id.clone(),
+            test_quote(instrument.id, DataSource::Yahoo),
+        );
+        runtime
+            .send(RuntimeCommand::PersistState(state))
+            .expect("state command");
+        runtime
+            .send(RuntimeCommand::PersistMarketCache { cache })
+            .expect("cache command");
+
+        let started = Instant::now();
+        runtime
+            .send(RuntimeCommand::Shutdown)
+            .expect("shutdown command");
+
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(
+            repository.load_state().expect("saved state").theme,
+            kabu_core::ThemePreference::Signal
+        );
+        assert_eq!(
+            repository.load_cache().expect("saved cache").quotes.len(),
+            1
+        );
+        assert!(runtime.is_shutdown());
+    }
+
+    #[test]
+    fn shutdown_flush_payload_is_persisted_before_bounded_acknowledgement() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let repository = Arc::new(kabu_data::JsonRepository::at(directory.path()));
+        let providers = ProviderSet {
+            equities: Arc::new(FakeProvider::immediate(DataSource::Yahoo, Vec::new())),
+            crypto: Arc::new(FakeProvider::immediate(DataSource::Binance, Vec::new())),
+        };
+        let runtime = RuntimeHandle::start(providers, repository.clone()).expect("runtime");
+        let mut state = PersistedState::starter();
+        state.theme = kabu_core::ThemePreference::Midnight;
+        let mut cache = CachedMarketState::default();
+        let instrument = aapl_instrument();
+        cache.quotes.insert(
+            instrument.id.clone(),
+            test_quote(instrument.id, DataSource::Yahoo),
+        );
+
+        runtime.shutdown_with_flush(state, cache);
+
+        assert_eq!(
+            repository.load_state().expect("saved state").theme,
+            kabu_core::ThemePreference::Midnight
+        );
+        assert_eq!(
+            repository.load_cache().expect("saved cache").quotes.len(),
+            1
+        );
+        assert!(runtime.is_shutdown());
+    }
+
+    #[test]
+    fn visibility_and_watchlist_commands_drive_the_coordinator() {
+        let probe = Arc::new(OperationProbe::default());
+        let providers = ProviderSet {
+            equities: Arc::new(ControlledProvider::new(
+                DataSource::Yahoo,
+                probe.clone(),
+                Duration::ZERO,
+            )),
+            crypto: Arc::new(ControlledProvider::new(
+                DataSource::Binance,
+                Arc::new(OperationProbe::default()),
+                Duration::ZERO,
+            )),
+        };
+        let runtime = RuntimeHandle::start(providers, Arc::new(NoopRepository)).expect("runtime");
+        runtime
+            .send(RuntimeCommand::SetWatchlist(vec![aapl_instrument()]))
+            .expect("watchlist");
+        runtime
+            .send(RuntimeCommand::SetVisible(true))
+            .expect("visible");
+
+        wait_for_counter(&probe.started, 1);
+        runtime
+            .send(RuntimeCommand::SetVisible(false))
+            .expect("hidden");
+        let calls_after_hide = probe.started.load(Ordering::SeqCst);
+        thread::sleep(Duration::from_millis(30));
+
+        assert_eq!(probe.started.load(Ordering::SeqCst), calls_after_hide);
+        runtime.shutdown();
+    }
+
+    #[test]
+    fn hiding_cancels_and_drains_in_flight_history() {
+        let probe = Arc::new(OperationProbe::default());
+        let providers = ProviderSet {
+            equities: Arc::new(ControlledProvider::new(
+                DataSource::Yahoo,
+                probe.clone(),
+                Duration::from_secs(2),
+            )),
+            crypto: Arc::new(ControlledProvider::new(
+                DataSource::Binance,
+                Arc::new(OperationProbe::default()),
+                Duration::ZERO,
+            )),
+        };
+        let runtime = RuntimeHandle::start(providers, Arc::new(NoopRepository)).expect("runtime");
+        runtime
+            .send(RuntimeCommand::SetVisible(true))
+            .expect("visible");
+        runtime
+            .send(RuntimeCommand::History {
+                generation: kabu_core::Generation::default().next(),
+                instrument: aapl_instrument(),
+                period: ChartPeriod::OneDay,
+            })
+            .expect("history");
+        wait_for_counter(&probe.started, 1);
+
+        runtime
+            .send(RuntimeCommand::SetVisible(false))
+            .expect("hidden");
+        let started = Instant::now();
+        while probe.active.load(Ordering::SeqCst) != 0 && started.elapsed() < Duration::from_secs(1)
+        {
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        assert_eq!(probe.active.load(Ordering::SeqCst), 0);
+        assert_eq!(probe.cancelled.load(Ordering::SeqCst), 1);
+        runtime.shutdown();
     }
 
     #[test]
@@ -1228,6 +1773,14 @@ mod tests {
             source: DataSource::Yahoo,
             venue_label: "NASDAQ".into(),
         }
+    }
+
+    fn aapl_instrument() -> Instrument {
+        Instrument::equity("AAPL", Some("NASDAQ"), "Apple", "USD").expect("AAPL")
+    }
+
+    fn btc_instrument() -> Instrument {
+        Instrument::crypto("BTC", "USDT", "Bitcoin").expect("BTC")
     }
 
     fn btc_result() -> SearchResult {

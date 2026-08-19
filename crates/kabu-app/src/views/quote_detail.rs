@@ -212,6 +212,16 @@ impl RenderOnce for QuoteDetail {
         };
         let quote = model.quote(&instrument.id).cloned();
         let quote_loading = model.quote_is_loading(&instrument.id);
+        let quote_error = model
+            .quote_error_message(&instrument.id)
+            .map(str::to_string);
+        let history_error = model.history_error_message().map(str::to_string);
+        let stream_status = model.stream_status();
+        let retry_error = match (quote_error, history_error) {
+            (Some(message), _) => Some((message, false)),
+            (None, Some(message)) => Some((message, true)),
+            (None, None) => None,
+        };
         let data = QuoteDetailData::from_quote(&instrument, quote.as_ref(), self.now);
         let period = model.selected_chart_period();
         let chart_availability = model.selected_chart_availability();
@@ -297,6 +307,9 @@ impl RenderOnce for QuoteDetail {
             )
             .child(period_tabs(self.model.clone(), period))
             .child(render_chart(chart_availability, chart, cx))
+            .children(retry_error.map(|(message, retry_history)| {
+                inline_retry(self.model.clone(), message, retry_history, cx)
+            }))
             .child(div().flex().flex_wrap().gap_2().children([
                 metric_card("Open", data.open.clone(), "quote-metric-open", cx),
                 metric_card("High", data.high.clone(), "quote-metric-high", cx),
@@ -330,11 +343,69 @@ impl RenderOnce for QuoteDetail {
                             .child(data.freshness_label),
                     )
                     .child(format!(
-                        "{} · {} · {}",
-                        data.source, data.provider_timestamp, data.provider_age
+                        "{} · {} · {} · {}",
+                        data.source,
+                        source_status(&instrument.id, stream_status),
+                        data.provider_timestamp,
+                        data.provider_age
                     )),
             )
             .into_any_element()
+    }
+}
+
+fn inline_retry(
+    model: Entity<AppModel>,
+    message: String,
+    retry_history: bool,
+    cx: &App,
+) -> gpui::AnyElement {
+    div()
+        .debug_selector(|| "quote-retry".into())
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap_3()
+        .rounded_lg()
+        .bg(cx.theme().warning.opacity(0.12))
+        .px_3()
+        .py_2()
+        .text_sm()
+        .text_color(cx.theme().warning)
+        .child(div().flex_1().child(message))
+        .child(
+            div().debug_selector(|| "quote-retry-button".into()).child(
+                Button::new("retry-market-data")
+                    .label("Retry")
+                    .compact()
+                    .on_click(move |_, _, cx| {
+                        model.update(cx, |model, cx| {
+                            if retry_history {
+                                model.retry_selected_history();
+                            } else {
+                                model.retry_selected_quote();
+                            }
+                            cx.notify();
+                        });
+                    }),
+            ),
+        )
+        .into_any_element()
+}
+
+fn source_status(
+    instrument_id: &InstrumentId,
+    stream_status: crate::runtime::StreamStatus,
+) -> &'static str {
+    match instrument_id {
+        InstrumentId::Equity { .. } => "Snapshot",
+        InstrumentId::Crypto { .. } => match stream_status {
+            crate::runtime::StreamStatus::Connecting => "Connecting",
+            crate::runtime::StreamStatus::Live => "Live",
+            crate::runtime::StreamStatus::Reconnecting => "Reconnecting",
+            crate::runtime::StreamStatus::Paused => "Paused",
+            crate::runtime::StreamStatus::Stopped => "Stopped",
+        },
     }
 }
 

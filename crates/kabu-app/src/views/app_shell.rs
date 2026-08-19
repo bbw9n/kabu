@@ -4,13 +4,17 @@ use gpui::{
     StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window, WindowAppearance,
     div, px,
 };
-use gpui_component::{ActiveTheme as _, IconName, StyledExt as _, TitleBar, button::Button};
+use gpui_component::{
+    ActiveTheme as _, IconName, StyledExt as _, TitleBar, WindowExt as _, button::Button,
+    notification::Notification,
+};
 use kabu_core::{CachedMarketState, PersistedState, Quote, ThemePreference};
 use std::{borrow::BorrowMut, time::Duration};
 
 use crate::{
     app_model::{AppModel, DEFAULT_SIDEBAR_WIDTH},
     commands::{clear_theme_action_target, register_theme_action_target},
+    macos_visibility::{AlwaysVisible, VisibilityProbe, VisibilityTracker},
     runtime::RuntimeHandle,
     theme::{KabuTheme, ThemeSelection, apply_theme},
     views::{QuoteDetail, SearchOverlay, SearchOverlayEvent, ThemeSwitcher, WatchlistPane},
@@ -63,6 +67,8 @@ pub struct AppShell {
     _search_subscription: Subscription,
     _runtime_event_forwarder: Task<()>,
     _runtime_event_task: Task<()>,
+    visibility: VisibilityTracker<Box<dyn VisibilityProbe>>,
+    _visibility_task: Task<()>,
 }
 
 impl AppShell {
@@ -82,10 +88,33 @@ impl AppShell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        Self::with_model_and_visibility(model, Box::new(AlwaysVisible), window, cx)
+    }
+
+    pub fn with_model_and_visibility(
+        model: Entity<AppModel>,
+        probe: Box<dyn VisibilityProbe>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let theme_selection = ThemeSelection::new(model.read(cx).theme());
         let window_appearance = window.appearance();
         let active_theme = theme_selection.resolve(window_appearance);
         apply_theme(active_theme, Some(window), cx);
+        let startup_notifications = model
+            .read(cx)
+            .warnings()
+            .iter()
+            .filter(|warning| warning.is_startup_notification())
+            .map(|warning| warning.message.clone())
+            .collect::<Vec<_>>();
+        if !startup_notifications.is_empty() {
+            cx.defer_in(window, move |_, window, cx| {
+                for message in startup_notifications {
+                    window.push_notification(Notification::warning(message), cx);
+                }
+            });
+        }
 
         let model_subscription = cx.observe(&model, |shell, model, cx| {
             shell.model_changed(&model, cx);
@@ -138,6 +167,43 @@ impl AppShell {
             clear_theme_action_target(target_generation, cx);
         });
 
+        let mut visibility = VisibilityTracker::new(probe);
+        if let Some(visible) = visibility.poll() {
+            model.update(cx, |model, cx| {
+                model.set_visible_at(visible, chrono::Utc::now());
+                cx.notify();
+            });
+        }
+        let visibility_timer = cx.spawn(async move |shell, cx| {
+            loop {
+                cx.background_executor().timer(Duration::from_secs(1)).await;
+                if cx
+                    .update(|cx| {
+                        let Some(shell) = shell.upgrade() else {
+                            return false;
+                        };
+                        shell.update(cx, |shell, cx| {
+                            let visibility_change = shell.visibility.poll();
+                            let now = chrono::Utc::now();
+                            let freshness_changed = shell.model.update(cx, |model, _| {
+                                if let Some(visible) = visibility_change {
+                                    model.set_visible_at(visible, now);
+                                }
+                                model.tick_at(now)
+                            });
+                            if visibility_change.is_some() || freshness_changed {
+                                cx.notify();
+                            }
+                        });
+                        true
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+
         let close_model = model.downgrade();
         window.on_window_should_close(cx, move |window, cx| {
             if let Some(model) = close_model.upgrade() {
@@ -145,6 +211,7 @@ impl AppShell {
                 model.update(cx, |model, cx| {
                     model.preview_window_geometry(f32::from(size.width), f32::from(size.height));
                     _ = model.persist_window_geometry();
+                    model.flush_and_shutdown();
                     cx.notify();
                 });
             }
@@ -168,6 +235,8 @@ impl AppShell {
             _search_subscription: search_subscription,
             _runtime_event_forwarder: runtime_event_forwarder,
             _runtime_event_task: runtime_event_task,
+            visibility,
+            _visibility_task: visibility_timer,
         }
     }
 
@@ -218,7 +287,12 @@ impl AppShell {
         };
 
         if let Some(quote) = model.quote(&instrument.id) {
-            return available_quote_header(instrument, quote);
+            return available_quote_header(
+                instrument,
+                quote,
+                model.freshness(&instrument.id),
+                model.quote_error_message(&instrument.id),
+            );
         }
 
         let loading = model.quote_is_loading(&instrument.id);
@@ -369,12 +443,14 @@ impl Render for AppShell {
             self.focus_search_on_render = false;
         }
         let sidebar_width = self.model.read(cx).sidebar_width();
-        let warning = self
+        let warnings = self
             .model
             .read(cx)
             .warnings()
-            .last()
-            .map(|warning| warning.message.clone());
+            .iter()
+            .filter(|warning| !warning.is_startup_notification())
+            .map(|warning| warning.message.clone())
+            .collect::<Vec<_>>();
 
         div()
             .flex()
@@ -383,7 +459,7 @@ impl Render for AppShell {
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
             .child(self.title_bar(cx))
-            .children(warning.map(|message| {
+            .children(warnings.into_iter().map(|message| {
                 div()
                     .border_b_1()
                     .border_color(cx.theme().warning)
@@ -456,6 +532,8 @@ impl Render for AppShell {
 fn available_quote_header(
     instrument: &kabu_core::Instrument,
     quote: &Quote,
+    freshness: kabu_core::Freshness,
+    error: Option<&str>,
 ) -> SelectedQuoteHeader {
     SelectedQuoteHeader {
         symbol: instrument.id.canonical_symbol(),
@@ -464,7 +542,9 @@ fn available_quote_header(
         change: format_quote_change(quote),
         source: format!("{:?}", quote.source),
         provider_timestamp: quote.provider_timestamp.to_rfc3339(),
-        status: format!("{:?}", quote.market_state),
+        status: error
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("{freshness:?}")),
         availability: SelectedQuoteAvailability::Available,
     }
 }

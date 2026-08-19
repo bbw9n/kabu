@@ -3281,6 +3281,7 @@ dependencies = [
  "async-channel 2.5.0",
  "async-trait",
  "chrono",
+ "futures-util",
  "gpui",
  "gpui-component",
  "gpui-component-assets",
@@ -3288,11 +3289,14 @@ dependencies = [
  "kabu-data",
  "objc2",
  "objc2-app-kit",
+ "rand 0.9.5",
  "raw-window-handle",
+ "reqwest",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
  "tracing",
+ "wiremock",
 ]
 
 [[package]]
