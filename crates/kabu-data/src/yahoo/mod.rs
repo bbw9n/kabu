@@ -159,9 +159,9 @@ fn yahoo_symbol(instrument: &Instrument) -> Result<String, MarketDataError> {
 fn chart_parameters(period: ChartPeriod) -> (&'static str, &'static str) {
     match period {
         ChartPeriod::OneDay => ("1d", "1m"),
-        ChartPeriod::OneWeek => ("5d", "5m"),
+        ChartPeriod::FiveDays => ("5d", "5m"),
         ChartPeriod::OneMonth => ("1mo", "30m"),
-        ChartPeriod::ThreeMonths => ("3mo", "1d"),
+        ChartPeriod::SixMonths => ("6mo", "1d"),
         ChartPeriod::OneYear => ("1y", "1d"),
     }
 }
@@ -288,9 +288,9 @@ mod tests {
     #[test]
     fn chart_periods_use_yahoo_ranges_and_intervals() {
         assert_eq!(chart_parameters(ChartPeriod::OneDay), ("1d", "1m"));
-        assert_eq!(chart_parameters(ChartPeriod::OneWeek), ("5d", "5m"));
+        assert_eq!(chart_parameters(ChartPeriod::FiveDays), ("5d", "5m"));
         assert_eq!(chart_parameters(ChartPeriod::OneMonth), ("1mo", "30m"));
-        assert_eq!(chart_parameters(ChartPeriod::ThreeMonths), ("3mo", "1d"));
+        assert_eq!(chart_parameters(ChartPeriod::SixMonths), ("6mo", "1d"));
         assert_eq!(chart_parameters(ChartPeriod::OneYear), ("1y", "1d"));
     }
 }

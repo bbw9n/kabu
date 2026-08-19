@@ -14,8 +14,9 @@ use kabu_app::{
     },
 };
 use kabu_core::{
-    CachedMarketState, DataSource, Instrument, InstrumentId, MarketState, PersistedState, Quote,
-    SearchResult, StateRepository, ThemePreference,
+    CachedChart, CachedMarketState, Candle, ChartPeriod, ChartRequestKey, DataSource, Instrument,
+    InstrumentId, MarketState, PersistedState, Quote, SearchResult, StateRepository,
+    ThemePreference,
 };
 use kabu_data::JsonRepository;
 use std::{cell::RefCell, rc::Rc, sync::Arc, time::Duration};
@@ -117,7 +118,7 @@ fn clicking_a_watchlist_row_selects_it(cx: &mut gpui::TestAppContext) {
 }
 
 #[gpui::test]
-fn keyboard_selection_updates_the_cached_quote_header_without_runtime_work(
+fn keyboard_selection_updates_the_cached_quote_header_while_chart_loads(
     cx: &mut gpui::TestAppContext,
 ) {
     cx.update(|cx| {
@@ -175,6 +176,96 @@ fn selected_quote_header_distinguishes_missing_and_loading_without_zero_values(
         assert_eq!(header.change, "—");
         assert_eq!(header.status, "Loading quote");
         assert_eq!(header.availability, SelectedQuoteAvailability::Loading);
+    });
+}
+
+#[gpui::test]
+fn quote_detail_renders_metrics_chart_and_dispatches_period_clicks(cx: &mut gpui::TestAppContext) {
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        kabu_app::commands::init(cx);
+    });
+    let runtime = RuntimeHandle::default();
+    let state = PersistedState::starter();
+    let instrument = state
+        .watchlist
+        .selected()
+        .expect("starter selection")
+        .clone();
+    let mut quote = cached_quote(instrument.id.clone(), 105.0, 100.0);
+    quote.open = Some(101.0);
+    quote.high = Some(107.0);
+    quote.low = Some(99.0);
+    quote.volume = Some(42_000_000.0);
+    let mut cache = CachedMarketState::default();
+    cache.quotes.insert(instrument.id.clone(), quote);
+    cache.charts.insert(
+        ChartRequestKey {
+            instrument_id: instrument.id,
+            period: ChartPeriod::OneDay,
+        },
+        CachedChart {
+            candles: vec![chart_candle(100.0), chart_candle(105.0)],
+            fetched_at: chrono::Utc::now(),
+        },
+    );
+    let model = cx.update(|cx| cx.new(|_| AppModel::new(state, cache, runtime.clone())));
+    let (shell, cx) =
+        cx.add_window_view(move |window, cx| AppShell::with_model(model.clone(), window, cx));
+    cx.refresh().expect("render quote detail");
+
+    for selector in [
+        "quote-detail",
+        "quote-detail-symbol",
+        "price-chart",
+        "quote-metric-open",
+        "quote-metric-high",
+        "quote-metric-low",
+        "quote-metric-previous-close",
+        "quote-metric-volume",
+        "quote-freshness",
+    ] {
+        assert!(cx.debug_bounds(selector).is_some(), "missing {selector}");
+    }
+
+    let period = cx.debug_bounds("quote-period-5d").expect("5D period tab");
+    cx.simulate_click(period.center(), Modifiers::none());
+
+    let model = shell.update(cx, |shell, _| shell.model());
+    model.read_with(cx, |model, _| {
+        assert_eq!(model.selected_chart_period(), ChartPeriod::FiveDays);
+    });
+    assert!(matches!(
+        runtime.recorded_commands().last(),
+        Some(RuntimeCommand::History {
+            period: ChartPeriod::FiveDays,
+            ..
+        })
+    ));
+}
+
+#[gpui::test]
+fn quote_detail_keeps_chart_loading_and_unavailable_states_outside_the_painter(
+    cx: &mut gpui::TestAppContext,
+) {
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        kabu_app::commands::init(cx);
+    });
+    let (shell, cx) = cx.add_window_view(AppShell::new);
+    cx.refresh().expect("render unavailable chart");
+    assert!(cx.debug_bounds("chart-unavailable").is_some());
+    assert!(cx.debug_bounds("price-chart").is_none());
+
+    let period = cx.debug_bounds("quote-period-1m").expect("1M period tab");
+    cx.simulate_click(period.center(), Modifiers::none());
+    cx.refresh().expect("render loading chart");
+    assert!(cx.debug_bounds("chart-loading").is_some());
+    assert!(cx.debug_bounds("price-chart").is_none());
+
+    let model = shell.update(cx, |shell, _| shell.model());
+    model.read_with(cx, |model, _| {
+        assert_eq!(model.selected_chart_period(), ChartPeriod::OneMonth);
     });
 }
 
@@ -444,12 +535,9 @@ fn arrows_and_return_select_an_existing_result_and_close_search(cx: &mut gpui::T
     let runtime = RuntimeHandle::default();
     let model = cx.update(|cx| {
         cx.new(|_| {
-            let mut model = AppModel::new(
-                PersistedState::starter(),
-                CachedMarketState::default(),
-                runtime.clone(),
-            );
-            model.select_index(2).expect("select BTC first");
+            let mut state = PersistedState::starter();
+            state.watchlist.select(2).expect("select BTC first");
+            let mut model = AppModel::new(state, CachedMarketState::default(), runtime.clone());
             let generation = model.begin_search("n");
             model.apply_search_results(generation, vec![aapl_result(), nvda_result()], Vec::new());
             model
@@ -552,6 +640,17 @@ fn cached_quote(instrument_id: InstrumentId, last: f64, previous_close: f64) -> 
         provider_timestamp: timestamp,
         received_at: timestamp,
         provider_delayed: false,
+    }
+}
+
+fn chart_candle(close: f64) -> Candle {
+    Candle {
+        starts_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp"),
+        open: close,
+        high: close,
+        low: close,
+        close,
+        volume: 1_000.0,
     }
 }
 

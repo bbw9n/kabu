@@ -1,21 +1,19 @@
 use gpui::{
-    App, AppContext as _, Context, DragMoveEvent, Empty, Entity, FocusHandle, FontFeatures,
+    App, AppContext as _, Context, DragMoveEvent, Empty, Entity, FocusHandle,
     InteractiveElement as _, IntoElement, ParentElement as _, Render,
     StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window, WindowAppearance,
     div, px,
 };
-use gpui_component::{
-    ActiveTheme as _, IconName, StyledExt as _, TitleBar, button::Button, skeleton::Skeleton,
-};
+use gpui_component::{ActiveTheme as _, IconName, StyledExt as _, TitleBar, button::Button};
 use kabu_core::{CachedMarketState, PersistedState, Quote, ThemePreference};
-use std::{borrow::BorrowMut, sync::Arc, time::Duration};
+use std::{borrow::BorrowMut, time::Duration};
 
 use crate::{
     app_model::{AppModel, DEFAULT_SIDEBAR_WIDTH},
     commands::{clear_theme_action_target, register_theme_action_target},
     runtime::RuntimeHandle,
     theme::{KabuTheme, ThemeSelection, apply_theme},
-    views::{SearchOverlay, SearchOverlayEvent, ThemeSwitcher, WatchlistPane},
+    views::{QuoteDetail, SearchOverlay, SearchOverlayEvent, ThemeSwitcher, WatchlistPane},
 };
 
 type IconButton = Button;
@@ -371,7 +369,6 @@ impl Render for AppShell {
             self.focus_search_on_render = false;
         }
         let sidebar_width = self.model.read(cx).sidebar_width();
-        let selected_header = self.selected_quote_header(cx);
         let warning = self
             .model
             .read(cx)
@@ -441,7 +438,7 @@ impl Render for AppShell {
                             .h_full()
                             .bg(cx.theme().background)
                             .p_6()
-                            .child(render_selected_quote_header(selected_header, cx)),
+                            .child(QuoteDetail::new(self.model.clone())),
                     )
                     .on_drag_move(cx.listener(
                         |shell, event: &DragMoveEvent<SidebarDrag>, _, cx| {
@@ -500,84 +497,4 @@ fn signed_percent(value: f64) -> String {
     } else {
         "0.00%".into()
     }
-}
-
-fn render_selected_quote_header(header: SelectedQuoteHeader, cx: &App) -> gpui::AnyElement {
-    let metadata = format!("{} · {}", header.source, header.provider_timestamp);
-    let change_color = if header.change.starts_with('+') {
-        cx.theme().success
-    } else if header.change.starts_with('−') {
-        cx.theme().danger
-    } else {
-        cx.theme().muted_foreground
-    };
-
-    div()
-        .debug_selector(|| "selected-quote-header".into())
-        .flex()
-        .flex_col()
-        .gap_4()
-        .child(
-            div()
-                .flex()
-                .items_end()
-                .justify_between()
-                .gap_4()
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .child(div().text_2xl().font_semibold().child(header.symbol))
-                        .child(
-                            div()
-                                .text_sm()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(header.display_name),
-                        ),
-                )
-                .child(match header.availability {
-                    SelectedQuoteAvailability::Loading => div()
-                        .flex()
-                        .flex_col()
-                        .items_end()
-                        .gap_1()
-                        .child(Skeleton::new().h(px(24.0)).w(px(112.0)))
-                        .child(Skeleton::new().secondary().h(px(14.0)).w(px(80.0)))
-                        .into_any_element(),
-                    SelectedQuoteAvailability::Available
-                    | SelectedQuoteAvailability::Unavailable => div()
-                        .flex()
-                        .flex_col()
-                        .items_end()
-                        .font(tabular_font())
-                        .child(div().text_2xl().font_semibold().child(header.price))
-                        .child(
-                            div()
-                                .text_sm()
-                                .text_color(change_color)
-                                .child(header.change),
-                        )
-                        .into_any_element(),
-                }),
-        )
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .justify_between()
-                .border_t_1()
-                .border_color(cx.theme().border)
-                .pt_3()
-                .text_xs()
-                .text_color(cx.theme().muted_foreground)
-                .child(header.status)
-                .child(metadata),
-        )
-        .into_any_element()
-}
-
-fn tabular_font() -> gpui::Font {
-    let mut value = gpui::font(".SystemUIFont");
-    value.features = FontFeatures(Arc::new(vec![("tnum".into(), 1)]));
-    value
 }

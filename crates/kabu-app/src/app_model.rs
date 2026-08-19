@@ -91,11 +91,19 @@ pub struct AppModel {
     search: SearchState,
     search_generation: Generation,
     history_generation: Generation,
+    selected_chart_period: ChartPeriod,
     current_history: Option<(GenerationId, ChartRequestKey)>,
     pending_search: Option<PendingSearch>,
     runtime: RuntimeHandle,
     repository: Option<Arc<dyn StateRepository>>,
     warnings: Vec<AppWarning>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChartAvailability {
+    Ready,
+    Loading,
+    Unavailable,
 }
 
 impl AppModel {
@@ -163,6 +171,7 @@ impl AppModel {
             search: SearchState::default(),
             search_generation: Generation::default(),
             history_generation: Generation::default(),
+            selected_chart_period: ChartPeriod::OneDay,
             current_history: None,
             pending_search: None,
             runtime,
@@ -205,6 +214,58 @@ impl AppModel {
 
     pub fn charts(&self) -> &HashMap<ChartRequestKey, CachedChart> {
         &self.charts
+    }
+
+    pub const fn selected_chart_period(&self) -> ChartPeriod {
+        self.selected_chart_period
+    }
+
+    pub fn selected_chart(&self) -> Option<&CachedChart> {
+        self.selected_chart_key()
+            .and_then(|key| self.charts.get(&key))
+    }
+
+    pub fn selected_chart_availability(&self) -> ChartAvailability {
+        let Some(key) = self.selected_chart_key() else {
+            return ChartAvailability::Unavailable;
+        };
+        if self
+            .current_history
+            .as_ref()
+            .is_some_and(|(_, current_key)| current_key == &key)
+        {
+            ChartAvailability::Loading
+        } else if self.charts.contains_key(&key) {
+            ChartAvailability::Ready
+        } else {
+            ChartAvailability::Unavailable
+        }
+    }
+
+    pub fn select_period(&mut self, period: ChartPeriod) -> Option<GenerationId> {
+        self.select_period_at(period, chrono::Utc::now())
+    }
+
+    pub fn select_period_at(
+        &mut self,
+        period: ChartPeriod,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Option<GenerationId> {
+        self.selected_chart_period = period;
+        let instrument = self.selected()?.clone();
+        let key = ChartRequestKey {
+            instrument_id: instrument.id.clone(),
+            period,
+        };
+        if self
+            .charts
+            .get(&key)
+            .is_some_and(|chart| chart_is_fresh(chart, period, now))
+        {
+            self.current_history = None;
+            return None;
+        }
+        Some(self.request_history(instrument, period))
     }
 
     pub const fn theme(&self) -> ThemePreference {
@@ -345,6 +406,9 @@ impl AppModel {
     }
 
     pub fn request_history(&mut self, instrument: Instrument, period: ChartPeriod) -> GenerationId {
+        if self.selected_identity.as_ref() == Some(&instrument.id) {
+            self.selected_chart_period = period;
+        }
         let generation = self.history_generation.next();
         let key = ChartRequestKey {
             instrument_id: instrument.id.clone(),
@@ -365,6 +429,14 @@ impl AppModel {
     }
 
     pub fn apply_runtime_event(&mut self, event: RuntimeEvent) {
+        self.apply_runtime_event_at(event, chrono::Utc::now());
+    }
+
+    pub fn apply_runtime_event_at(
+        &mut self,
+        event: RuntimeEvent,
+        now: chrono::DateTime<chrono::Utc>,
+    ) {
         match event {
             RuntimeEvent::SearchCompleted {
                 generation,
@@ -395,7 +467,7 @@ impl AppModel {
                         key,
                         CachedChart {
                             candles,
-                            fetched_at: chrono::Utc::now(),
+                            fetched_at: now,
                         },
                     );
                     self.current_history = None;
@@ -416,12 +488,22 @@ impl AppModel {
     }
 
     pub fn select_index(&mut self, index: usize) -> Result<(), AppModelError> {
+        self.select_index_at(index, chrono::Utc::now())
+    }
+
+    pub fn select_index_at(
+        &mut self,
+        index: usize,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), AppModelError> {
         if self.watchlist.selected_index() == Some(index) {
             return Ok(());
         }
         self.watchlist.select(index)?;
         self.sync_selected_identity();
-        self.persist_state()
+        let persistence_result = self.persist_state();
+        self.select_period_at(ChartPeriod::OneDay, now);
+        persistence_result
     }
 
     pub fn select_instrument(&mut self, instrument_id: &InstrumentId) -> Result<(), AppModelError> {
@@ -444,14 +526,22 @@ impl AppModel {
         let before = self.watchlist.selected_index();
         self.watchlist.select_next();
         self.sync_selected_identity();
-        self.persist_if_selection_changed(before)
+        let persistence_result = self.persist_if_selection_changed(before);
+        if before != self.watchlist.selected_index() {
+            self.select_period(ChartPeriod::OneDay);
+        }
+        persistence_result
     }
 
     pub fn select_previous(&mut self) -> Result<(), AppModelError> {
         let before = self.watchlist.selected_index();
         self.watchlist.select_previous();
         self.sync_selected_identity();
-        self.persist_if_selection_changed(before)
+        let persistence_result = self.persist_if_selection_changed(before);
+        if before != self.watchlist.selected_index() {
+            self.select_period(ChartPeriod::OneDay);
+        }
+        persistence_result
     }
 
     pub fn remove_selected(&mut self) -> Result<(), AppModelError> {
@@ -460,7 +550,9 @@ impl AppModel {
         };
         self.watchlist.remove(&selected);
         self.sync_selected_identity();
-        self.persist_state()
+        let persistence_result = self.persist_state();
+        self.select_period(ChartPeriod::OneDay);
+        persistence_result
     }
 
     pub fn set_theme(&mut self, theme: ThemePreference) -> Result<(), AppModelError> {
@@ -551,6 +643,13 @@ impl AppModel {
             .is_some_and(|current| current.0 == generation && &current.1 == key)
     }
 
+    fn selected_chart_key(&self) -> Option<ChartRequestKey> {
+        Some(ChartRequestKey {
+            instrument_id: self.selected_identity.clone()?,
+            period: self.selected_chart_period,
+        })
+    }
+
     fn send_runtime(&mut self, command: RuntimeCommand) -> Result<(), RuntimeSendError> {
         let result = self.runtime.send(command);
         if result.is_err() {
@@ -560,6 +659,17 @@ impl AppModel {
         }
         result
     }
+}
+
+fn chart_is_fresh(
+    chart: &CachedChart,
+    period: ChartPeriod,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    now.signed_duration_since(chart.fetched_at)
+        .to_std()
+        .unwrap_or_default()
+        <= period.cache_ttl()
 }
 
 fn clamp_sidebar_width(width: f32) -> f32 {

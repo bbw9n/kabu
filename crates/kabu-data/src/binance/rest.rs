@@ -100,9 +100,9 @@ async fn snapshot(
 fn chart_parameters(period: ChartPeriod) -> (&'static str, usize) {
     match period {
         ChartPeriod::OneDay => ("5m", 288),
-        ChartPeriod::OneWeek => ("30m", 336),
+        ChartPeriod::FiveDays => ("30m", 240),
         ChartPeriod::OneMonth => ("2h", 360),
-        ChartPeriod::ThreeMonths => ("1d", 90),
+        ChartPeriod::SixMonths => ("1d", 180),
         ChartPeriod::OneYear => ("1d", 365),
     }
 }
@@ -154,9 +154,9 @@ mod tests {
     #[test]
     fn chart_periods_use_binance_intervals_and_limits() {
         assert_eq!(chart_parameters(ChartPeriod::OneDay), ("5m", 288));
-        assert_eq!(chart_parameters(ChartPeriod::OneWeek), ("30m", 336));
+        assert_eq!(chart_parameters(ChartPeriod::FiveDays), ("30m", 240));
         assert_eq!(chart_parameters(ChartPeriod::OneMonth), ("2h", 360));
-        assert_eq!(chart_parameters(ChartPeriod::ThreeMonths), ("1d", 90));
+        assert_eq!(chart_parameters(ChartPeriod::SixMonths), ("1d", 180));
         assert_eq!(chart_parameters(ChartPeriod::OneYear), ("1d", 365));
     }
 }

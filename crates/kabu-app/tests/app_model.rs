@@ -1,5 +1,5 @@
 use kabu_app::{
-    app_model::{AppModel, AppModelError, clamp_window_size_to_display},
+    app_model::{AppModel, AppModelError, ChartAvailability, clamp_window_size_to_display},
     runtime::{ProviderWarning, RuntimeCommand, RuntimeEvent, RuntimeHandle},
 };
 use kabu_core::{
@@ -345,10 +345,11 @@ fn adding_search_result_appends_selects_persists_and_requests_market_data() {
 
 #[test]
 fn adding_duplicate_selects_existing_without_reordering_or_refreshing_watchlists() {
-    let repository = RecordingRepository::starter();
+    let mut state = PersistedState::starter();
+    state.watchlist.select(2).expect("select BTC first");
+    let repository = RecordingRepository::with_state(state);
     let runtime = RuntimeHandle::default();
     let mut model = AppModel::with_repository(repository.clone(), runtime.clone());
-    model.select_index(2).expect("select BTC first");
     let generation = model.begin_search("nvda");
     model.apply_search_results(generation, vec![nvda_result()], Vec::new());
 
@@ -499,6 +500,207 @@ fn current_history_completion_populates_the_matching_chart_cache() {
 }
 
 #[test]
+fn chart_defaults_to_one_day() {
+    let model = AppModel::new(
+        PersistedState::starter(),
+        CachedMarketState::default(),
+        fake_runtime(),
+    );
+
+    assert_eq!(model.selected_chart_period(), ChartPeriod::OneDay);
+}
+
+#[test]
+fn fresh_period_cache_avoids_duplicate_request_at_the_ttl_boundary() {
+    for age_seconds in [299, 300] {
+        let (mut model, runtime, now) =
+            model_with_cached_chart(ChartPeriod::OneMonth, Duration::from_secs(age_seconds));
+
+        model.select_period_at(ChartPeriod::OneMonth, now);
+
+        assert!(runtime.recorded_commands().is_empty());
+        assert_eq!(model.selected_chart_period(), ChartPeriod::OneMonth);
+        assert_eq!(
+            model.selected_chart_availability(),
+            ChartAvailability::Ready
+        );
+    }
+}
+
+#[test]
+fn expired_period_cache_requests_history_and_marks_the_chart_loading() {
+    let (mut model, runtime, now) =
+        model_with_cached_chart(ChartPeriod::OneMonth, Duration::from_secs(301));
+
+    model.select_period_at(ChartPeriod::OneMonth, now);
+
+    assert!(matches!(
+        runtime.recorded_commands().last(),
+        Some(RuntimeCommand::History {
+            period: ChartPeriod::OneMonth,
+            ..
+        })
+    ));
+    assert_eq!(
+        model.selected_chart_availability(),
+        ChartAvailability::Loading
+    );
+}
+
+#[test]
+fn every_period_action_targets_the_selected_instrument_and_period() {
+    let runtime = RuntimeHandle::default();
+    let mut model = AppModel::new(
+        PersistedState::starter(),
+        CachedMarketState::default(),
+        runtime.clone(),
+    );
+    let selected = model.selected().expect("selected instrument").id.clone();
+
+    for period in [
+        ChartPeriod::OneDay,
+        ChartPeriod::FiveDays,
+        ChartPeriod::OneMonth,
+        ChartPeriod::SixMonths,
+        ChartPeriod::OneYear,
+    ] {
+        model.select_period_at(period, ts(1_800_000_000));
+        assert!(matches!(
+            runtime.recorded_commands().last(),
+            Some(RuntimeCommand::History {
+                instrument,
+                period: sent_period,
+                ..
+            }) if instrument.id == selected && *sent_period == period
+        ));
+        assert_eq!(model.selected_chart_period(), period);
+    }
+}
+
+#[test]
+fn selecting_an_instrument_resets_to_one_day_and_requests_missing_history() {
+    let runtime = RuntimeHandle::default();
+    let mut model = AppModel::new(
+        PersistedState::starter(),
+        CachedMarketState::default(),
+        runtime.clone(),
+    );
+    model.select_period_at(ChartPeriod::SixMonths, ts(1_800_000_000));
+    let command_count = runtime.recorded_commands().len();
+
+    model
+        .select_index_at(1, ts(1_800_000_001))
+        .expect("select NVDA");
+
+    assert_eq!(model.selected_chart_period(), ChartPeriod::OneDay);
+    assert!(matches!(
+        runtime.recorded_commands().get(command_count),
+        Some(RuntimeCommand::History {
+            instrument,
+            period: ChartPeriod::OneDay,
+            ..
+        }) if instrument.id.canonical_symbol() == "NVDA"
+    ));
+}
+
+#[test]
+fn selecting_an_instrument_uses_its_fresh_one_day_cache_without_a_request() {
+    let mut state = PersistedState::starter();
+    state.watchlist.select(0).expect("select AAPL");
+    let nvda = state.watchlist.instruments()[1].clone();
+    let now = ts(1_800_000_000);
+    let mut cache = CachedMarketState::default();
+    cache.charts.insert(
+        ChartRequestKey {
+            instrument_id: nvda.id,
+            period: ChartPeriod::OneDay,
+        },
+        kabu_core::CachedChart {
+            candles: vec![history_candle(201.0)],
+            fetched_at: now - chrono::Duration::seconds(59),
+        },
+    );
+    let runtime = RuntimeHandle::default();
+    let mut model = AppModel::new(state, cache, runtime.clone());
+
+    model.select_index_at(1, now).expect("select cached NVDA");
+
+    assert!(runtime.recorded_commands().is_empty());
+    assert_eq!(model.selected_chart_period(), ChartPeriod::OneDay);
+    assert_eq!(
+        model.selected_chart_availability(),
+        ChartAvailability::Ready
+    );
+}
+
+#[test]
+fn history_completion_requires_the_complete_current_key() {
+    let mut model = AppModel::new(
+        PersistedState::starter(),
+        CachedMarketState::default(),
+        fake_runtime(),
+    );
+    let instrument = model.selected().expect("selected instrument").clone();
+    let generation = model.request_history(instrument.clone(), ChartPeriod::SixMonths);
+    let wrong_key = ChartRequestKey {
+        instrument_id: instrument.id.clone(),
+        period: ChartPeriod::OneMonth,
+    };
+    let current_key = ChartRequestKey {
+        instrument_id: instrument.id,
+        period: ChartPeriod::SixMonths,
+    };
+
+    model.apply_runtime_event(RuntimeEvent::HistoryCompleted {
+        generation,
+        key: wrong_key.clone(),
+        candles: vec![history_candle(90.0)],
+    });
+    assert!(!model.charts().contains_key(&wrong_key));
+
+    model.apply_runtime_event(RuntimeEvent::HistoryCompleted {
+        generation,
+        key: current_key.clone(),
+        candles: vec![history_candle(110.0)],
+    });
+    assert_eq!(
+        model
+            .charts()
+            .get(&current_key)
+            .expect("matching chart")
+            .candles,
+        vec![history_candle(110.0)]
+    );
+}
+
+#[test]
+fn history_failure_requires_the_complete_current_key() {
+    let mut model = AppModel::new(
+        PersistedState::starter(),
+        CachedMarketState::default(),
+        fake_runtime(),
+    );
+    let instrument = model.selected().expect("selected instrument").clone();
+    let generation = model.request_history(instrument.clone(), ChartPeriod::SixMonths);
+    let wrong_key = ChartRequestKey {
+        instrument_id: instrument.id,
+        period: ChartPeriod::OneMonth,
+    };
+
+    model.apply_runtime_event(RuntimeEvent::HistoryFailed {
+        generation,
+        key: wrong_key,
+        error: market_error(MarketDataErrorKind::Timeout),
+    });
+
+    assert_eq!(
+        model.selected_chart_availability(),
+        ChartAvailability::Loading
+    );
+    assert!(model.warnings().is_empty());
+}
+
+#[test]
 fn superseded_history_completion_and_failure_are_ignored() {
     let mut model = AppModel::new(
         PersistedState::starter(),
@@ -511,7 +713,7 @@ fn superseded_history_completion_and_failure_are_ignored() {
         instrument_id: instrument.id.clone(),
         period: ChartPeriod::OneDay,
     };
-    let _current = model.request_history(instrument, ChartPeriod::OneWeek);
+    let _current = model.request_history(instrument, ChartPeriod::FiveDays);
 
     model.apply_runtime_event(RuntimeEvent::HistoryCompleted {
         generation: old,
@@ -661,6 +863,37 @@ fn history_candle(close: f64) -> Candle {
         close,
         volume: 1_000.0,
     }
+}
+
+fn model_with_cached_chart(
+    period: ChartPeriod,
+    age: Duration,
+) -> (AppModel, RuntimeHandle, chrono::DateTime<chrono::Utc>) {
+    let state = PersistedState::starter();
+    let instrument = state
+        .watchlist
+        .selected()
+        .expect("starter selection")
+        .clone();
+    let now = ts(1_800_000_000);
+    let mut cache = CachedMarketState::default();
+    cache.charts.insert(
+        ChartRequestKey {
+            instrument_id: instrument.id,
+            period,
+        },
+        kabu_core::CachedChart {
+            candles: vec![history_candle(101.0)],
+            fetched_at: now - chrono::Duration::from_std(age).expect("test age"),
+        },
+    );
+    let runtime = RuntimeHandle::default();
+    let model = AppModel::new(state, cache, runtime.clone());
+    (model, runtime, now)
+}
+
+fn ts(seconds: i64) -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::from_timestamp(seconds, 0).expect("timestamp")
 }
 
 fn market_error(kind: MarketDataErrorKind) -> MarketDataError {
