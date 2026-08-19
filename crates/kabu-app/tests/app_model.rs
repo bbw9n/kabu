@@ -344,6 +344,43 @@ fn adding_search_result_appends_selects_persists_and_requests_market_data() {
 }
 
 #[test]
+fn search_selection_uses_fresh_one_day_cache_without_history_request() {
+    let result = msft_result();
+    let now = ts(1_800_000_000);
+    let mut cache = CachedMarketState::default();
+    cache.charts.insert(
+        ChartRequestKey {
+            instrument_id: result.instrument.id.clone(),
+            period: ChartPeriod::OneDay,
+        },
+        kabu_core::CachedChart {
+            candles: vec![history_candle(301.0)],
+            fetched_at: now - chrono::Duration::seconds(59),
+        },
+    );
+    let runtime = RuntimeHandle::default();
+    let mut model = AppModel::new(PersistedState::starter(), cache, runtime.clone());
+    let generation = model.begin_search("msft");
+    model.apply_search_results(generation, vec![result.clone()], Vec::new());
+
+    model.add_search_result_at(0, now).expect("add cached MSFT");
+
+    assert_eq!(
+        model.selected().expect("selected MSFT").id,
+        result.instrument.id
+    );
+    assert_eq!(model.selected_chart_period(), ChartPeriod::OneDay);
+    assert_eq!(
+        model.selected_chart_availability(),
+        ChartAvailability::Ready
+    );
+    assert!(matches!(
+        runtime.recorded_commands().as_slice(),
+        [RuntimeCommand::Snapshot { .. }]
+    ));
+}
+
+#[test]
 fn adding_duplicate_selects_existing_without_reordering_or_refreshing_watchlists() {
     let mut state = PersistedState::starter();
     state.watchlist.select(2).expect("select BTC first");
@@ -548,6 +585,44 @@ fn expired_period_cache_requests_history_and_marks_the_chart_loading() {
 }
 
 #[test]
+fn future_dated_cache_is_not_fresh_and_requests_history() {
+    let state = PersistedState::starter();
+    let instrument = state
+        .watchlist
+        .selected()
+        .expect("starter selection")
+        .clone();
+    let now = ts(1_800_000_000);
+    let mut cache = CachedMarketState::default();
+    cache.charts.insert(
+        ChartRequestKey {
+            instrument_id: instrument.id,
+            period: ChartPeriod::OneMonth,
+        },
+        kabu_core::CachedChart {
+            candles: vec![history_candle(101.0)],
+            fetched_at: now + chrono::Duration::seconds(1),
+        },
+    );
+    let runtime = RuntimeHandle::default();
+    let mut model = AppModel::new(state, cache, runtime.clone());
+
+    model.select_period_at(ChartPeriod::OneMonth, now);
+
+    assert!(matches!(
+        runtime.recorded_commands().as_slice(),
+        [RuntimeCommand::History {
+            period: ChartPeriod::OneMonth,
+            ..
+        }]
+    ));
+    assert_eq!(
+        model.selected_chart_availability(),
+        ChartAvailability::Loading
+    );
+}
+
+#[test]
 fn every_period_action_targets_the_selected_instrument_and_period() {
     let runtime = RuntimeHandle::default();
     let mut model = AppModel::new(
@@ -631,6 +706,85 @@ fn selecting_an_instrument_uses_its_fresh_one_day_cache_without_a_request() {
         model.selected_chart_availability(),
         ChartAvailability::Ready
     );
+}
+
+#[test]
+fn same_row_reselection_resets_to_fresh_one_day_cache_and_supersedes_history() {
+    let state = PersistedState::starter();
+    let instrument = state
+        .watchlist
+        .selected()
+        .expect("starter selection")
+        .clone();
+    let now = ts(1_800_000_000);
+    let mut cache = CachedMarketState::default();
+    cache.charts.insert(
+        ChartRequestKey {
+            instrument_id: instrument.id.clone(),
+            period: ChartPeriod::OneDay,
+        },
+        kabu_core::CachedChart {
+            candles: vec![history_candle(201.0)],
+            fetched_at: now - chrono::Duration::seconds(59),
+        },
+    );
+    let runtime = RuntimeHandle::default();
+    let mut model = AppModel::new(state, cache, runtime.clone());
+    let stale_generation = model
+        .select_period_at(ChartPeriod::SixMonths, now)
+        .expect("missing six-month chart requests history");
+    let stale_key = ChartRequestKey {
+        instrument_id: instrument.id,
+        period: ChartPeriod::SixMonths,
+    };
+
+    model.select_index_at(0, now).expect("reselect current row");
+
+    assert_eq!(runtime.recorded_commands().len(), 1);
+    assert_eq!(model.selected_chart_period(), ChartPeriod::OneDay);
+    assert_eq!(
+        model.selected_chart_availability(),
+        ChartAvailability::Ready
+    );
+
+    model.apply_runtime_event_at(
+        RuntimeEvent::HistoryCompleted {
+            generation: stale_generation,
+            key: stale_key.clone(),
+            candles: vec![history_candle(999.0)],
+        },
+        now,
+    );
+    model.apply_runtime_event(RuntimeEvent::HistoryFailed {
+        generation: stale_generation,
+        key: stale_key.clone(),
+        error: market_error(MarketDataErrorKind::Timeout),
+    });
+
+    assert!(!model.charts().contains_key(&stale_key));
+    assert!(model.warnings().is_empty());
+}
+
+#[test]
+fn failed_history_send_after_same_row_reselection_is_terminal_and_not_loading() {
+    let runtime = RuntimeHandle::default();
+    runtime.shutdown();
+    let mut model = AppModel::new(
+        PersistedState::starter(),
+        CachedMarketState::default(),
+        runtime,
+    );
+    let now = ts(1_800_000_000);
+    model.select_period_at(ChartPeriod::SixMonths, now);
+
+    model.select_index_at(0, now).expect("reselect current row");
+
+    assert_eq!(model.selected_chart_period(), ChartPeriod::OneDay);
+    assert_eq!(
+        model.selected_chart_availability(),
+        ChartAvailability::Unavailable
+    );
+    assert_eq!(model.warnings().len(), 2);
 }
 
 #[test]
@@ -727,6 +881,67 @@ fn superseded_history_completion_and_failure_are_ignored() {
     });
 
     assert!(!model.charts().contains_key(&old_key));
+    assert!(model.warnings().is_empty());
+}
+
+#[test]
+fn removing_final_instrument_supersedes_stale_history_completion() {
+    let runtime = RuntimeHandle::default();
+    let mut model = AppModel::new(
+        state_with_one_instrument(),
+        CachedMarketState::default(),
+        runtime,
+    );
+    let instrument = model.selected().expect("selected instrument").clone();
+    let generation = model.request_history(instrument.clone(), ChartPeriod::OneDay);
+    let key = ChartRequestKey {
+        instrument_id: instrument.id,
+        period: ChartPeriod::OneDay,
+    };
+
+    model.remove_selected().expect("remove final instrument");
+    assert!(model.selected().is_none());
+    assert_eq!(
+        model.selected_chart_availability(),
+        ChartAvailability::Unavailable
+    );
+
+    model.apply_runtime_event(RuntimeEvent::HistoryCompleted {
+        generation,
+        key: key.clone(),
+        candles: vec![history_candle(777.0)],
+    });
+
+    assert!(!model.charts().contains_key(&key));
+    assert!(model.warnings().is_empty());
+}
+
+#[test]
+fn removing_final_instrument_supersedes_stale_history_failure() {
+    let mut model = AppModel::new(
+        state_with_one_instrument(),
+        CachedMarketState::default(),
+        fake_runtime(),
+    );
+    let instrument = model.selected().expect("selected instrument").clone();
+    let generation = model.request_history(instrument.clone(), ChartPeriod::OneDay);
+    let key = ChartRequestKey {
+        instrument_id: instrument.id,
+        period: ChartPeriod::OneDay,
+    };
+
+    model.remove_selected().expect("remove final instrument");
+    model.apply_runtime_event(RuntimeEvent::HistoryFailed {
+        generation,
+        key,
+        error: market_error(MarketDataErrorKind::Timeout),
+    });
+
+    assert!(model.selected().is_none());
+    assert_eq!(
+        model.selected_chart_availability(),
+        ChartAvailability::Unavailable
+    );
     assert!(model.warnings().is_empty());
 }
 
@@ -890,6 +1105,16 @@ fn model_with_cached_chart(
     let runtime = RuntimeHandle::default();
     let model = AppModel::new(state, cache, runtime.clone());
     (model, runtime, now)
+}
+
+fn state_with_one_instrument() -> PersistedState {
+    let instrument = PersistedState::starter().watchlist.instruments()[0].clone();
+    let mut watchlist = Watchlist::default();
+    watchlist.add(instrument);
+    watchlist.select(0).expect("select only instrument");
+    let mut state = PersistedState::starter();
+    state.watchlist = watchlist;
+    state
 }
 
 fn ts(seconds: i64) -> chrono::DateTime<chrono::Utc> {

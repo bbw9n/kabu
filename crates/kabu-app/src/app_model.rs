@@ -252,7 +252,10 @@ impl AppModel {
         now: chrono::DateTime<chrono::Utc>,
     ) -> Option<GenerationId> {
         self.selected_chart_period = period;
-        let instrument = self.selected()?.clone();
+        let Some(instrument) = self.selected().cloned() else {
+            self.current_history = None;
+            return None;
+        };
         let key = ChartRequestKey {
             instrument_id: instrument.id.clone(),
             period,
@@ -372,6 +375,14 @@ impl AppModel {
     }
 
     pub fn add_search_result(&mut self, index: usize) -> Result<(), AppModelError> {
+        self.add_search_result_at(index, chrono::Utc::now())
+    }
+
+    pub fn add_search_result_at(
+        &mut self,
+        index: usize,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), AppModelError> {
         let result = self.search.results.get(index).cloned().ok_or(
             AppModelError::SearchResultOutOfBounds {
                 index,
@@ -401,7 +412,7 @@ impl AppModel {
                 ));
             }
         }
-        self.request_history(result.instrument, ChartPeriod::OneDay);
+        self.select_one_day_for_current_at(now);
         persistence_result
     }
 
@@ -496,13 +507,14 @@ impl AppModel {
         index: usize,
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<(), AppModelError> {
-        if self.watchlist.selected_index() == Some(index) {
-            return Ok(());
-        }
-        self.watchlist.select(index)?;
-        self.sync_selected_identity();
-        let persistence_result = self.persist_state();
-        self.select_period_at(ChartPeriod::OneDay, now);
+        let persistence_result = if self.watchlist.selected_index() == Some(index) {
+            Ok(())
+        } else {
+            self.watchlist.select(index)?;
+            self.sync_selected_identity();
+            self.persist_state()
+        };
+        self.select_one_day_for_current_at(now);
         persistence_result
     }
 
@@ -528,7 +540,7 @@ impl AppModel {
         self.sync_selected_identity();
         let persistence_result = self.persist_if_selection_changed(before);
         if before != self.watchlist.selected_index() {
-            self.select_period(ChartPeriod::OneDay);
+            self.select_one_day_for_current_at(chrono::Utc::now());
         }
         persistence_result
     }
@@ -539,7 +551,7 @@ impl AppModel {
         self.sync_selected_identity();
         let persistence_result = self.persist_if_selection_changed(before);
         if before != self.watchlist.selected_index() {
-            self.select_period(ChartPeriod::OneDay);
+            self.select_one_day_for_current_at(chrono::Utc::now());
         }
         persistence_result
     }
@@ -551,7 +563,7 @@ impl AppModel {
         self.watchlist.remove(&selected);
         self.sync_selected_identity();
         let persistence_result = self.persist_state();
-        self.select_period(ChartPeriod::OneDay);
+        self.select_one_day_for_current_at(chrono::Utc::now());
         persistence_result
     }
 
@@ -611,6 +623,10 @@ impl AppModel {
         self.selected_identity = self.watchlist.selected().map(|item| item.id.clone());
     }
 
+    fn select_one_day_for_current_at(&mut self, now: chrono::DateTime<chrono::Utc>) {
+        self.select_period_at(ChartPeriod::OneDay, now);
+    }
+
     fn persist_state(&mut self) -> Result<(), AppModelError> {
         let Some(repository) = self.repository.clone() else {
             return Ok(());
@@ -666,10 +682,11 @@ fn chart_is_fresh(
     period: ChartPeriod,
     now: chrono::DateTime<chrono::Utc>,
 ) -> bool {
-    now.signed_duration_since(chart.fetched_at)
-        .to_std()
-        .unwrap_or_default()
-        <= period.cache_ttl()
+    now >= chart.fetched_at
+        && now
+            .signed_duration_since(chart.fetched_at)
+            .to_std()
+            .is_ok_and(|age| age <= period.cache_ttl())
 }
 
 fn clamp_sidebar_width(width: f32) -> f32 {

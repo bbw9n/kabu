@@ -29,9 +29,8 @@ pub fn normalize_closes(candles: &[Candle]) -> Vec<(f32, f32)> {
 
     let minimum = closes.iter().copied().fold(f64::INFINITY, f64::min);
     let maximum = closes.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-    let range = maximum - minimum;
     let last_index = (closes.len() - 1) as f32;
-    if range == 0.0 {
+    if minimum == maximum {
         return closes
             .iter()
             .enumerate()
@@ -39,12 +38,16 @@ pub fn normalize_closes(candles: &[Candle]) -> Vec<(f32, f32)> {
             .collect();
     }
 
+    let scale = minimum.abs().max(maximum.abs());
+    let scaled_minimum = minimum / scale;
+    let scaled_range = maximum / scale - scaled_minimum;
     let drawable_height = 1.0 - CHART_VERTICAL_PADDING * 2.0;
     closes
         .iter()
         .enumerate()
         .map(|(index, close)| {
-            let vertical_fraction = ((*close - minimum) / range) as f32;
+            let vertical_fraction =
+                ((*close / scale - scaled_minimum) / scaled_range).clamp(0.0, 1.0) as f32;
             (
                 index as f32 / last_index,
                 CHART_VERTICAL_PADDING + (1.0 - vertical_fraction) * drawable_height,

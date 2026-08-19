@@ -26,6 +26,16 @@ fn varying_series_reserves_eight_percent_vertical_padding() {
 }
 
 #[test]
+fn extreme_finite_closes_normalize_to_finite_ordered_padded_coordinates() {
+    let points = normalize_closes(&[candle(-f64::MAX), candle(0.0), candle(f64::MAX)]);
+
+    assert!(points.iter().all(|(x, y)| x.is_finite() && y.is_finite()));
+    assert_eq!(points, vec![(0.0, 0.92), (0.5, 0.5), (1.0, 0.08)]);
+    assert!(points.windows(2).all(|pair| pair[0].1 >= pair[1].1));
+    assert!(points.iter().all(|(_, y)| (0.08..=0.92).contains(y)));
+}
+
+#[test]
 fn non_finite_closes_are_discarded_before_normalizing_and_choosing_color() {
     let candles = [
         candle(f64::NAN),
