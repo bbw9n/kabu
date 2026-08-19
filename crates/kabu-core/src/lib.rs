@@ -1,5 +1,6 @@
 pub mod freshness;
 pub mod instrument;
+pub mod provider;
 pub mod quote;
 pub mod retry;
 pub mod search;
@@ -8,6 +9,10 @@ pub mod watchlist;
 
 pub use freshness::{Freshness, classify_freshness};
 pub use instrument::{AssetClass, Instrument, InstrumentError, InstrumentId};
+pub use provider::{
+    ChartHistory, InstrumentSearch, MarketDataError, MarketDataErrorKind, PersistenceError,
+    QuoteSnapshots, QuoteStream, QuoteSubscription, StateRepository,
+};
 pub use quote::{Candle, ChartPeriod, DataSource, MarketState, Quote};
 pub use retry::{RetryPolicy, jittered_delay};
 pub use search::{SearchResult, rank_search_results};
