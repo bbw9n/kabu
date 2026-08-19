@@ -1,11 +1,35 @@
 use crate::{Instrument, InstrumentId};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct Watchlist {
     instruments: Vec<Instrument>,
     selected_index: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct PersistedWatchlist {
+    instruments: Vec<Instrument>,
+    selected_index: Option<usize>,
+}
+
+impl<'de> Deserialize<'de> for Watchlist {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let persisted = PersistedWatchlist::deserialize(deserializer)?;
+        let selected_index = persisted
+            .selected_index
+            .filter(|_| !persisted.instruments.is_empty())
+            .map(|index| index.min(persisted.instruments.len() - 1));
+
+        Ok(Self {
+            instruments: persisted.instruments,
+            selected_index,
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -167,5 +191,15 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["AAPL", "NVDA", "BTC/USDT", "ETH/USDT"]
         );
+    }
+
+    #[test]
+    fn deserialization_clamps_an_out_of_bounds_selection() {
+        let mut persisted = serde_json::to_value(Watchlist::starter()).expect("json");
+        persisted["selected_index"] = serde_json::json!(usize::MAX);
+        let mut restored: Watchlist = serde_json::from_value(persisted).expect("watchlist");
+
+        assert_eq!(restored.selected_index(), Some(3));
+        assert_eq!(restored.select_next(), Some(3));
     }
 }
