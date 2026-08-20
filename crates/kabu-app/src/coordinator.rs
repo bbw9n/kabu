@@ -159,8 +159,9 @@ async fn run_stock_polls(
             snapshots = provider.snapshots(&instruments) => snapshots,
         };
         match snapshots {
-            Ok(quotes) => {
+            Ok(mut quotes) => {
                 failures = 0;
+                retain_requested_quotes(&mut quotes, &instruments);
                 if !quotes.is_empty() {
                     send_event(&events, RuntimeEvent::Quotes(quotes));
                 }
@@ -239,7 +240,11 @@ async fn run_crypto_stream(
                 break;
             };
             match item {
-                Ok(quote) => {
+                Ok(quote)
+                    if instruments
+                        .iter()
+                        .any(|instrument| instrument.id == quote.instrument_id) =>
+                {
                     if reconcile_after_disconnect {
                         if !reconcile_crypto(&instruments, provider.as_ref(), &events, &cancelled)
                             .await
@@ -252,6 +257,7 @@ async fn run_crypto_stream(
                     }
                     send_event(&events, RuntimeEvent::Quotes(vec![quote]));
                 }
+                Ok(_) => {}
                 Err(error) => {
                     if error.kind == MarketDataErrorKind::Disconnected {
                         reconcile_after_disconnect = true;
@@ -296,8 +302,12 @@ async fn reconcile_crypto(
         snapshots = provider.snapshots(instruments) => snapshots,
     };
     match snapshots {
-        Ok(quotes) if !quotes.is_empty() => send_event(events, RuntimeEvent::Quotes(quotes)),
-        Ok(_) => {}
+        Ok(mut quotes) => {
+            retain_requested_quotes(&mut quotes, instruments);
+            if !quotes.is_empty() {
+                send_event(events, RuntimeEvent::Quotes(quotes));
+            }
+        }
         Err(error) => send_quote_error(events, instruments, error),
     }
     true
@@ -318,6 +328,14 @@ fn send_quote_error(
             error,
         },
     );
+}
+
+fn retain_requested_quotes(quotes: &mut Vec<kabu_core::Quote>, instruments: &[Instrument]) {
+    quotes.retain(|quote| {
+        instruments
+            .iter()
+            .any(|instrument| instrument.id == quote.instrument_id)
+    });
 }
 
 fn send_event(events: &RuntimeEventSender, event: RuntimeEvent) {
@@ -434,6 +452,31 @@ mod tests {
             assert_eq!(harness.yahoo_snapshot_calls(), expected);
         }
 
+        harness.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn provider_quotes_are_filtered_to_the_applied_watchlist_before_mailboxing() {
+        let active = aapl_instrument();
+        let mut returned = vec![aapl_quote()];
+        returned.extend((0..256).map(|index| {
+            let instrument =
+                Instrument::equity(&format!("X{index}"), Some("NASDAQ"), "Unexpected", "USD")
+                    .expect("unrelated instrument");
+            quote(&instrument, DataSource::Yahoo)
+        }));
+        let harness = CoordinatorHarness::with_yahoo_results(vec![active.clone()], [Ok(returned)]);
+
+        harness.set_visible(true).await;
+        harness.settle().await;
+
+        let mut quote_ids = Vec::new();
+        while let Ok(event) = harness.events.try_recv() {
+            if let RuntimeEvent::Quotes(quotes) = event {
+                quote_ids.extend(quotes.into_iter().map(|quote| quote.instrument_id));
+            }
+        }
+        assert_eq!(quote_ids, vec![active.id]);
         harness.shutdown().await;
     }
 

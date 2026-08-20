@@ -462,10 +462,25 @@ fn gpui_event_pressure_applies_final_quote_status_and_typed_error_without_deadlo
     runtime.publish_recorded_event(RuntimeEvent::StreamStatus(StreamStatus::Connecting));
     runtime.publish_recorded_event(RuntimeEvent::StreamStatus(StreamStatus::Live));
     for index in 0..300 {
-        let mut quote = cached_quote(aapl.clone(), 100.0 + index as f64, 99.0);
+        let unrelated = InstrumentId::equity(&format!("X{index}"), Some("NASDAQ"))
+            .expect("distinct pressure identity");
+        let mut quote = cached_quote(unrelated.clone(), 100.0 + index as f64, 99.0);
         quote.provider_timestamp += chrono::Duration::milliseconds(index as i64);
         runtime.publish_recorded_event(RuntimeEvent::Quotes(vec![quote]));
+        runtime.publish_recorded_event(RuntimeEvent::QuoteError {
+            instrument_ids: vec![unrelated],
+            error: MarketDataError {
+                kind: MarketDataErrorKind::Timeout,
+                message: "private distinct provider response".into(),
+                retry_after: None,
+            },
+        });
     }
+    runtime.publish_recorded_event(RuntimeEvent::Quotes(vec![cached_quote(
+        aapl.clone(),
+        399.0,
+        99.0,
+    )]));
     runtime.publish_recorded_event(RuntimeEvent::QuoteError {
         instrument_ids: vec![btc.clone()],
         error: MarketDataError {

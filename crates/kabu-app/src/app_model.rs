@@ -433,6 +433,7 @@ impl AppModel {
 
     pub fn set_search_query(&mut self, query: impl AsRef<str>) -> GenerationId {
         let generation = self.begin_search(query);
+        _ = self.send_runtime(RuntimeCommand::CancelSearch);
         if self.search.query.is_empty() {
             self.search.loading = false;
             self.pending_search = None;
@@ -461,6 +462,7 @@ impl AppModel {
 
     pub fn cancel_pending_search(&mut self) {
         self.begin_search("");
+        _ = self.send_runtime(RuntimeCommand::CancelSearch);
     }
 
     pub fn advance_search_clock(&mut self, elapsed: Duration) {
@@ -613,8 +615,8 @@ impl AppModel {
                 for quote in quotes {
                     let instrument_id = quote.instrument_id.clone();
                     let freshness = classify_freshness(&quote, now);
+                    self.loading_quotes.remove(&instrument_id);
                     if self.quotes.merge(quote) == MergeOutcome::Applied {
-                        self.loading_quotes.remove(&instrument_id);
                         self.freshness.insert(instrument_id.clone(), freshness);
                         self.quote_errors.remove(&instrument_id);
                         applied = true;
@@ -741,7 +743,8 @@ impl AppModel {
             }
         } else {
             let search_was_pending = self.search.loading || self.pending_search.is_some();
-            self.search_generation.next();
+            let generation = self.search_generation.next();
+            self.current_search_generation = Some(generation);
             self.pending_search = None;
             self.search.loading = false;
             if search_was_pending {
@@ -1019,7 +1022,13 @@ impl AppModel {
     fn send_runtime(&mut self, command: RuntimeCommand) -> Result<(), RuntimeSendError> {
         let dispatch_kind = runtime_dispatch_kind(&command);
         let warning_key = WarningKey::RuntimeDispatch(dispatch_kind);
-        let is_control = dispatch_kind == RuntimeDispatchKind::Control;
+        let is_control = dispatch_kind == RuntimeDispatchKind::Control
+            || matches!(
+                &command,
+                RuntimeCommand::Search { .. }
+                    | RuntimeCommand::RetrySearchProvider { .. }
+                    | RuntimeCommand::CancelSearch
+            );
         let result = self.runtime.send(command);
         if result.is_err() {
             self.upsert_warning(
@@ -1175,9 +1184,9 @@ impl AppModel {
 
 fn runtime_dispatch_kind(command: &RuntimeCommand) -> RuntimeDispatchKind {
     match command {
-        RuntimeCommand::Search { .. } | RuntimeCommand::RetrySearchProvider { .. } => {
-            RuntimeDispatchKind::Search
-        }
+        RuntimeCommand::Search { .. }
+        | RuntimeCommand::RetrySearchProvider { .. }
+        | RuntimeCommand::CancelSearch => RuntimeDispatchKind::Search,
         RuntimeCommand::Snapshot { .. } => RuntimeDispatchKind::Snapshot,
         RuntimeCommand::History { .. } => RuntimeDispatchKind::History,
         RuntimeCommand::SetVisible(_)

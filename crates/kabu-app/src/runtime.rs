@@ -32,6 +32,7 @@ pub enum RuntimeCommand {
         query: String,
         source: DataSource,
     },
+    CancelSearch,
     Snapshot {
         instruments: Vec<Instrument>,
     },
@@ -159,8 +160,9 @@ pub enum RuntimeEvent {
 /// A coalescing runtime event mailbox backed by a bounded-one notification
 /// channel. Repeated data-plane updates replace the pending value in their
 /// semantic slot (quote per instrument, error per instrument/error class,
-/// status, persistence category, or request key). This keeps quote floods from
-/// consuming control capacity while retaining the final observable state.
+/// status, persistence category, or request key). Dynamic data families have
+/// fixed cardinality caps and evict their oldest same-family value. Control,
+/// persistence, and terminal slots are never evicted by data floods.
 #[derive(Clone)]
 pub struct RuntimeEvents {
     state: Arc<Mutex<RuntimeEventState>>,
@@ -192,6 +194,10 @@ enum RuntimeEventSlot {
     StreamStatus,
 }
 
+const QUOTE_EVENT_SLOT_CAPACITY: usize = 64;
+const QUOTE_ERROR_EVENT_SLOT_CAPACITY: usize = 64;
+const HISTORY_EVENT_SLOT_CAPACITY: usize = 32;
+
 pub(crate) fn runtime_event_channel() -> (RuntimeEventSender, RuntimeEvents) {
     let (notify, notifications) = async_channel::bounded(1);
     let state = Arc::new(Mutex::new(RuntimeEventState::default()));
@@ -218,6 +224,17 @@ impl RuntimeEventSender {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         for (slot, event) in events {
+            if state
+                .slots
+                .get(&slot)
+                .and_then(|sequence| state.pending.get(sequence))
+                .is_some_and(|pending| event_is_older_generation(&event, pending))
+            {
+                continue;
+            }
+            if !state.slots.contains_key(&slot) {
+                evict_oldest_dynamic_slot_at_capacity(&mut state, &slot);
+            }
             state.next_sequence = state
                 .next_sequence
                 .checked_add(1)
@@ -244,6 +261,138 @@ impl RuntimeEventSender {
     fn close(&self) {
         self.notify.close();
     }
+
+    fn clear_search(&self) {
+        self.remove_slots(|slot| {
+            matches!(
+                slot,
+                RuntimeEventSlot::Search | RuntimeEventSlot::SearchProvider(_)
+            )
+        });
+    }
+
+    fn clear_search_provider(&self, source: DataSource) {
+        self.remove_slots(
+            |slot| matches!(slot, RuntimeEventSlot::SearchProvider(candidate) if *candidate == source),
+        );
+    }
+
+    fn retain_watchlist_events(&self, watchlist: &[Instrument]) {
+        self.remove_slots(|slot| {
+            let instrument_id = match slot {
+                RuntimeEventSlot::Quote(instrument_id)
+                | RuntimeEventSlot::QuoteError(instrument_id, _) => Some(instrument_id),
+                RuntimeEventSlot::History(key) => Some(&key.instrument_id),
+                RuntimeEventSlot::Search
+                | RuntimeEventSlot::SearchProvider(_)
+                | RuntimeEventSlot::Catalog
+                | RuntimeEventSlot::Persistence(_)
+                | RuntimeEventSlot::StreamStatus => None,
+            };
+            instrument_id.is_some_and(|instrument_id| {
+                !watchlist
+                    .iter()
+                    .any(|instrument| &instrument.id == instrument_id)
+            })
+        });
+    }
+
+    fn remove_slots(&self, remove: impl Fn(&RuntimeEventSlot) -> bool) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let removed: Vec<_> = state
+            .slots
+            .iter()
+            .filter_map(|(slot, sequence)| remove(slot).then_some((slot.clone(), *sequence)))
+            .collect();
+        for (slot, sequence) in removed {
+            state.slots.remove(&slot);
+            state.pending.remove(&sequence);
+        }
+    }
+}
+
+fn event_is_older_generation(incoming: &RuntimeEvent, pending: &RuntimeEvent) -> bool {
+    match (
+        runtime_event_generation(incoming),
+        runtime_event_generation(pending),
+    ) {
+        (Some(incoming), Some(pending)) => incoming < pending,
+        _ => false,
+    }
+}
+
+fn runtime_event_generation(event: &RuntimeEvent) -> Option<GenerationId> {
+    match event {
+        RuntimeEvent::SearchCompleted { generation, .. }
+        | RuntimeEvent::SearchProviderCompleted { generation, .. }
+        | RuntimeEvent::HistoryCompleted { generation, .. }
+        | RuntimeEvent::HistoryFailed { generation, .. } => Some(*generation),
+        RuntimeEvent::Quotes(_)
+        | RuntimeEvent::QuoteError { .. }
+        | RuntimeEvent::CatalogRefresh { .. }
+        | RuntimeEvent::PersistenceCompleted { .. }
+        | RuntimeEvent::StreamStatus(_) => None,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DynamicEventFamily {
+    Quote,
+    QuoteError,
+    History,
+}
+
+fn dynamic_event_family(slot: &RuntimeEventSlot) -> Option<(DynamicEventFamily, usize)> {
+    match slot {
+        RuntimeEventSlot::Quote(_) => Some((DynamicEventFamily::Quote, QUOTE_EVENT_SLOT_CAPACITY)),
+        RuntimeEventSlot::QuoteError(_, _) => Some((
+            DynamicEventFamily::QuoteError,
+            QUOTE_ERROR_EVENT_SLOT_CAPACITY,
+        )),
+        RuntimeEventSlot::History(_) => {
+            Some((DynamicEventFamily::History, HISTORY_EVENT_SLOT_CAPACITY))
+        }
+        RuntimeEventSlot::Search
+        | RuntimeEventSlot::SearchProvider(_)
+        | RuntimeEventSlot::Catalog
+        | RuntimeEventSlot::Persistence(_)
+        | RuntimeEventSlot::StreamStatus => None,
+    }
+}
+
+fn evict_oldest_dynamic_slot_at_capacity(
+    state: &mut RuntimeEventState,
+    incoming: &RuntimeEventSlot,
+) {
+    let Some((family, capacity)) = dynamic_event_family(incoming) else {
+        return;
+    };
+    let family_slots = state.slots.iter().filter_map(|(slot, sequence)| {
+        (dynamic_event_family(slot).map(|(candidate, _)| candidate) == Some(family))
+            .then_some((slot.clone(), *sequence))
+    });
+    let mut family_len = 0;
+    let mut oldest = None;
+    for candidate in family_slots {
+        family_len += 1;
+        if oldest
+            .as_ref()
+            .is_none_or(|(_, sequence)| candidate.1 < *sequence)
+        {
+            oldest = Some(candidate);
+        }
+    }
+    if family_len < capacity {
+        return;
+    }
+    let Some((oldest_slot, oldest_sequence)) = oldest else {
+        return;
+    };
+    state.slots.remove(&oldest_slot);
+    state.pending.remove(&oldest_sequence);
 }
 
 impl RuntimeEvents {
@@ -302,29 +451,39 @@ impl RuntimeEvents {
 
 fn normalize_runtime_event(event: RuntimeEvent) -> Vec<(RuntimeEventSlot, RuntimeEvent)> {
     match event {
-        RuntimeEvent::Quotes(quotes) => quotes
-            .into_iter()
-            .map(|quote| {
-                let slot = RuntimeEventSlot::Quote(quote.instrument_id.clone());
-                (slot, RuntimeEvent::Quotes(vec![quote]))
-            })
-            .collect(),
+        RuntimeEvent::Quotes(quotes) => {
+            let skip = quotes.len().saturating_sub(QUOTE_EVENT_SLOT_CAPACITY);
+            quotes
+                .into_iter()
+                .skip(skip)
+                .map(|quote| {
+                    let slot = RuntimeEventSlot::Quote(quote.instrument_id.clone());
+                    (slot, RuntimeEvent::Quotes(vec![quote]))
+                })
+                .collect()
+        }
         RuntimeEvent::QuoteError {
             instrument_ids,
             error,
-        } => instrument_ids
-            .into_iter()
-            .map(|instrument_id| {
-                let slot = RuntimeEventSlot::QuoteError(instrument_id.clone(), error.kind);
-                (
-                    slot,
-                    RuntimeEvent::QuoteError {
-                        instrument_ids: vec![instrument_id],
-                        error: error.clone(),
-                    },
-                )
-            })
-            .collect(),
+        } => {
+            let skip = instrument_ids
+                .len()
+                .saturating_sub(QUOTE_ERROR_EVENT_SLOT_CAPACITY);
+            instrument_ids
+                .into_iter()
+                .skip(skip)
+                .map(|instrument_id| {
+                    let slot = RuntimeEventSlot::QuoteError(instrument_id.clone(), error.kind);
+                    (
+                        slot,
+                        RuntimeEvent::QuoteError {
+                            instrument_ids: vec![instrument_id],
+                            error: error.clone(),
+                        },
+                    )
+                })
+                .collect()
+        }
         event => vec![(runtime_event_slot(&event), event)],
     }
 }
@@ -526,6 +685,26 @@ struct DesiredControlState {
     revision: u64,
     visible: bool,
     watchlist: Vec<Instrument>,
+    search: DesiredSearchState,
+}
+
+#[derive(Clone, Default)]
+struct DesiredSearchState {
+    full: DesiredSearchSlot,
+    yahoo: DesiredSearchSlot,
+    binance: DesiredSearchSlot,
+}
+
+#[derive(Clone, Default)]
+struct DesiredSearchSlot {
+    revision: u64,
+    request: Option<SearchRequest>,
+}
+
+#[derive(Clone)]
+struct SearchRequest {
+    generation: GenerationId,
+    query: String,
 }
 
 struct ControlLane {
@@ -560,6 +739,20 @@ struct NetworkInputs {
     providers: ProviderSet,
     storage: RuntimeStorage,
     catalog_client: Option<BinanceClient>,
+}
+
+#[derive(Default)]
+struct SearchJobs {
+    full: Option<tokio::task::JoinHandle<()>>,
+    yahoo: Option<tokio::task::JoinHandle<()>>,
+    binance: Option<tokio::task::JoinHandle<()>>,
+}
+
+#[derive(Default)]
+struct AppliedSearchRevisions {
+    full: u64,
+    yahoo: u64,
+    binance: u64,
 }
 
 #[derive(Default)]
@@ -622,6 +815,7 @@ impl RuntimeHandle {
                 revision: 0,
                 visible: true,
                 watchlist: Vec::new(),
+                search: DesiredSearchState::default(),
             }),
             applied_revision: AtomicU64::new(0),
             notify: control_notify,
@@ -686,7 +880,7 @@ impl RuntimeHandle {
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 if is_control_command(&command) {
-                    commands.retain(|existing| !same_control_slot(existing, &command));
+                    coalesce_recording_control(&mut commands, &command);
                     commands.push_back(command);
                     return Ok(());
                 }
@@ -720,6 +914,24 @@ impl RuntimeHandle {
                     }
                     RuntimeCommand::SetCryptoWatchlist(crypto) => {
                         runtime.controls.update_crypto_watchlist(crypto);
+                        Ok(())
+                    }
+                    RuntimeCommand::Search { generation, query } => {
+                        runtime.controls.update_search(generation, query);
+                        Ok(())
+                    }
+                    RuntimeCommand::RetrySearchProvider {
+                        generation,
+                        query,
+                        source,
+                    } => {
+                        runtime
+                            .controls
+                            .update_search_retry(generation, query, source);
+                        Ok(())
+                    }
+                    RuntimeCommand::CancelSearch => {
+                        runtime.controls.cancel_search();
                         Ok(())
                     }
                     command => runtime
@@ -940,25 +1152,41 @@ impl RuntimeHandle {
 fn is_control_command(command: &RuntimeCommand) -> bool {
     matches!(
         command,
-        RuntimeCommand::SetVisible(_)
+        RuntimeCommand::Search { .. }
+            | RuntimeCommand::RetrySearchProvider { .. }
+            | RuntimeCommand::CancelSearch
+            | RuntimeCommand::SetVisible(_)
             | RuntimeCommand::SetWatchlist(_)
             | RuntimeCommand::SetCryptoWatchlist(_)
     )
 }
 
-fn same_control_slot(left: &RuntimeCommand, right: &RuntimeCommand) -> bool {
-    matches!(
-        (left, right),
-        (RuntimeCommand::SetVisible(_), RuntimeCommand::SetVisible(_))
-            | (
-                RuntimeCommand::SetWatchlist(_),
-                RuntimeCommand::SetWatchlist(_)
-            )
-            | (
-                RuntimeCommand::SetCryptoWatchlist(_),
-                RuntimeCommand::SetCryptoWatchlist(_)
-            )
-    )
+fn coalesce_recording_control(commands: &mut VecDeque<RuntimeCommand>, incoming: &RuntimeCommand) {
+    commands.retain(|existing| match incoming {
+        RuntimeCommand::Search { .. } | RuntimeCommand::CancelSearch => !matches!(
+            existing,
+            RuntimeCommand::Search { .. }
+                | RuntimeCommand::RetrySearchProvider { .. }
+                | RuntimeCommand::CancelSearch
+        ),
+        RuntimeCommand::RetrySearchProvider { source, .. } => !matches!(
+            existing,
+            RuntimeCommand::RetrySearchProvider {
+                source: existing_source,
+                ..
+            } if existing_source == source
+        ),
+        RuntimeCommand::SetVisible(_) => !matches!(existing, RuntimeCommand::SetVisible(_)),
+        RuntimeCommand::SetWatchlist(_) => !matches!(existing, RuntimeCommand::SetWatchlist(_)),
+        RuntimeCommand::SetCryptoWatchlist(_) => {
+            !matches!(existing, RuntimeCommand::SetCryptoWatchlist(_))
+        }
+        RuntimeCommand::Snapshot { .. }
+        | RuntimeCommand::History { .. }
+        | RuntimeCommand::PersistState(_)
+        | RuntimeCommand::PersistMarketCache { .. }
+        | RuntimeCommand::Shutdown => true,
+    });
 }
 
 impl Drop for LiveRuntime {
@@ -995,7 +1223,12 @@ impl Drop for LiveRuntime {
 
 impl ControlLane {
     fn update_visibility(&self, visible: bool) {
-        self.update(|state| state.visible = visible);
+        self.update(|state| {
+            state.visible = visible;
+            if !visible {
+                state.search.cancel_all();
+            }
+        });
     }
 
     fn update_watchlist(&self, watchlist: Vec<Instrument>) {
@@ -1009,6 +1242,26 @@ impl ControlLane {
                 .retain(|instrument| instrument.id.asset_class() == AssetClass::Equity);
             state.watchlist.extend(crypto);
         });
+    }
+
+    fn update_search(&self, generation: GenerationId, query: String) {
+        self.update(|state| {
+            state
+                .search
+                .replace_full(SearchRequest { generation, query });
+        });
+    }
+
+    fn update_search_retry(&self, generation: GenerationId, query: String, source: DataSource) {
+        self.update(|state| {
+            state
+                .search
+                .replace_retry(source, SearchRequest { generation, query });
+        });
+    }
+
+    fn cancel_search(&self) {
+        self.update(|state| state.search.cancel_all());
     }
 
     fn update(&self, mutate: impl FnOnce(&mut DesiredControlState)) {
@@ -1033,6 +1286,121 @@ impl ControlLane {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .revision;
         self.applied_revision.load(Ordering::SeqCst) == desired_revision
+    }
+}
+
+impl DesiredSearchState {
+    fn replace_full(&mut self, request: SearchRequest) {
+        self.full.replace(Some(request));
+        self.yahoo.replace(None);
+        self.binance.replace(None);
+    }
+
+    fn replace_retry(&mut self, source: DataSource, request: SearchRequest) {
+        self.provider_mut(source).replace(Some(request));
+    }
+
+    fn cancel_all(&mut self) {
+        self.full.replace(None);
+        self.yahoo.replace(None);
+        self.binance.replace(None);
+    }
+
+    fn provider(&self, source: DataSource) -> &DesiredSearchSlot {
+        match source {
+            DataSource::Yahoo => &self.yahoo,
+            DataSource::Binance => &self.binance,
+        }
+    }
+
+    fn provider_mut(&mut self, source: DataSource) -> &mut DesiredSearchSlot {
+        match source {
+            DataSource::Yahoo => &mut self.yahoo,
+            DataSource::Binance => &mut self.binance,
+        }
+    }
+}
+
+impl DesiredSearchSlot {
+    fn replace(&mut self, request: Option<SearchRequest>) {
+        self.revision = self.revision.wrapping_add(1);
+        self.request = request;
+    }
+}
+
+impl SearchJobs {
+    async fn cancel_all(&mut self) {
+        abort_and_join(&mut self.full).await;
+        abort_and_join(&mut self.yahoo).await;
+        abort_and_join(&mut self.binance).await;
+    }
+
+    async fn cancel_provider(&mut self, source: DataSource) {
+        abort_and_join(self.provider_mut(source)).await;
+    }
+
+    fn provider_mut(&mut self, source: DataSource) -> &mut Option<tokio::task::JoinHandle<()>> {
+        match source {
+            DataSource::Yahoo => &mut self.yahoo,
+            DataSource::Binance => &mut self.binance,
+        }
+    }
+}
+
+async fn abort_and_join(job: &mut Option<tokio::task::JoinHandle<()>>) {
+    if let Some(job) = job.take() {
+        job.abort();
+        _ = job.await;
+    }
+}
+
+async fn apply_desired_search(
+    desired: &DesiredSearchState,
+    applied: &mut AppliedSearchRevisions,
+    jobs: &mut SearchJobs,
+    visible: bool,
+    providers: &ProviderSet,
+    events: &RuntimeEventSender,
+) {
+    if applied.full != desired.full.revision {
+        jobs.cancel_all().await;
+        events.clear_search();
+        if visible && let Some(request) = desired.full.request.clone() {
+            let providers = providers.clone();
+            let events = events.clone();
+            jobs.full = Some(tokio::spawn(async move {
+                send_search(request.generation, request.query, &providers, &events).await;
+            }));
+        }
+        applied.full = desired.full.revision;
+    }
+
+    for source in [DataSource::Yahoo, DataSource::Binance] {
+        let desired_slot = desired.provider(source);
+        let applied_revision = match source {
+            DataSource::Yahoo => &mut applied.yahoo,
+            DataSource::Binance => &mut applied.binance,
+        };
+        if *applied_revision == desired_slot.revision {
+            continue;
+        }
+        jobs.cancel_provider(source).await;
+        events.clear_search_provider(source);
+        if visible && let Some(request) = desired_slot.request.clone() {
+            let providers = providers.clone();
+            let events = events.clone();
+            *jobs.provider_mut(source) = Some(tokio::spawn(async move {
+                send_provider_search(
+                    request.generation,
+                    request.query,
+                    source,
+                    &providers,
+                    &events,
+                )
+                .await;
+            }));
+        }
+        *applied_revision = desired_slot.revision;
     }
 }
 
@@ -1105,7 +1473,8 @@ async fn run_dispatcher(inputs: NetworkInputs) -> ShutdownOutcome {
         final_flush,
     } = storage;
     let mut jobs = tokio::task::JoinSet::new();
-    let mut search_job: Option<tokio::task::JoinHandle<()>> = None;
+    let mut search_jobs = SearchJobs::default();
+    let mut applied_search = AppliedSearchRevisions::default();
     let mut pending = VecDeque::with_capacity(COMMAND_CAPACITY);
     let mut other_in_flight = 0usize;
     let mut visible = true;
@@ -1152,22 +1521,28 @@ async fn run_dispatcher(inputs: NetworkInputs) -> ShutdownOutcome {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clone();
             if desired.visible {
-                coordinator.set_watchlist(desired.watchlist).await;
+                coordinator.set_watchlist(desired.watchlist.clone()).await;
                 visible = true;
                 coordinator.set_visible(true).await;
             } else {
                 visible = false;
-                if let Some(job) = search_job.take() {
-                    job.abort();
-                    _ = job.await;
-                }
                 pending.clear();
                 jobs.abort_all();
                 while jobs.join_next().await.is_some() {}
                 other_in_flight = 0;
                 coordinator.set_visible(false).await;
-                coordinator.set_watchlist(desired.watchlist).await;
+                coordinator.set_watchlist(desired.watchlist.clone()).await;
             }
+            events.retain_watchlist_events(&desired.watchlist);
+            apply_desired_search(
+                &desired.search,
+                &mut applied_search,
+                &mut search_jobs,
+                visible,
+                &providers,
+                &events,
+            )
+            .await;
             controls
                 .applied_revision
                 .store(desired.revision, Ordering::SeqCst);
@@ -1199,45 +1574,9 @@ async fn run_dispatcher(inputs: NetworkInputs) -> ShutdownOutcome {
                     break;
                 };
                 match command {
-                    RuntimeCommand::Search { generation, query } => {
-                        if !visible {
-                            continue;
-                        }
-                        if let Some(job) = search_job.take() {
-                            job.abort();
-                            _ = job.await;
-                        }
-                        let events = events.clone();
-                        let providers = providers.clone();
-                        search_job = Some(tokio::spawn(async move {
-                            send_search(generation, query, &providers, &events).await;
-                        }));
-                    }
-                    RuntimeCommand::RetrySearchProvider {
-                        generation,
-                        query,
-                        source,
-                    } => {
-                        if !visible {
-                            continue;
-                        }
-                        if let Some(job) = search_job.take() {
-                            job.abort();
-                            _ = job.await;
-                        }
-                        let events = events.clone();
-                        let providers = providers.clone();
-                        search_job = Some(tokio::spawn(async move {
-                            send_provider_search(
-                                generation,
-                                query,
-                                source,
-                                &providers,
-                                &events,
-                            )
-                            .await;
-                        }));
-                    }
+                    RuntimeCommand::Search { .. }
+                    | RuntimeCommand::RetrySearchProvider { .. }
+                    | RuntimeCommand::CancelSearch => {}
                     RuntimeCommand::Snapshot { .. } | RuntimeCommand::History { .. } => {
                         if !visible {
                             continue;
@@ -1252,10 +1591,8 @@ async fn run_dispatcher(inputs: NetworkInputs) -> ShutdownOutcome {
                         visible = next_visible;
                         coordinator.set_visible(next_visible).await;
                         if !next_visible {
-                            if let Some(job) = search_job.take() {
-                                job.abort();
-                                _ = job.await;
-                            }
+                            search_jobs.cancel_all().await;
+                            events.clear_search();
                             pending.clear();
                             jobs.abort_all();
                             while jobs.join_next().await.is_some() {}
@@ -1280,10 +1617,8 @@ async fn run_dispatcher(inputs: NetworkInputs) -> ShutdownOutcome {
         }
     }
 
-    if let Some(job) = search_job {
-        job.abort();
-        _ = job.await;
-    }
+    search_jobs.cancel_all().await;
+    events.clear_search();
     jobs.abort_all();
     while jobs.join_next().await.is_some() {}
     coordinator.shutdown().await;
@@ -1489,6 +1824,7 @@ fn spawn_other_job(
             }
             RuntimeCommand::Search { .. }
             | RuntimeCommand::RetrySearchProvider { .. }
+            | RuntimeCommand::CancelSearch
             | RuntimeCommand::SetVisible(_)
             | RuntimeCommand::SetWatchlist(_)
             | RuntimeCommand::SetCryptoWatchlist(_)
@@ -1634,7 +1970,11 @@ async fn collect_snapshot_outcome(
     events: &RuntimeEventSender,
 ) {
     match outcome {
-        Ok(provider_quotes) => quotes.extend(provider_quotes),
+        Ok(provider_quotes) => quotes.extend(provider_quotes.into_iter().filter(|quote| {
+            instruments
+                .iter()
+                .any(|instrument| instrument.id == quote.instrument_id)
+        })),
         Err(error) => {
             _ = events
                 .send(RuntimeEvent::QuoteError {
@@ -1673,12 +2013,13 @@ mod tests {
         PersistenceCategory, PersistenceResult, ProductionComponents, ProviderSet, RuntimeCommand,
         RuntimeEvent, RuntimeHandle, StreamStatus, refresh_catalog_cache,
     };
+    use crate::app_model::{AppModel, ChartAvailability};
     use async_trait::async_trait;
     use kabu_core::{
-        CachedMarketState, Candle, ChartHistory, ChartPeriod, DataSource, Instrument, InstrumentId,
-        InstrumentSearch, MarketDataError, MarketDataErrorKind, MarketState, PersistedState,
-        PersistenceError, Quote, QuoteSnapshots, QuoteStream, QuoteSubscription, SearchResult,
-        StateRepository,
+        CachedMarketState, Candle, ChartHistory, ChartPeriod, ChartRequestKey, DataSource,
+        Generation, Instrument, InstrumentId, InstrumentSearch, MarketDataError,
+        MarketDataErrorKind, MarketState, PersistedState, PersistenceError, Quote, QuoteSnapshots,
+        QuoteStream, QuoteSubscription, SearchResult, StateRepository,
     };
     use std::{
         sync::{
@@ -1692,6 +2033,388 @@ mod tests {
         Mock, MockServer, ResponseTemplate,
         matchers::{method, path},
     };
+
+    #[test]
+    fn distinct_event_flood_has_fixed_cardinality_and_retains_terminal_state() {
+        let (sender, events) = super::runtime_event_channel();
+        let mut generations = Generation::default();
+        let final_id = distinct_equity_id(511);
+
+        sender
+            .try_send(RuntimeEvent::SearchCompleted {
+                generation: generations.next(),
+                results: vec![nvda_result()],
+                warnings: Vec::new(),
+            })
+            .expect("terminal search event");
+        sender
+            .try_send(RuntimeEvent::CatalogRefresh {
+                result: Err(MarketDataErrorKind::Unavailable),
+                catalog_available: false,
+            })
+            .expect("catalog control event");
+        sender
+            .try_send(RuntimeEvent::PersistenceCompleted {
+                category: PersistenceCategory::State,
+                result: PersistenceResult::Failed,
+            })
+            .expect("state persistence event");
+        sender
+            .try_send(RuntimeEvent::PersistenceCompleted {
+                category: PersistenceCategory::MarketCache,
+                result: PersistenceResult::Failed,
+            })
+            .expect("cache persistence event");
+        sender
+            .try_send(RuntimeEvent::StreamStatus(StreamStatus::Connecting))
+            .expect("initial status");
+
+        for index in 0..512 {
+            let instrument_id = distinct_equity_id(index);
+            let mut quote = test_quote(instrument_id.clone(), DataSource::Yahoo);
+            quote.last = index as f64;
+            sender
+                .try_send(RuntimeEvent::Quotes(vec![quote]))
+                .expect("quote flood remains nonblocking");
+            sender
+                .try_send(RuntimeEvent::QuoteError {
+                    instrument_ids: vec![instrument_id.clone()],
+                    error: test_error(MarketDataErrorKind::Disconnected),
+                })
+                .expect("error flood remains nonblocking");
+            sender
+                .try_send(RuntimeEvent::HistoryCompleted {
+                    generation: generations.next(),
+                    key: ChartRequestKey {
+                        instrument_id,
+                        period: ChartPeriod::OneDay,
+                    },
+                    candles: vec![test_candle()],
+                })
+                .expect("history flood remains nonblocking");
+        }
+        sender
+            .try_send(RuntimeEvent::StreamStatus(StreamStatus::Paused))
+            .expect("final status");
+
+        {
+            let state = sender
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let quote_slots = state
+                .slots
+                .keys()
+                .filter(|slot| matches!(slot, super::RuntimeEventSlot::Quote(_)))
+                .count();
+            let error_slots = state
+                .slots
+                .keys()
+                .filter(|slot| matches!(slot, super::RuntimeEventSlot::QuoteError(_, _)))
+                .count();
+            let history_slots = state
+                .slots
+                .keys()
+                .filter(|slot| matches!(slot, super::RuntimeEventSlot::History(_)))
+                .count();
+            assert!(quote_slots <= 64, "quote slots must have a fixed cap");
+            assert!(error_slots <= 64, "error slots must have a fixed cap");
+            assert!(history_slots <= 32, "history slots must have a fixed cap");
+            assert!(state.pending.len() <= 167, "all semantic slots are bounded");
+        }
+
+        let mut saw_final_quote = false;
+        let mut saw_final_error = false;
+        let mut saw_search = false;
+        let mut saw_catalog = false;
+        let mut saw_state_persistence = false;
+        let mut saw_cache_persistence = false;
+        let mut status = None;
+        while let Ok(event) = events.try_recv() {
+            match event {
+                RuntimeEvent::Quotes(quotes) => {
+                    saw_final_quote |= quotes.first().is_some_and(|quote| {
+                        quote.instrument_id == final_id && quote.last == 511.0
+                    });
+                }
+                RuntimeEvent::QuoteError {
+                    instrument_ids,
+                    error,
+                } => {
+                    saw_final_error |= instrument_ids == [final_id.clone()]
+                        && error.kind == MarketDataErrorKind::Disconnected;
+                }
+                RuntimeEvent::SearchCompleted { .. } => saw_search = true,
+                RuntimeEvent::CatalogRefresh { .. } => saw_catalog = true,
+                RuntimeEvent::PersistenceCompleted { category, .. } => match category {
+                    PersistenceCategory::State => saw_state_persistence = true,
+                    PersistenceCategory::MarketCache => saw_cache_persistence = true,
+                },
+                RuntimeEvent::StreamStatus(next) => status = Some(next),
+                RuntimeEvent::SearchProviderCompleted { .. }
+                | RuntimeEvent::HistoryCompleted { .. }
+                | RuntimeEvent::HistoryFailed { .. } => {}
+            }
+        }
+        assert!(saw_final_quote);
+        assert!(saw_final_error);
+        assert!(saw_search);
+        assert!(saw_catalog);
+        assert!(saw_state_persistence);
+        assert!(saw_cache_persistence);
+        assert_eq!(status, Some(StreamStatus::Paused));
+    }
+
+    #[test]
+    fn one_oversized_provider_event_normalizes_to_a_fixed_number_of_slots() {
+        let quotes: Vec<_> = (0..512)
+            .map(|index| test_quote(distinct_equity_id(index), DataSource::Yahoo))
+            .collect();
+        let quote_events = super::normalize_runtime_event(RuntimeEvent::Quotes(quotes));
+        assert_eq!(quote_events.len(), super::QUOTE_EVENT_SLOT_CAPACITY);
+        assert!(matches!(
+            quote_events.last(),
+            Some((super::RuntimeEventSlot::Quote(id), _)) if id == &distinct_equity_id(511)
+        ));
+
+        let instrument_ids: Vec<_> = (0..512).map(distinct_equity_id).collect();
+        let error_events = super::normalize_runtime_event(RuntimeEvent::QuoteError {
+            instrument_ids,
+            error: test_error(MarketDataErrorKind::Timeout),
+        });
+        assert_eq!(error_events.len(), super::QUOTE_ERROR_EVENT_SLOT_CAPACITY);
+        assert!(matches!(
+            error_events.last(),
+            Some((super::RuntimeEventSlot::QuoteError(id, _), _))
+                if id == &distinct_equity_id(511)
+        ));
+    }
+
+    #[test]
+    fn mailbox_never_replaces_newer_generation_with_late_stale_history_or_search() {
+        let (sender, events) = super::runtime_event_channel();
+        let mut generations = Generation::default();
+        let stale = generations.next();
+        let current = generations.next();
+        let key = ChartRequestKey {
+            instrument_id: aapl_instrument().id,
+            period: ChartPeriod::OneMonth,
+        };
+
+        sender
+            .try_send(RuntimeEvent::HistoryCompleted {
+                generation: current,
+                key: key.clone(),
+                candles: vec![test_candle()],
+            })
+            .expect("current history");
+        sender
+            .try_send(RuntimeEvent::HistoryFailed {
+                generation: stale,
+                key,
+                error: test_error(MarketDataErrorKind::Timeout),
+            })
+            .expect("late stale history");
+        sender
+            .try_send(RuntimeEvent::SearchCompleted {
+                generation: current,
+                results: vec![btc_result()],
+                warnings: Vec::new(),
+            })
+            .expect("current search");
+        sender
+            .try_send(RuntimeEvent::SearchCompleted {
+                generation: stale,
+                results: vec![nvda_result()],
+                warnings: Vec::new(),
+            })
+            .expect("late stale search");
+        sender
+            .try_send(RuntimeEvent::SearchProviderCompleted {
+                generation: current,
+                source: DataSource::Binance,
+                results: vec![btc_result()],
+                warning: None,
+            })
+            .expect("current provider search");
+        sender
+            .try_send(RuntimeEvent::SearchProviderCompleted {
+                generation: stale,
+                source: DataSource::Binance,
+                results: Vec::new(),
+                warning: Some(super::ProviderWarning {
+                    source: DataSource::Binance,
+                    kind: MarketDataErrorKind::Unavailable,
+                    message: "fixed warning".into(),
+                }),
+            })
+            .expect("late stale provider search");
+
+        let mut history_generation = None;
+        let mut search_generation = None;
+        let mut provider_generation = None;
+        while let Ok(event) = events.try_recv() {
+            match event {
+                RuntimeEvent::HistoryCompleted { generation, .. }
+                | RuntimeEvent::HistoryFailed { generation, .. } => {
+                    history_generation = Some(generation);
+                }
+                RuntimeEvent::SearchCompleted { generation, .. } => {
+                    search_generation = Some(generation);
+                }
+                RuntimeEvent::SearchProviderCompleted { generation, .. } => {
+                    provider_generation = Some(generation);
+                }
+                RuntimeEvent::Quotes(_)
+                | RuntimeEvent::QuoteError { .. }
+                | RuntimeEvent::CatalogRefresh { .. }
+                | RuntimeEvent::PersistenceCompleted { .. }
+                | RuntimeEvent::StreamStatus(_) => {}
+            }
+        }
+        assert_eq!(history_generation, Some(current));
+        assert_eq!(search_generation, Some(current));
+        assert_eq!(provider_generation, Some(current));
+    }
+
+    #[test]
+    fn reverse_history_completion_order_reaches_current_terminal_app_state() {
+        let cases = [true, false];
+        for current_succeeds in cases {
+            let (sender, events) = super::runtime_event_channel();
+            let runtime = RuntimeHandle::default();
+            let mut model = AppModel::new(
+                PersistedState::starter(),
+                CachedMarketState::default(),
+                runtime,
+            );
+            let instrument = model.selected().expect("starter selection").clone();
+            let stale = model.request_history(instrument.clone(), ChartPeriod::OneMonth);
+            let current = model.request_history(instrument.clone(), ChartPeriod::OneMonth);
+            let key = ChartRequestKey {
+                instrument_id: instrument.id,
+                period: ChartPeriod::OneMonth,
+            };
+
+            if current_succeeds {
+                sender
+                    .try_send(RuntimeEvent::HistoryCompleted {
+                        generation: current,
+                        key: key.clone(),
+                        candles: vec![test_candle()],
+                    })
+                    .expect("current completion");
+                sender
+                    .try_send(RuntimeEvent::HistoryFailed {
+                        generation: stale,
+                        key,
+                        error: test_error(MarketDataErrorKind::Timeout),
+                    })
+                    .expect("late stale failure");
+            } else {
+                sender
+                    .try_send(RuntimeEvent::HistoryFailed {
+                        generation: current,
+                        key: key.clone(),
+                        error: test_error(MarketDataErrorKind::Timeout),
+                    })
+                    .expect("current failure");
+                sender
+                    .try_send(RuntimeEvent::HistoryCompleted {
+                        generation: stale,
+                        key,
+                        candles: vec![test_candle()],
+                    })
+                    .expect("late stale completion");
+            }
+
+            while let Ok(event) = events.try_recv() {
+                model.apply_runtime_event(event);
+            }
+            assert_eq!(
+                model.selected_chart_availability(),
+                if current_succeeds {
+                    ChartAvailability::Ready
+                } else {
+                    ChartAvailability::Unavailable
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn watchlist_and_search_cleanup_remove_dead_mailbox_keys() {
+        let (sender, events) = super::runtime_event_channel();
+        let keep = aapl_instrument();
+        let remove =
+            Instrument::equity("DROP", Some("NYSE"), "Removed", "USD").expect("removed instrument");
+        let generation = kabu_core::Generation::default().next();
+        for instrument in [&keep, &remove] {
+            sender
+                .try_send(RuntimeEvent::Quotes(vec![test_quote(
+                    instrument.id.clone(),
+                    DataSource::Yahoo,
+                )]))
+                .expect("quote");
+            sender
+                .try_send(RuntimeEvent::QuoteError {
+                    instrument_ids: vec![instrument.id.clone()],
+                    error: test_error(MarketDataErrorKind::Timeout),
+                })
+                .expect("quote error");
+            sender
+                .try_send(RuntimeEvent::HistoryCompleted {
+                    generation,
+                    key: ChartRequestKey {
+                        instrument_id: instrument.id.clone(),
+                        period: ChartPeriod::OneDay,
+                    },
+                    candles: vec![test_candle()],
+                })
+                .expect("history");
+        }
+        sender
+            .try_send(RuntimeEvent::SearchCompleted {
+                generation,
+                results: vec![nvda_result()],
+                warnings: Vec::new(),
+            })
+            .expect("full search");
+        sender
+            .try_send(RuntimeEvent::SearchProviderCompleted {
+                generation,
+                source: DataSource::Yahoo,
+                results: vec![nvda_result()],
+                warning: None,
+            })
+            .expect("provider search");
+
+        sender.retain_watchlist_events(std::slice::from_ref(&keep));
+        sender.clear_search();
+
+        {
+            let state = sender
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            assert!(state.slots.keys().all(|slot| match slot {
+                super::RuntimeEventSlot::Quote(id) | super::RuntimeEventSlot::QuoteError(id, _) =>
+                    id == &keep.id,
+                super::RuntimeEventSlot::History(key) => key.instrument_id == keep.id,
+                super::RuntimeEventSlot::Search | super::RuntimeEventSlot::SearchProvider(_) => {
+                    false
+                }
+                _ => true,
+            }));
+        }
+        while events.try_recv().is_ok() {}
+        let state = sender
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(state.slots.is_empty());
+        assert!(state.pending.is_empty());
+    }
 
     #[test]
     fn recording_runtime_coalesces_controls_without_admitting_extra_ordinary_work() {
@@ -1747,6 +2470,27 @@ mod tests {
                 RuntimeCommand::SetCryptoWatchlist(crypto),
                 RuntimeCommand::SetVisible(true),
             ] if instruments == &vec![aapl] && crypto == &vec![btc]
+        ));
+    }
+
+    #[test]
+    fn search_cancel_is_reliable_when_the_ordinary_queue_is_saturated() {
+        let runtime = RuntimeHandle::default();
+        for _ in 0..super::COMMAND_CAPACITY {
+            runtime
+                .send(RuntimeCommand::Snapshot {
+                    instruments: Vec::new(),
+                })
+                .expect("fill ordinary queue");
+        }
+
+        runtime
+            .send(RuntimeCommand::CancelSearch)
+            .expect("search cancellation uses the reliable control lane");
+
+        assert!(matches!(
+            runtime.recorded_commands().last(),
+            Some(RuntimeCommand::CancelSearch)
         ));
     }
 
@@ -2683,6 +3427,49 @@ mod tests {
     }
 
     #[test]
+    fn explicit_snapshot_filters_unrequested_provider_output() {
+        let unexpected = distinct_equity_id(9_999);
+        let provider = ControlledProvider::new(
+            DataSource::Yahoo,
+            Arc::new(OperationProbe::default()),
+            Duration::ZERO,
+        )
+        .with_snapshot_extra(test_quote(unexpected.clone(), DataSource::Yahoo));
+        let providers = ProviderSet {
+            equities: Arc::new(provider),
+            crypto: Arc::new(ControlledProvider::new(
+                DataSource::Binance,
+                Arc::new(OperationProbe::default()),
+                Duration::ZERO,
+            )),
+        };
+        let runtime = RuntimeHandle::start(providers, Arc::new(NoopRepository)).expect("runtime");
+        let requested = aapl_instrument();
+
+        runtime
+            .send(RuntimeCommand::Snapshot {
+                instruments: vec![requested.clone()],
+            })
+            .expect("snapshot");
+        let first = runtime.events().recv_blocking().expect("requested quote");
+        thread::sleep(Duration::from_millis(10));
+        let mut ids = match first {
+            RuntimeEvent::Quotes(quotes) => quotes
+                .into_iter()
+                .map(|quote| quote.instrument_id)
+                .collect::<Vec<_>>(),
+            event => panic!("unexpected event: {event:?}"),
+        };
+        while let Ok(RuntimeEvent::Quotes(quotes)) = runtime.events().try_recv() {
+            ids.extend(quotes.into_iter().map(|quote| quote.instrument_id));
+        }
+
+        assert_eq!(ids, vec![requested.id]);
+        assert!(!ids.contains(&unexpected));
+        runtime.shutdown();
+    }
+
+    #[test]
     fn newer_search_cancels_the_prior_generation_before_it_can_emit() {
         let probe = Arc::new(OperationProbe::default());
         let providers = ProviderSet {
@@ -2726,7 +3513,7 @@ mod tests {
     }
 
     #[test]
-    fn newer_query_cancels_an_in_flight_provider_retry_before_it_can_emit() {
+    fn newer_query_cancels_both_in_flight_provider_retries_before_they_can_emit() {
         let probe = Arc::new(OperationProbe::default());
         let providers = ProviderSet {
             equities: Arc::new(
@@ -2748,8 +3535,15 @@ mod tests {
                 query: "old".into(),
                 source: DataSource::Yahoo,
             })
-            .expect("old provider retry");
-        wait_for_counter(&probe.started, 1);
+            .expect("old Yahoo provider retry");
+        runtime
+            .send(RuntimeCommand::RetrySearchProvider {
+                generation: retry_generation,
+                query: "old".into(),
+                source: DataSource::Binance,
+            })
+            .expect("old Binance provider retry");
+        wait_for_counter(&probe.started, 2);
 
         runtime
             .send(RuntimeCommand::Search {
@@ -2764,7 +3558,103 @@ mod tests {
             panic!("expected current full search completion");
         };
         assert_eq!(generation, current);
-        assert_eq!(probe.cancelled.load(Ordering::SeqCst), 1);
+        assert_eq!(probe.cancelled.load(Ordering::SeqCst), 2);
+        assert!(runtime.events().try_recv().is_err());
+        runtime.shutdown();
+    }
+
+    #[test]
+    fn provider_retries_have_independent_owned_jobs_and_same_source_replacement() {
+        let yahoo_probe = Arc::new(OperationProbe::default());
+        let binance_probe = Arc::new(OperationProbe::default());
+        let providers = ProviderSet {
+            equities: Arc::new(
+                ControlledProvider::new(DataSource::Yahoo, yahoo_probe.clone(), Duration::ZERO)
+                    .with_slow_search(Duration::from_secs(30)),
+            ),
+            crypto: Arc::new(
+                ControlledProvider::new(DataSource::Binance, binance_probe.clone(), Duration::ZERO)
+                    .with_slow_search(Duration::from_secs(30)),
+            ),
+        };
+        let runtime = RuntimeHandle::start(providers, Arc::new(NoopRepository)).expect("runtime");
+        let generation = kabu_core::Generation::default().next();
+
+        runtime
+            .send(RuntimeCommand::RetrySearchProvider {
+                generation,
+                query: "old".into(),
+                source: DataSource::Yahoo,
+            })
+            .expect("Yahoo retry");
+        wait_for_counter(&yahoo_probe.started, 1);
+        runtime
+            .send(RuntimeCommand::RetrySearchProvider {
+                generation,
+                query: "old".into(),
+                source: DataSource::Binance,
+            })
+            .expect("Binance retry");
+        wait_for_counter(&binance_probe.started, 1);
+
+        assert_eq!(yahoo_probe.active.load(Ordering::SeqCst), 1);
+        assert_eq!(binance_probe.active.load(Ordering::SeqCst), 1);
+
+        runtime
+            .send(RuntimeCommand::RetrySearchProvider {
+                generation,
+                query: "old".into(),
+                source: DataSource::Yahoo,
+            })
+            .expect("replacement Yahoo retry");
+        wait_for_counter(&yahoo_probe.started, 2);
+        assert_eq!(yahoo_probe.cancelled.load(Ordering::SeqCst), 1);
+        assert_eq!(yahoo_probe.active.load(Ordering::SeqCst), 1);
+        assert_eq!(binance_probe.cancelled.load(Ordering::SeqCst), 0);
+        assert_eq!(binance_probe.active.load(Ordering::SeqCst), 1);
+
+        runtime
+            .send(RuntimeCommand::CancelSearch)
+            .expect("reliable cancellation");
+        assert!(runtime.wait_for_control_state(Duration::from_secs(1)));
+        assert_eq!(yahoo_probe.active.load(Ordering::SeqCst), 0);
+        assert_eq!(binance_probe.active.load(Ordering::SeqCst), 0);
+        assert!(runtime.events().try_recv().is_err());
+        runtime.shutdown();
+    }
+
+    #[test]
+    fn model_search_close_awaits_actual_slow_provider_cancellation() {
+        let yahoo_probe = Arc::new(OperationProbe::default());
+        let binance_probe = Arc::new(OperationProbe::default());
+        let providers = ProviderSet {
+            equities: Arc::new(
+                ControlledProvider::new(DataSource::Yahoo, yahoo_probe.clone(), Duration::ZERO)
+                    .with_slow_search(Duration::from_secs(30)),
+            ),
+            crypto: Arc::new(
+                ControlledProvider::new(DataSource::Binance, binance_probe.clone(), Duration::ZERO)
+                    .with_slow_search(Duration::from_secs(30)),
+            ),
+        };
+        let runtime = RuntimeHandle::start(providers, Arc::new(NoopRepository)).expect("runtime");
+        let mut model = AppModel::new(
+            PersistedState::starter(),
+            CachedMarketState::default(),
+            runtime.clone(),
+        );
+        model.set_search_query("old");
+        model.advance_search_clock(Duration::from_millis(250));
+        wait_for_counter(&yahoo_probe.started, 1);
+        wait_for_counter(&binance_probe.started, 1);
+
+        model.cancel_pending_search();
+
+        assert!(runtime.wait_for_control_state(Duration::from_secs(1)));
+        assert_eq!(yahoo_probe.active.load(Ordering::SeqCst), 0);
+        assert_eq!(binance_probe.active.load(Ordering::SeqCst), 0);
+        assert_eq!(yahoo_probe.cancelled.load(Ordering::SeqCst), 1);
+        assert_eq!(binance_probe.cancelled.load(Ordering::SeqCst), 1);
         assert!(runtime.events().try_recv().is_err());
         runtime.shutdown();
     }
@@ -2790,6 +3680,21 @@ mod tests {
                 query: "old".into(),
             })
             .expect("search");
+        let retry_generation = kabu_core::Generation::default().next();
+        runtime
+            .send(RuntimeCommand::RetrySearchProvider {
+                generation: retry_generation,
+                query: "old".into(),
+                source: DataSource::Yahoo,
+            })
+            .expect("Yahoo retry");
+        runtime
+            .send(RuntimeCommand::RetrySearchProvider {
+                generation: retry_generation,
+                query: "old".into(),
+                source: DataSource::Binance,
+            })
+            .expect("Binance retry");
         runtime
             .send(RuntimeCommand::Snapshot {
                 instruments: vec![instrument.clone()],
@@ -2802,12 +3707,12 @@ mod tests {
                 period: ChartPeriod::OneDay,
             })
             .expect("history");
-        wait_for_counter(&probe.started, 4);
+        wait_for_counter(&probe.started, 6);
 
         runtime.shutdown();
 
         assert_eq!(probe.active.load(Ordering::SeqCst), 0);
-        assert_eq!(probe.cancelled.load(Ordering::SeqCst), 4);
+        assert_eq!(probe.cancelled.load(Ordering::SeqCst), 6);
         assert!(runtime.is_shutdown());
     }
 
@@ -3139,6 +4044,7 @@ mod tests {
         slow_search_delay: Duration,
         fail_snapshot: bool,
         fail_history: bool,
+        snapshot_extras: Vec<Quote>,
         snapshot_instruments: Arc<Mutex<Vec<Vec<InstrumentId>>>>,
     }
 
@@ -3151,6 +4057,7 @@ mod tests {
                 slow_search_delay: Duration::ZERO,
                 fail_snapshot: false,
                 fail_history: false,
+                snapshot_extras: Vec::new(),
                 snapshot_instruments: Arc::new(Mutex::new(Vec::new())),
             }
         }
@@ -3167,6 +4074,11 @@ mod tests {
 
         fn with_history_failure(mut self) -> Self {
             self.fail_history = true;
+            self
+        }
+
+        fn with_snapshot_extra(mut self, quote: Quote) -> Self {
+            self.snapshot_extras.push(quote);
             self
         }
 
@@ -3217,10 +4129,12 @@ mod tests {
             if self.fail_snapshot {
                 return Err(test_error(MarketDataErrorKind::Unavailable));
             }
-            Ok(instruments
+            let mut quotes: Vec<_> = instruments
                 .iter()
                 .map(|instrument| test_quote(instrument.id.clone(), self.source))
-                .collect())
+                .collect();
+            quotes.extend(self.snapshot_extras.clone());
+            Ok(quotes)
         }
     }
 
@@ -3283,6 +4197,10 @@ mod tests {
             received_at: timestamp,
             provider_delayed: false,
         }
+    }
+
+    fn distinct_equity_id(index: usize) -> InstrumentId {
+        InstrumentId::equity(&format!("X{index}"), Some("NASDAQ")).expect("distinct identity")
     }
 
     fn test_candle() -> Candle {
@@ -3450,13 +4368,19 @@ mod tests {
     ) {
         let deadline = Instant::now() + Duration::from_secs(1);
         loop {
-            let event = events.recv_blocking().expect("persistence event");
-            if let RuntimeEvent::PersistenceCompleted { category, result } = event {
-                assert_eq!(category, expected_category);
-                assert_eq!(result, expected_result);
-                return;
+            match events.try_recv() {
+                Ok(RuntimeEvent::PersistenceCompleted { category, result }) => {
+                    assert_eq!(category, expected_category);
+                    assert_eq!(result, expected_result);
+                    return;
+                }
+                Ok(_) | Err(async_channel::TryRecvError::Empty) => {}
+                Err(async_channel::TryRecvError::Closed) => {
+                    panic!("persistence event channel closed before acknowledgement")
+                }
             }
             assert!(Instant::now() < deadline, "persistence event deadline");
+            thread::sleep(Duration::from_millis(1));
         }
     }
 

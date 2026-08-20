@@ -278,7 +278,10 @@ fn search_waits_exactly_250_milliseconds() {
 
     model.set_search_query("nv");
     model.advance_search_clock(Duration::from_millis(249));
-    assert!(runtime.recorded_commands().is_empty());
+    assert!(matches!(
+        runtime.recorded_commands().as_slice(),
+        [RuntimeCommand::CancelSearch]
+    ));
 
     model.advance_search_clock(Duration::from_millis(1));
     assert!(matches!(
@@ -302,7 +305,10 @@ fn empty_search_cancels_a_pending_provider_call_and_clears_results() {
     model.set_search_query("   ");
     model.advance_search_clock(Duration::from_secs(1));
 
-    assert!(runtime.recorded_commands().is_empty());
+    assert!(matches!(
+        runtime.recorded_commands().as_slice(),
+        [RuntimeCommand::CancelSearch]
+    ));
     assert!(model.search().results().is_empty());
     assert!(!model.search().is_loading());
 }
@@ -473,6 +479,10 @@ fn closing_search_rejects_a_late_provider_retry_completion() {
     model.retry_search_provider(DataSource::Binance);
 
     model.cancel_pending_search();
+    assert!(matches!(
+        model.runtime().recorded_commands().last(),
+        Some(RuntimeCommand::CancelSearch)
+    ));
     model.apply_runtime_event(RuntimeEvent::SearchProviderCompleted {
         generation,
         source: DataSource::Binance,
@@ -483,6 +493,80 @@ fn closing_search_rejects_a_late_provider_retry_completion() {
     assert!(model.search().query().is_empty());
     assert!(model.search().results().is_empty());
     assert!(!model.search().provider_retryable(DataSource::Binance));
+}
+
+#[test]
+fn hide_advances_retry_generation_and_restored_provider_retries_merge_independently() {
+    let runtime = RuntimeHandle::default();
+    let mut model = AppModel::new(
+        PersistedState::starter(),
+        CachedMarketState::default(),
+        runtime.clone(),
+    );
+    model.set_visible_at(true, ts(1_999));
+    let stale = model.begin_search("private-hidden-query");
+    model.apply_search_results(
+        stale,
+        vec![nvda_result()],
+        vec![
+            ProviderWarning {
+                source: DataSource::Yahoo,
+                kind: MarketDataErrorKind::Unavailable,
+                message: "Yahoo search is temporarily unavailable.".into(),
+            },
+            ProviderWarning {
+                source: DataSource::Binance,
+                kind: MarketDataErrorKind::Timeout,
+                message: "Binance search is temporarily unavailable.".into(),
+            },
+        ],
+    );
+
+    model.set_visible_at(false, ts(2_000));
+    model.apply_runtime_event(RuntimeEvent::SearchProviderCompleted {
+        generation: stale,
+        source: DataSource::Binance,
+        results: vec![btc_result()],
+        warning: None,
+    });
+    assert_eq!(model.search().results(), &[nvda_result()]);
+    model.set_visible_at(true, ts(2_001));
+    model.retry_search_provider(DataSource::Yahoo);
+    model.retry_search_provider(DataSource::Binance);
+
+    let retries: Vec<_> = runtime
+        .recorded_commands()
+        .into_iter()
+        .filter_map(|command| match command {
+            RuntimeCommand::RetrySearchProvider {
+                generation, source, ..
+            } => Some((generation, source)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(retries.len(), 2);
+    assert_ne!(retries[0].0, stale);
+    assert_eq!(retries[0].0, retries[1].0);
+    assert_eq!(retries[0].1, DataSource::Yahoo);
+    assert_eq!(retries[1].1, DataSource::Binance);
+    let current = retries[0].0;
+
+    model.apply_runtime_event(RuntimeEvent::SearchProviderCompleted {
+        generation: current,
+        source: DataSource::Yahoo,
+        results: vec![nvda_result()],
+        warning: None,
+    });
+    model.apply_runtime_event(RuntimeEvent::SearchProviderCompleted {
+        generation: current,
+        source: DataSource::Binance,
+        results: vec![btc_result()],
+        warning: None,
+    });
+
+    assert!(model.search().provider_warnings().is_empty());
+    assert_eq!(model.search().results().len(), 2);
+    assert!(!format!("{:?}", model.search()).contains("private-hidden-query-provider-body"));
 }
 
 #[test]
@@ -632,7 +716,7 @@ fn add_persistence_failure_keeps_selection_and_still_requests_live_data() {
 }
 
 #[test]
-fn full_runtime_queue_finishes_search_with_a_sanitized_terminal_error() {
+fn full_runtime_queue_admits_search_on_the_reliable_control_lane() {
     let runtime = RuntimeHandle::default();
     for _ in 0..64 {
         runtime
@@ -650,18 +734,25 @@ fn full_runtime_queue_finishes_search_with_a_sanitized_terminal_error() {
     model.set_search_query("private-full-query");
     model.advance_search_clock(Duration::from_millis(250));
 
-    assert!(!model.search().is_loading());
+    assert!(model.search().is_loading());
+    assert_eq!(model.search().terminal_error(), None);
     assert_eq!(
-        model.search().terminal_error(),
-        Some("Search is temporarily unavailable.")
+        runtime
+            .recorded_commands()
+            .iter()
+            .filter(|command| matches!(command, RuntimeCommand::Snapshot { .. }))
+            .count(),
+        64
     );
+    assert!(matches!(
+        runtime.recorded_commands().last(),
+        Some(RuntimeCommand::Search { query, .. }) if query == "private-full-query"
+    ));
     assert!(
-        !model
+        model
             .warnings()
-            .last()
-            .expect("runtime warning")
-            .message
-            .contains("private-full-query")
+            .iter()
+            .all(|warning| !warning.message.contains("private-full-query"))
     );
 }
 
@@ -1207,7 +1298,10 @@ fn app_model_rejects_older_quotes_and_preserves_the_last_good_value_on_error() {
     model.apply_runtime_event_at(RuntimeEvent::Quotes(vec![newest]), ts(2_000));
     model.set_quote_loading(id.clone(), true);
     model.apply_runtime_event_at(RuntimeEvent::Quotes(vec![older]), ts(2_001));
-    assert!(model.quote_is_loading(&id));
+    assert!(
+        !model.quote_is_loading(&id),
+        "any completed quote outcome clears reconciliation loading"
+    );
     model.apply_runtime_event_at(
         RuntimeEvent::QuoteError {
             instrument_ids: vec![id.clone()],

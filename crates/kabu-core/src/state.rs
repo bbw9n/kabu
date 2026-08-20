@@ -113,7 +113,7 @@ pub struct CachedInstrumentCatalog {
     pub instruments: Vec<Instrument>,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub struct GenerationId(u64);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
