@@ -278,6 +278,60 @@ fn quote_detail_renders_metrics_chart_and_dispatches_period_clicks(cx: &mut gpui
 }
 
 #[gpui::test]
+fn minimum_window_keeps_the_chart_above_every_metric_card(cx: &mut gpui::TestAppContext) {
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        kabu_app::commands::init(cx);
+    });
+    let state = PersistedState::starter();
+    let instrument = state
+        .watchlist
+        .selected()
+        .expect("starter selection")
+        .clone();
+    let mut cache = CachedMarketState::default();
+    cache.quotes.insert(
+        instrument.id.clone(),
+        cached_quote(instrument.id.clone(), 105.0, 100.0),
+    );
+    cache.charts.insert(
+        ChartRequestKey {
+            instrument_id: instrument.id,
+            period: ChartPeriod::OneDay,
+        },
+        CachedChart {
+            candles: vec![chart_candle(100.0), chart_candle(105.0)],
+            fetched_at: chrono::Utc::now(),
+        },
+    );
+    let model = cx.update(|cx| cx.new(|_| AppModel::new(state, cache, RuntimeHandle::default())));
+    let (_, cx) =
+        cx.add_window_view(move |window, cx| AppShell::with_model(model.clone(), window, cx));
+    cx.simulate_resize(size(px(MIN_WINDOW_WIDTH), px(MIN_WINDOW_HEIGHT)));
+    cx.refresh().expect("render minimum-size detail");
+
+    let chart = cx.debug_bounds("price-chart").expect("price chart bounds");
+    assert!(
+        f32::from(chart.size.height) >= 190.0,
+        "minimum-size chart collapsed to {} points",
+        f32::from(chart.size.height)
+    );
+    for selector in [
+        "quote-metric-open",
+        "quote-metric-high",
+        "quote-metric-low",
+        "quote-metric-previous-close",
+        "quote-metric-volume",
+    ] {
+        let metric = cx.debug_bounds(selector).expect("metric card bounds");
+        assert!(
+            chart.bottom() <= metric.top(),
+            "{selector} overlaps the chart: chart={chart:?}, metric={metric:?}"
+        );
+    }
+}
+
+#[gpui::test]
 fn quote_retry_keeps_last_good_price_visible_with_refreshing_indicator(
     cx: &mut gpui::TestAppContext,
 ) {

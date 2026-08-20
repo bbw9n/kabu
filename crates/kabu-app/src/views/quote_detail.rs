@@ -252,6 +252,7 @@ impl RenderOnce for QuoteDetail {
             .child(
                 div()
                     .flex()
+                    .flex_shrink_0()
                     .items_end()
                     .justify_between()
                     .gap_4()
@@ -324,7 +325,7 @@ impl RenderOnce for QuoteDetail {
             .children(retry_error.map(|(message, retry_history)| {
                 inline_retry(self.model.clone(), message, retry_history, cx)
             }))
-            .child(div().flex().flex_wrap().gap_2().children([
+            .child(div().flex().flex_shrink_0().flex_wrap().gap_2().children([
                 metric_card("Open", data.open.clone(), "quote-metric-open", cx),
                 metric_card("High", data.high.clone(), "quote-metric-high", cx),
                 metric_card("Low", data.low.clone(), "quote-metric-low", cx),
@@ -339,6 +340,7 @@ impl RenderOnce for QuoteDetail {
             .child(
                 div()
                     .flex()
+                    .flex_shrink_0()
                     .items_center()
                     .justify_between()
                     .border_t_1()
@@ -426,6 +428,7 @@ fn source_status(
 fn period_tabs(model: Entity<AppModel>, selected: ChartPeriod) -> gpui::AnyElement {
     div()
         .flex()
+        .flex_shrink_0()
         .gap_1()
         .children([
             period_tab(
@@ -501,7 +504,7 @@ fn render_chart(
             .debug_selector(|| "chart-loading".into())
             .flex()
             .flex_1()
-            .min_h(px(160.0))
+            .min_h(px(super::price_chart::MIN_CHART_CONTAINER_HEIGHT))
             .child(Skeleton::new().size_full())
             .into_any_element(),
         ChartAvailability::Ready => {
@@ -523,7 +526,7 @@ fn unavailable_chart(cx: &App) -> gpui::AnyElement {
         .debug_selector(|| "chart-unavailable".into())
         .flex()
         .flex_1()
-        .min_h(px(160.0))
+        .min_h(px(super::price_chart::MIN_CHART_CONTAINER_HEIGHT))
         .items_center()
         .justify_center()
         .rounded_lg()

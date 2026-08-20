@@ -7,6 +7,7 @@ use kabu_core::Candle;
 
 pub const CHART_VERTICAL_PADDING: f32 = 0.08;
 pub const CHART_STROKE_WIDTH: f32 = 2.0;
+pub const MIN_CHART_CONTAINER_HEIGHT: f32 = 200.0;
 const GUIDE_POSITIONS: [f32; 3] = [0.25, 0.5, 0.75];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -106,7 +107,7 @@ impl RenderOnce for PriceChart {
             .flex()
             .flex_col()
             .flex_1()
-            .min_h_0()
+            .min_h(px(MIN_CHART_CONTAINER_HEIGHT))
             .child(
                 canvas(
                     |_, _, _| (),

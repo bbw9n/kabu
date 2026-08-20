@@ -15,6 +15,7 @@ fn main() {
         .run(|cx| {
             gpui_component::init(cx);
             kabu_app::commands::init(cx);
+            kabu_app::lifecycle::quit_after_last_window_closes(cx);
             cx.spawn(async move |cx| {
                 let launch = ProductionComponents::production()?.start()?;
                 let (model, bounds) = cx.update(|cx| {
