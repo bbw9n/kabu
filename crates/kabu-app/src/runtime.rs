@@ -161,8 +161,10 @@ pub enum RuntimeEvent {
 /// channel. Repeated data-plane updates replace the pending value in their
 /// semantic slot (quote per instrument, error per instrument/error class,
 /// status, persistence category, or request key). Dynamic data families have
-/// fixed cardinality caps and evict their oldest same-family value. Control,
-/// persistence, and terminal slots are never evicted by data floods.
+/// fixed cardinality caps. Quote/error overflow evicts its oldest same-family
+/// value; history retains the highest generations and newest equal-generation
+/// terminals. Fixed search, catalog, persistence, and status slots are never
+/// evicted by dynamic-family floods.
 #[derive(Clone)]
 pub struct RuntimeEvents {
     state: Arc<Mutex<RuntimeEventState>>,
@@ -232,8 +234,8 @@ impl RuntimeEventSender {
             {
                 continue;
             }
-            if !state.slots.contains_key(&slot) {
-                evict_oldest_dynamic_slot_at_capacity(&mut state, &slot);
+            if !state.slots.contains_key(&slot) && !admit_dynamic_slot(&mut state, &slot, &event) {
+                continue;
             }
             state.next_sequence = state
                 .next_sequence
@@ -363,36 +365,55 @@ fn dynamic_event_family(slot: &RuntimeEventSlot) -> Option<(DynamicEventFamily, 
     }
 }
 
-fn evict_oldest_dynamic_slot_at_capacity(
+fn admit_dynamic_slot(
     state: &mut RuntimeEventState,
     incoming: &RuntimeEventSlot,
-) {
+    incoming_event: &RuntimeEvent,
+) -> bool {
     let Some((family, capacity)) = dynamic_event_family(incoming) else {
-        return;
+        return true;
     };
     let family_slots = state.slots.iter().filter_map(|(slot, sequence)| {
         (dynamic_event_family(slot).map(|(candidate, _)| candidate) == Some(family))
             .then_some((slot.clone(), *sequence))
     });
     let mut family_len = 0;
-    let mut oldest = None;
+    let mut lowest = None;
     for candidate in family_slots {
         family_len += 1;
-        if oldest
+        let generation = (family == DynamicEventFamily::History).then(|| {
+            runtime_event_generation(
+                state
+                    .pending
+                    .get(&candidate.1)
+                    .expect("runtime event slot points to pending state"),
+            )
+            .expect("history event has a generation")
+        });
+        if lowest
             .as_ref()
-            .is_none_or(|(_, sequence)| candidate.1 < *sequence)
+            .is_none_or(|(_, sequence, retained_generation)| {
+                (generation, candidate.1) < (*retained_generation, *sequence)
+            })
         {
-            oldest = Some(candidate);
+            lowest = Some((candidate.0, candidate.1, generation));
         }
     }
     if family_len < capacity {
-        return;
+        return true;
     }
-    let Some((oldest_slot, oldest_sequence)) = oldest else {
-        return;
+    let Some((lowest_slot, lowest_sequence, lowest_generation)) = lowest else {
+        return true;
     };
-    state.slots.remove(&oldest_slot);
-    state.pending.remove(&oldest_sequence);
+    if family == DynamicEventFamily::History
+        && runtime_event_generation(incoming_event).expect("history event has a generation")
+            < lowest_generation.expect("retained history event has a generation")
+    {
+        return false;
+    }
+    state.slots.remove(&lowest_slot);
+    state.pending.remove(&lowest_sequence);
+    true
 }
 
 impl RuntimeEvents {
@@ -2343,6 +2364,142 @@ mod tests {
     }
 
     #[test]
+    fn current_selected_history_survives_lower_generation_distinct_key_pressure() {
+        for current_succeeds in [true, false] {
+            let (sender, events) = super::runtime_event_channel();
+            let runtime = RuntimeHandle::default();
+            let mut model = AppModel::new(
+                PersistedState::starter(),
+                CachedMarketState::default(),
+                runtime,
+            );
+            let selected = model.selected().expect("starter selection").clone();
+            let mut stale = Vec::new();
+            for index in 0..40 {
+                let instrument = Instrument::equity(
+                    &format!("OLD{index}"),
+                    Some("NASDAQ"),
+                    "Stale history",
+                    "USD",
+                )
+                .expect("stale history instrument");
+                let generation = model.request_history(instrument.clone(), ChartPeriod::OneDay);
+                stale.push((
+                    generation,
+                    ChartRequestKey {
+                        instrument_id: instrument.id,
+                        period: ChartPeriod::OneDay,
+                    },
+                ));
+            }
+            let current = model.request_history(selected.clone(), ChartPeriod::OneMonth);
+            let current_key = ChartRequestKey {
+                instrument_id: selected.id,
+                period: ChartPeriod::OneMonth,
+            };
+
+            if current_succeeds {
+                sender
+                    .try_send(RuntimeEvent::HistoryCompleted {
+                        generation: current,
+                        key: current_key,
+                        candles: vec![test_candle()],
+                    })
+                    .expect("current success is published first");
+            } else {
+                sender
+                    .try_send(RuntimeEvent::HistoryFailed {
+                        generation: current,
+                        key: current_key,
+                        error: test_error(MarketDataErrorKind::Timeout),
+                    })
+                    .expect("current failure is published first");
+            }
+            for (generation, key) in stale {
+                sender
+                    .try_send(RuntimeEvent::HistoryCompleted {
+                        generation,
+                        key,
+                        candles: vec![test_candle()],
+                    })
+                    .expect("lower-generation distinct completion");
+            }
+
+            while let Ok(event) = events.try_recv() {
+                model.apply_runtime_event(event);
+            }
+
+            assert_eq!(
+                model.selected_chart_availability(),
+                if current_succeeds {
+                    ChartAvailability::Ready
+                } else {
+                    ChartAvailability::Unavailable
+                }
+            );
+            let state = sender
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            assert!(state.slots.is_empty());
+            assert!(state.pending.is_empty());
+        }
+    }
+
+    #[test]
+    fn history_capacity_retains_highest_generations_and_newest_equal_arrival() {
+        let (sender, events) = super::runtime_event_channel();
+        let mut generations = Generation::default();
+        let lower = generations.next();
+        let middle = generations.next();
+        let higher = generations.next();
+        let lowest_key = history_key(0);
+
+        sender
+            .try_send(history_completion(lower, lowest_key.clone()))
+            .expect("one lower generation");
+        for index in 1..32 {
+            sender
+                .try_send(history_completion(middle, history_key(index)))
+                .expect("middle generation fills history capacity");
+        }
+
+        let discarded_key = history_key(100);
+        sender
+            .try_send(history_completion(
+                kabu_core::GenerationId::default(),
+                discarded_key.clone(),
+            ))
+            .expect("lower candidate is handled without blocking");
+        assert_history_slots(&sender, 32, &[&lowest_key], &[&discarded_key]);
+
+        let newest_equal_key = history_key(32);
+        sender
+            .try_send(history_completion(lower, newest_equal_key.clone()))
+            .expect("newest equal-generation terminal");
+        assert_history_slots(&sender, 32, &[&newest_equal_key], &[&lowest_key]);
+
+        let higher_key = history_key(33);
+        sender
+            .try_send(history_completion(higher, higher_key.clone()))
+            .expect("higher-generation terminal");
+        assert_history_slots(
+            &sender,
+            32,
+            &[&higher_key, &history_key(1)],
+            &[&newest_equal_key],
+        );
+
+        while events.try_recv().is_ok() {}
+        let state = sender
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(state.slots.is_empty());
+        assert!(state.pending.is_empty());
+    }
+
+    #[test]
     fn watchlist_and_search_cleanup_remove_dead_mailbox_keys() {
         let (sender, events) = super::runtime_event_channel();
         let keep = aapl_instrument();
@@ -4201,6 +4358,55 @@ mod tests {
 
     fn distinct_equity_id(index: usize) -> InstrumentId {
         InstrumentId::equity(&format!("X{index}"), Some("NASDAQ")).expect("distinct identity")
+    }
+
+    fn history_key(index: usize) -> ChartRequestKey {
+        ChartRequestKey {
+            instrument_id: distinct_equity_id(index),
+            period: ChartPeriod::OneMonth,
+        }
+    }
+
+    fn history_completion(
+        generation: kabu_core::GenerationId,
+        key: ChartRequestKey,
+    ) -> RuntimeEvent {
+        RuntimeEvent::HistoryCompleted {
+            generation,
+            key,
+            candles: vec![test_candle()],
+        }
+    }
+
+    fn assert_history_slots(
+        sender: &super::RuntimeEventSender,
+        expected_len: usize,
+        present: &[&ChartRequestKey],
+        absent: &[&ChartRequestKey],
+    ) {
+        let state = sender
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let history_keys: Vec<_> = state
+            .slots
+            .keys()
+            .filter_map(|slot| match slot {
+                super::RuntimeEventSlot::History(key) => Some(key),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(history_keys.len(), expected_len);
+        for key in present {
+            assert!(history_keys.contains(key), "expected retained history key");
+        }
+        for key in absent {
+            assert!(
+                !history_keys.contains(key),
+                "expected discarded history key"
+            );
+        }
+        assert_eq!(state.pending.len(), expected_len);
     }
 
     fn test_candle() -> Candle {
