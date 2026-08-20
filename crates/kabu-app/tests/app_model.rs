@@ -455,7 +455,9 @@ fn full_runtime_queue_finishes_search_with_a_sanitized_terminal_error() {
     let runtime = RuntimeHandle::default();
     for _ in 0..64 {
         runtime
-            .send(RuntimeCommand::SetVisible(true))
+            .send(RuntimeCommand::Snapshot {
+                instruments: Vec::new(),
+            })
             .expect("fill recording queue");
     }
     let mut model = AppModel::new(
@@ -1206,6 +1208,36 @@ fn restore_does_not_request_a_selected_chart_that_is_still_fresh() {
 }
 
 #[test]
+fn restore_rechecks_and_refreshes_a_chart_that_expired_while_hidden_once() {
+    let (mut model, runtime, hide_time) =
+        model_with_cached_chart(ChartPeriod::OneDay, Duration::from_secs(30));
+    model.set_visible_at(true, hide_time);
+    model.select_period_at(ChartPeriod::OneDay, hide_time);
+    assert_eq!(history_command_count(&runtime), 0);
+
+    model.set_visible_at(false, hide_time);
+    model.set_visible_at(true, hide_time + chrono::Duration::seconds(31));
+    model.tick_at(hide_time + chrono::Duration::seconds(32));
+    model.set_visible_at(true, hide_time + chrono::Duration::seconds(33));
+
+    assert_eq!(history_command_count(&runtime), 1);
+}
+
+#[test]
+fn restore_rechecks_but_does_not_refresh_a_chart_still_fresh_after_hidden_time() {
+    let (mut model, runtime, hide_time) =
+        model_with_cached_chart(ChartPeriod::OneDay, Duration::from_secs(30));
+    model.set_visible_at(true, hide_time);
+    model.select_period_at(ChartPeriod::OneDay, hide_time);
+
+    model.set_visible_at(false, hide_time);
+    model.set_visible_at(true, hide_time + chrono::Duration::seconds(29));
+    model.tick_at(hide_time + chrono::Duration::seconds(30));
+
+    assert_eq!(history_command_count(&runtime), 0);
+}
+
+#[test]
 fn market_cache_writes_are_batched_for_two_seconds_and_finally_flushed() {
     let runtime = RuntimeHandle::default();
     let mut model = AppModel::new(
@@ -1451,6 +1483,110 @@ fn sustained_cache_queue_saturation_keeps_warnings_bounded() {
     model.tick_at(ts(2_002));
     assert!(model.warnings().is_empty());
     assert_eq!(persist_cache_count(&runtime), 1);
+}
+
+#[test]
+fn operational_dispatch_warnings_clear_only_when_their_own_class_recovers() {
+    let runtime = RuntimeHandle::default();
+    for _ in 0..64 {
+        runtime
+            .send(RuntimeCommand::Snapshot {
+                instruments: Vec::new(),
+            })
+            .expect("fill ordinary recording queue");
+    }
+    let mut model = AppModel::new(
+        PersistedState::starter(),
+        CachedMarketState::default(),
+        runtime.clone(),
+    );
+    let selected = model.selected().expect("selected").id.clone();
+    model.apply_runtime_event_at(
+        RuntimeEvent::Quotes(vec![cached_quote(selected, 100.0, 99.0)]),
+        ts(1_000),
+    );
+    for _ in 0..300 {
+        model.retry_selected_quote();
+    }
+
+    assert_eq!(model.warnings().len(), 2);
+    assert!(model.warnings().iter().any(
+        |warning| warning.message == "Background market-data work is temporarily unavailable."
+    ));
+    assert!(
+        model
+            .warnings()
+            .iter()
+            .any(|warning| warning.message == "Cached market data could not be queued for saving.")
+    );
+
+    model.set_visible_at(true, ts(1_000));
+
+    assert!(runtime.recorded_commands().iter().any(|command| matches!(
+        command,
+        RuntimeCommand::SetWatchlist(_) | RuntimeCommand::SetVisible(true)
+    )));
+    assert_eq!(model.warnings().len(), 2);
+
+    runtime.take_recorded_commands();
+    model.select_period_at(ChartPeriod::OneDay, ts(1_001));
+
+    assert_eq!(history_command_count(&runtime), 1);
+    assert_eq!(model.warnings().len(), 2);
+
+    model.retry_selected_quote();
+
+    assert_eq!(model.warnings().len(), 1);
+    assert_eq!(
+        model
+            .warnings()
+            .first()
+            .map(|warning| warning.message.as_str()),
+        Some("Cached market data could not be queued for saving.")
+    );
+
+    model.tick_at(ts(1_002));
+
+    assert!(model.warnings().is_empty());
+}
+
+#[test]
+fn successful_history_dispatch_does_not_clear_snapshot_or_cache_write_warnings() {
+    let runtime = RuntimeHandle::default();
+    for _ in 0..64 {
+        runtime
+            .send(RuntimeCommand::Snapshot {
+                instruments: Vec::new(),
+            })
+            .expect("fill ordinary recording queue");
+    }
+    let mut model = AppModel::new(
+        PersistedState::starter(),
+        CachedMarketState::default(),
+        runtime.clone(),
+    );
+    let selected = model.selected().expect("selected").id.clone();
+    model.apply_runtime_event_at(
+        RuntimeEvent::Quotes(vec![cached_quote(selected, 100.0, 99.0)]),
+        ts(1_000),
+    );
+    model.retry_selected_quote();
+    assert_eq!(model.warnings().len(), 2);
+
+    runtime.take_recorded_commands();
+    model.select_period_at(ChartPeriod::OneDay, ts(1_001));
+
+    assert_eq!(history_command_count(&runtime), 1);
+    assert_eq!(model.warnings().len(), 2);
+    assert!(model.warnings().iter().any(
+        |warning| warning.message == "Background market-data work is temporarily unavailable."
+    ));
+    assert!(
+        model
+            .warnings()
+            .iter()
+            .any(|warning| warning.message == "Cached market data could not be queued for saving.")
+    );
 }
 
 #[test]

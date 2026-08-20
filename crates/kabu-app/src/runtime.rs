@@ -371,7 +371,17 @@ impl RuntimeHandle {
                     .commands
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                if commands.len() == COMMAND_CAPACITY {
+                if is_control_command(&command) {
+                    commands.retain(|existing| !same_control_slot(existing, &command));
+                    commands.push_back(command);
+                    return Ok(());
+                }
+                if commands
+                    .iter()
+                    .filter(|command| !is_control_command(command))
+                    .count()
+                    == COMMAND_CAPACITY
+                {
                     return Err(RuntimeSendError::Full);
                 }
                 commands.push_back(command);
@@ -547,13 +557,36 @@ impl RuntimeHandle {
     }
 }
 
+fn is_control_command(command: &RuntimeCommand) -> bool {
+    matches!(
+        command,
+        RuntimeCommand::SetVisible(_)
+            | RuntimeCommand::SetWatchlist(_)
+            | RuntimeCommand::SetCryptoWatchlist(_)
+    )
+}
+
+fn same_control_slot(left: &RuntimeCommand, right: &RuntimeCommand) -> bool {
+    matches!(
+        (left, right),
+        (RuntimeCommand::SetVisible(_), RuntimeCommand::SetVisible(_))
+            | (
+                RuntimeCommand::SetWatchlist(_),
+                RuntimeCommand::SetWatchlist(_)
+            )
+            | (
+                RuntimeCommand::SetCryptoWatchlist(_),
+                RuntimeCommand::SetCryptoWatchlist(_)
+            )
+    )
+}
+
 impl Drop for LiveRuntime {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::SeqCst);
         _ = self.shutdown_signal.try_send(());
         _ = self.commands.try_send(RuntimeCommand::Shutdown);
         self.commands.close();
-        self.events.close();
         self.controls.notify.close();
         self.shutdown_signal.close();
         let mut complete = self
@@ -633,7 +666,6 @@ fn initiate_shutdown(runtime: &LiveRuntime) {
     _ = runtime.commands.try_send(RuntimeCommand::Shutdown);
     runtime.commands.close();
     runtime.controls.notify.close();
-    runtime.events.close();
 }
 
 fn wait_for_live_shutdown(runtime: &LiveRuntime, timeout: std::time::Duration) -> bool {
@@ -1093,7 +1125,7 @@ async fn refresh_catalog_cache(
 mod tests {
     use super::{
         ProductionComponents, ProviderSet, RuntimeCommand, RuntimeEvent, RuntimeHandle,
-        refresh_catalog_cache,
+        StreamStatus, refresh_catalog_cache,
     };
     use async_trait::async_trait;
     use kabu_core::{
@@ -1116,7 +1148,7 @@ mod tests {
     };
 
     #[test]
-    fn recording_runtime_rejects_commands_after_its_bounded_capacity() {
+    fn recording_runtime_coalesces_controls_without_admitting_extra_ordinary_work() {
         let runtime = RuntimeHandle::default();
         for _ in 0..super::COMMAND_CAPACITY {
             runtime
@@ -1127,9 +1159,49 @@ mod tests {
         }
 
         assert_eq!(
-            runtime.send(RuntimeCommand::SetVisible(false)),
+            runtime.send(RuntimeCommand::Snapshot {
+                instruments: Vec::new(),
+            }),
             Err(super::RuntimeSendError::Full)
         );
+
+        let aapl = aapl_instrument();
+        let btc = btc_instrument();
+        for _ in 0..300 {
+            runtime
+                .send(RuntimeCommand::SetWatchlist(vec![aapl.clone()]))
+                .expect("watchlist control remains reliable");
+            runtime
+                .send(RuntimeCommand::SetCryptoWatchlist(vec![btc.clone()]))
+                .expect("crypto watchlist control remains reliable");
+            runtime
+                .send(RuntimeCommand::SetVisible(false))
+                .expect("visibility control remains reliable");
+        }
+        runtime
+            .send(RuntimeCommand::SetVisible(true))
+            .expect("latest visibility control remains reliable");
+
+        let commands = runtime.recorded_commands();
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| !super::is_control_command(command))
+                .count(),
+            super::COMMAND_CAPACITY
+        );
+        let controls: Vec<_> = commands
+            .iter()
+            .filter(|command| super::is_control_command(command))
+            .collect();
+        assert!(matches!(
+            controls.as_slice(),
+            [
+                RuntimeCommand::SetWatchlist(instruments),
+                RuntimeCommand::SetCryptoWatchlist(crypto),
+                RuntimeCommand::SetVisible(true),
+            ] if instruments == &vec![aapl] && crypto == &vec![btc]
+        ));
     }
 
     #[test]
@@ -1321,6 +1393,24 @@ mod tests {
             .expect("shutdown command");
 
         assert!(runtime.is_shutdown());
+    }
+
+    #[test]
+    fn shutdown_keeps_stopped_observable_until_coordinator_cleanup_finishes() {
+        let providers = ProviderSet {
+            equities: Arc::new(FakeProvider::immediate(DataSource::Yahoo, Vec::new())),
+            crypto: Arc::new(FakeProvider::immediate(DataSource::Binance, Vec::new())),
+        };
+        let runtime = RuntimeHandle::start(providers, Arc::new(NoopRepository)).expect("runtime");
+        let events = runtime.events();
+
+        runtime.shutdown();
+
+        let mut stopped = false;
+        while let Ok(event) = events.try_recv() {
+            stopped |= matches!(event, RuntimeEvent::StreamStatus(StreamStatus::Stopped));
+        }
+        assert!(stopped);
     }
 
     #[test]

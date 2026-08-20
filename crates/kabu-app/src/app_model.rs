@@ -56,9 +56,18 @@ enum WarningKey {
     CacheLoad,
     History,
     Persistence,
-    Background,
+    RuntimeDispatch(RuntimeDispatchKind),
     CacheWrite,
     Catalog,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RuntimeDispatchKind {
+    Search,
+    Snapshot,
+    History,
+    Control,
+    StatePersistence,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -138,7 +147,7 @@ pub struct AppModel {
     visible: bool,
     last_visibility_dispatch: Option<bool>,
     control_sync_pending: bool,
-    refresh_history_on_restore: bool,
+    recheck_history_on_restore: bool,
     stream_status: StreamStatus,
 }
 
@@ -252,7 +261,7 @@ impl AppModel {
             visible: false,
             last_visibility_dispatch: None,
             control_sync_pending: false,
-            refresh_history_on_restore: false,
+            recheck_history_on_restore: false,
             stream_status: StreamStatus::Paused,
         }
     }
@@ -683,8 +692,8 @@ impl AppModel {
                 self.watchlist.instruments().to_vec(),
             ));
             self.send_visibility(true);
-            if self.refresh_history_on_restore {
-                self.refresh_history_on_restore = false;
+            if self.recheck_history_on_restore {
+                self.recheck_history_on_restore = false;
                 self.select_period_at(self.selected_chart_period, now);
             }
         } else {
@@ -695,12 +704,7 @@ impl AppModel {
             if search_was_pending {
                 self.search.terminal_error = Some("Search paused while Kabu is hidden.".into());
             }
-            self.refresh_history_on_restore = self.current_history.is_some()
-                || self.selected_chart_key().is_some_and(|key| {
-                    self.charts
-                        .get(&key)
-                        .is_none_or(|chart| !chart_is_fresh(chart, key.period, now))
-                });
+            self.recheck_history_on_restore = self.selected_chart_key().is_some();
             self.history_generation.next();
             self.current_history = None;
             self.loading_quotes.clear();
@@ -961,21 +965,18 @@ impl AppModel {
     }
 
     fn send_runtime(&mut self, command: RuntimeCommand) -> Result<(), RuntimeSendError> {
-        let is_control = matches!(
-            &command,
-            RuntimeCommand::SetVisible(_)
-                | RuntimeCommand::SetWatchlist(_)
-                | RuntimeCommand::SetCryptoWatchlist(_)
-        );
+        let dispatch_kind = runtime_dispatch_kind(&command);
+        let warning_key = WarningKey::RuntimeDispatch(dispatch_kind);
+        let is_control = dispatch_kind == RuntimeDispatchKind::Control;
         let result = self.runtime.send(command);
         if result.is_err() {
             self.upsert_warning(
-                WarningKey::Background,
+                warning_key,
                 "Background market-data work is temporarily unavailable.",
                 false,
             );
         } else {
-            self.clear_warning(WarningKey::Background);
+            self.clear_warning(warning_key);
             if is_control {
                 self.control_sync_pending = !self.runtime.control_state_is_synchronized();
             }
@@ -1058,6 +1059,21 @@ impl AppModel {
             quotes: self.quotes.quotes().clone(),
             charts: self.charts.clone(),
             instrument_catalog: self.instrument_catalog.clone(),
+        }
+    }
+}
+
+fn runtime_dispatch_kind(command: &RuntimeCommand) -> RuntimeDispatchKind {
+    match command {
+        RuntimeCommand::Search { .. } => RuntimeDispatchKind::Search,
+        RuntimeCommand::Snapshot { .. } => RuntimeDispatchKind::Snapshot,
+        RuntimeCommand::History { .. } => RuntimeDispatchKind::History,
+        RuntimeCommand::SetVisible(_)
+        | RuntimeCommand::SetWatchlist(_)
+        | RuntimeCommand::SetCryptoWatchlist(_)
+        | RuntimeCommand::Shutdown => RuntimeDispatchKind::Control,
+        RuntimeCommand::PersistState(_) | RuntimeCommand::PersistMarketCache { .. } => {
+            RuntimeDispatchKind::StatePersistence
         }
     }
 }
