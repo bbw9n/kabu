@@ -7,13 +7,15 @@ pub(super) struct SearchResponse {
 
 #[derive(Debug, Deserialize)]
 pub(super) struct SearchQuote {
-    pub symbol: String,
-    #[serde(rename = "shortname", alias = "longname")]
-    pub name: String,
+    pub symbol: Option<String>,
+    #[serde(rename = "shortname")]
+    pub short_name: Option<String>,
+    #[serde(rename = "longname")]
+    pub long_name: Option<String>,
     #[serde(rename = "quoteType")]
-    pub quote_type: String,
-    pub exchange: String,
-    pub currency: String,
+    pub quote_type: Option<String>,
+    pub exchange: Option<String>,
+    pub currency: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -37,15 +39,17 @@ pub(super) struct ChartResult {
 pub(super) struct ChartMeta {
     pub currency: String,
     #[serde(rename = "exchangeTimezoneName")]
-    pub _exchange_timezone_name: String,
+    pub _exchange_timezone_name: Option<String>,
     #[serde(rename = "marketState")]
-    pub market_state: String,
+    pub market_state: Option<String>,
     #[serde(rename = "regularMarketTime")]
     pub regular_market_time: i64,
     #[serde(rename = "dataGranularity")]
-    pub _data_granularity: String,
+    pub _data_granularity: Option<String>,
     #[serde(rename = "previousClose")]
     pub previous_close: Option<f64>,
+    #[serde(rename = "chartPreviousClose")]
+    pub chart_previous_close: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]

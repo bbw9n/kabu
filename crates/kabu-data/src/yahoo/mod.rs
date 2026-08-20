@@ -120,28 +120,47 @@ impl ChartHistory for YahooClient {
 }
 
 fn is_supported_equity(quote: &SearchQuote) -> bool {
-    quote.quote_type == "EQUITY"
+    quote.quote_type.as_deref() == Some("EQUITY")
         && matches!(
-            quote.exchange.as_str(),
-            "NMS" | "NYQ" | "NGM" | "NCM" | "ASE" | "PNK" | "OQX"
+            quote.exchange.as_deref(),
+            Some("NMS" | "NYQ" | "NGM" | "NCM" | "ASE" | "PNK" | "OQX")
         )
 }
 
 fn map_search_quote(quote: SearchQuote) -> Result<SearchResult, MarketDataError> {
-    if quote.name.trim().is_empty() || quote.currency.trim().is_empty() {
-        return Err(malformed_response(SEARCH_ENDPOINT));
-    }
-    let instrument = Instrument::equity(
-        &quote.symbol,
-        Some(&quote.exchange),
-        &quote.name,
-        &quote.currency,
-    )
-    .map_err(|_| malformed_response(SEARCH_ENDPOINT))?;
+    let symbol = quote
+        .symbol
+        .as_deref()
+        .ok_or_else(|| malformed_response(SEARCH_ENDPOINT))?;
+    let name = quote
+        .short_name
+        .as_deref()
+        .filter(|name| !name.trim().is_empty())
+        .or_else(|| {
+            quote
+                .long_name
+                .as_deref()
+                .filter(|name| !name.trim().is_empty())
+        })
+        .ok_or_else(|| malformed_response(SEARCH_ENDPOINT))?;
+    let exchange = quote
+        .exchange
+        .as_deref()
+        .ok_or_else(|| malformed_response(SEARCH_ENDPOINT))?;
+    // Kabu admits only the supported US equity venues above. Yahoo commonly
+    // sends null currency in search responses, so USD is the provider-neutral
+    // default for this already-restricted result set.
+    let currency = quote
+        .currency
+        .as_deref()
+        .filter(|currency| !currency.trim().is_empty())
+        .unwrap_or("USD");
+    let instrument = Instrument::equity(symbol, Some(exchange), name, currency)
+        .map_err(|_| malformed_response(SEARCH_ENDPOINT))?;
     Ok(SearchResult {
         instrument,
         source: DataSource::Yahoo,
-        venue_label: quote.exchange,
+        venue_label: exchange.to_owned(),
     })
 }
 
@@ -175,7 +194,7 @@ fn map_snapshot(instrument: &Instrument, chart: &ChartResult) -> Result<Quote, M
     Ok(Quote {
         instrument_id: instrument.id.clone(),
         last: newest.close,
-        previous_close: finite_optional(chart.meta.previous_close)?,
+        previous_close: previous_close(&chart.meta)?,
         open: Some(newest.open),
         high: Some(newest.high),
         low: Some(newest.low),
@@ -261,6 +280,13 @@ fn finite_optional(value: Option<f64>) -> Result<Option<f64>, MarketDataError> {
     }
 }
 
+fn previous_close(meta: &ChartMeta) -> Result<Option<f64>, MarketDataError> {
+    // Yahoo may emit both fields. `previousClose` is the existing quote-level
+    // contract, so it wins when present; `chartPreviousClose` is its chart-v8
+    // compatibility fallback.
+    finite_optional(meta.previous_close.or(meta.chart_previous_close))
+}
+
 fn validated_text(value: &str) -> Result<String, MarketDataError> {
     let value = value.trim();
     if value.is_empty() {
@@ -271,11 +297,11 @@ fn validated_text(value: &str) -> Result<String, MarketDataError> {
 }
 
 fn market_state(meta: &ChartMeta) -> MarketState {
-    match meta.market_state.as_str() {
-        "PRE" | "PREPRE" => MarketState::PreMarket,
-        "REGULAR" => MarketState::Regular,
-        "POST" | "POSTPOST" => MarketState::PostMarket,
-        "CLOSED" => MarketState::Closed,
+    match meta.market_state.as_deref() {
+        Some("PRE" | "PREPRE") => MarketState::PreMarket,
+        Some("REGULAR") => MarketState::Regular,
+        Some("POST" | "POSTPOST") => MarketState::PostMarket,
+        Some("CLOSED") => MarketState::Closed,
         _ => MarketState::Unknown,
     }
 }

@@ -68,7 +68,7 @@ KABU_LIVE_TESTS=1 cargo test -p kabu-data --test live_market -- --ignored --noca
 ```
 
 Running `cargo test -p kabu-data --test live_market` without `--ignored` only
-compiles the two live contracts and reports them ignored. Even an explicit
+compiles the three live contracts and reports them ignored. Even an explicit
 `--ignored` run does not make a public request unless `KABU_LIVE_TESTS=1`.
 
 See [docs/manual-test.md](docs/manual-test.md) for the complete, non-destructive
@@ -110,8 +110,8 @@ never renders a missing numeric value as zero.
   that, and `Stale` after 120 seconds.
 - Provider-marked delay is always `Delayed`; a closed equity is `Closed` rather
   than becoming stale merely because the market is shut.
-- No cached quote is `Unavailable` and displays an em dash, not a fabricated
-  price.
+- When no cached quote exists, the state is `Unavailable` and the price is an
+  em dash, not a fabricated numeric value.
 
 Transient failures preserve the last good value and show a typed,
 provider-specific warning or retry control. Current errors include timeouts,
@@ -143,11 +143,12 @@ endpoints power the crypto catalog, quotes, history, and ticker stream. Both are
 unofficial public integrations with no availability, latency, or compatibility
 SLA from Kabu. Neither requires an account or API key.
 
-Kabu installs Rustls's AWS-LC provider once before constructing production
-clients. Reqwest, Kabu's direct HTTP stack, selects AWS-LC, while GPUI's internal
-HTTP dependency also enables Ring; the explicit process choice prevents the
-otherwise ambiguous combined feature set from panicking in Binance WebSocket
-startup.
+Kabu attempts to install Rustls's AWS-LC provider once before each production
+HTTP or WebSocket client boundary. Reqwest, Kabu's direct HTTP stack, already
+requires AWS-LC, while GPUI's internal HTTP dependency also enables Ring. The
+explicit first-install choice prevents the otherwise ambiguous combined
+feature set from panicking. If another process component has already installed
+a Rustls provider, Kabu safely reuses that immutable process-wide choice.
 
 ## Local data, privacy, and security
 

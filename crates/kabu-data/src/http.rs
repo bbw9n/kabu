@@ -5,14 +5,14 @@ use reqwest::{Response, StatusCode};
 use serde::de::DeserializeOwned;
 
 pub(crate) fn client() -> Result<reqwest::Client, reqwest::Error> {
-    install_default_crypto_provider();
+    ensure_default_crypto_provider();
     reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .user_agent(format!("Kabu/{}", env!("CARGO_PKG_VERSION")))
         .build()
 }
 
-fn install_default_crypto_provider() {
+pub(crate) fn ensure_default_crypto_provider() {
     if rustls::crypto::CryptoProvider::get_default().is_some() {
         return;
     }
@@ -95,19 +95,71 @@ pub(crate) fn malformed_response(endpoint: &str) -> MarketDataError {
 
 #[cfg(test)]
 mod tests {
-    use super::client;
+    use super::{client, ensure_default_crypto_provider};
     use rustls::crypto::CryptoProvider;
-    use std::sync::Arc;
+    use std::{
+        process::Command,
+        sync::{Arc, Barrier},
+    };
+
+    const PRISTINE_PROVIDER_CHILD: &str = "KABU_PRISTINE_PROVIDER_CHILD";
 
     #[test]
-    fn production_clients_install_and_reuse_the_aws_lc_crypto_provider() {
+    fn production_clients_reuse_the_installed_crypto_provider() {
         let _first_client = client().expect("first production HTTP client");
         let installed = CryptoProvider::get_default().expect("installed crypto provider");
-        let aws_lc = rustls::crypto::aws_lc_rs::default_provider();
-        assert!(std::ptr::eq(installed.secure_random, aws_lc.secure_random));
 
         let _second_client = client().expect("second production HTTP client");
         let reused = CryptoProvider::get_default().expect("reused crypto provider");
         assert!(Arc::ptr_eq(installed, reused));
+    }
+
+    #[test]
+    fn pristine_process_concurrently_installs_aws_lc() {
+        let output = Command::new(std::env::current_exe().expect("current test executable"))
+            .args([
+                "--exact",
+                "http::tests::pristine_provider_child",
+                "--nocapture",
+            ])
+            .env(PRISTINE_PROVIDER_CHILD, "1")
+            .output()
+            .expect("run pristine provider child");
+
+        assert!(
+            output.status.success(),
+            "pristine provider child failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn pristine_provider_child() {
+        if std::env::var(PRISTINE_PROVIDER_CHILD).as_deref() != Ok("1") {
+            return;
+        }
+
+        assert!(
+            CryptoProvider::get_default().is_none(),
+            "child test process must begin without a provider"
+        );
+        let worker_count = 16;
+        let barrier = Arc::new(Barrier::new(worker_count));
+        let workers = (0..worker_count)
+            .map(|_| {
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    ensure_default_crypto_provider();
+                })
+            })
+            .collect::<Vec<_>>();
+        for worker in workers {
+            worker.join().expect("provider worker");
+        }
+
+        let installed = CryptoProvider::get_default().expect("installed crypto provider");
+        let aws_lc = rustls::crypto::aws_lc_rs::default_provider();
+        assert!(std::ptr::eq(installed.secure_random, aws_lc.secure_random));
     }
 }

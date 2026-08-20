@@ -122,6 +122,7 @@ async fn run_stream(
     let retry = RetryPolicy::crypto_stream();
     let mut attempt = 0usize;
     loop {
+        crate::http::ensure_default_crypto_provider();
         let connection = tokio::select! {
             _ = sender.closed() => return,
             connection = connect_async(&url) => connection,

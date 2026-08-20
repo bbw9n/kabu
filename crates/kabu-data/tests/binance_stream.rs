@@ -229,6 +229,38 @@ async fn cancelling_session_awaits_the_real_adapter_producer() {
     server.wait_for_client_disconnect().await;
 }
 
+#[tokio::test]
+async fn direct_client_wss_failure_is_typed_instead_of_panicking() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let address = listener.local_addr().expect("local address");
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("accept");
+        let mut buffer = [0_u8; 1_024];
+        let _ =
+            tokio::time::timeout(std::time::Duration::from_secs(2), socket.read(&mut buffer)).await;
+    });
+    let client = BinanceClient::new(
+        reqwest::Client::builder().build().expect("test client"),
+        "http://127.0.0.1/".parse().expect("REST URL"),
+        format!("wss://{address}").parse().expect("WSS URL"),
+        None,
+    );
+
+    let mut stream = client
+        .subscribe(&[btc_instrument()])
+        .await
+        .expect("subscribe");
+    let error = tokio::time::timeout(std::time::Duration::from_secs(3), stream.next())
+        .await
+        .expect("stream completed promptly")
+        .expect("typed disconnect event")
+        .expect_err("TLS handshake must fail without panicking");
+
+    assert_eq!(error.kind, kabu_core::MarketDataErrorKind::Disconnected);
+    stream.cancel().await;
+    server.await.expect("server task");
+}
+
 struct TestWebSocketServer {
     url: String,
     paths: Arc<Mutex<Vec<String>>>,
