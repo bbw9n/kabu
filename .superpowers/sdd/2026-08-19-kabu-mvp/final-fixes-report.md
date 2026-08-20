@@ -300,3 +300,207 @@ explicitly unverified because the desktop was locked.
   not raw provider bodies, persisted content, paths, or I/O detail.
 - The locked desktop prevented a new search-provenance screenshot and the
   physical only-window close gesture. No unverified screenshot was produced.
+
+# Fix Round 2/5
+
+Implementation commit: `7fb39e34089093ffe6e25d60d7e8e07ecc8dc4ff`
+(`fix: bound events and search cancellation`). This round started from
+`660f90ab06f88fa4ce2521de209394238197216a`. The progress ledger was not
+modified.
+
+## Scope and architecture
+
+The runtime event mailbox now has fixed semantic cardinality in addition to
+its bounded-one wake channel:
+
+- quote slots: 64;
+- typed quote-error slots: 64 across identity/error-class keys;
+- chart-history slots: 32 across request keys;
+- protected fixed slots: one full-search result, two provider-search results,
+  one catalog outcome, two persistence categories, and one stream status;
+- maximum pending semantic entries: 167.
+
+A new distinct key at capacity evicts the oldest pending entry from only its
+own dynamic family. Quote floods therefore cannot evict stream status,
+persistence, catalog, or search terminal state. One oversized provider event
+is normalized to the final 64 quote/error identities before insertion, so the
+temporary normalized collection is bounded too. Production coordinator and
+explicit snapshot paths filter provider output to the applied/requested
+identities before publishing. This ensures arbitrary provider identities
+cannot displace active rows.
+
+Full search, per-provider search, and history slots compare `GenerationId`
+before replacement. A late lower-generation completion/failure is discarded;
+equal or newer state remains deterministic. Applying a watchlist prunes
+quote/error/history slots for removed identities. Search cancellation/new
+search prunes full/provider search slots, and normal delivery removes both the
+slot and pending sequence.
+
+Search commands now use the reliable coalesced control lane rather than the
+ordinary capacity-64 command queue. The desired state has three fixed,
+versioned slots and the dispatcher owns exactly three handles:
+
+- one full-search job;
+- one Yahoo retry job;
+- one Binance retry job.
+
+A same-provider retry aborts and joins only that provider's prior retry. A new
+full query, hide, explicit overlay close, or shutdown aborts and joins every
+relevant search handle and clears stale pending search events. The applied
+control revision advances only after those joins, which makes
+`wait_for_control_state` a cancellation acknowledgement without blocking GPUI.
+Both provider retries can run concurrently and cannot evict or starve each
+other. Recording mode mirrors the same fixed-slot coalescing for deterministic
+tests.
+
+`set_search_query` now emits reliable cancellation immediately, before its
+250 ms debounce; closing the overlay emits typed `CancelSearch`. Hide advances
+and stores `current_search_generation`, so retained warning Retry controls use
+a valid post-hide token after restore. A full search supersedes both retry
+slots, while a provider retry replaces only its source.
+
+Adjacent changes:
+
+- every quote outcome removes reconciliation loading before merge, while the
+  quote state still rejects older data and preserves the last good value;
+- the persistence assertion helper now polls `try_recv` to an actual
+  one-second deadline rather than blocking indefinitely inside its deadline
+  loop;
+- mailbox cleanup is exercised for watchlist removal, search close, and normal
+  completion.
+
+## Strict RED evidence
+
+Each production change followed a focused failing regression:
+
+- `distinct_event_flood_has_fixed_cardinality_and_retains_terminal_state`
+  failed at `quote slots must have a fixed cap` after publishing 512 distinct
+  quote/error/history identities.
+- `mailbox_never_replaces_newer_generation_with_late_stale_history_or_search`
+  failed with `left: GenerationId(1), right: GenerationId(2)` when a late stale
+  result overwrote the newer pending result.
+- `app_model_rejects_older_quotes_and_preserves_the_last_good_value_on_error`
+  failed after its expectation was corrected to require reconciliation loading
+  to end on a rejected older quote.
+- `search_cancel_is_reliable_when_the_ordinary_queue_is_saturated` failed with
+  `Full` after 64 ordinary commands.
+- `provider_retries_have_independent_owned_jobs_and_same_source_replacement`
+  failed because starting Binance left Yahoo active at zero instead of one.
+- `hide_advances_retry_generation_and_restored_provider_retries_merge_independently`
+  failed because the retry token remained `GenerationId(1)` across hide.
+- `closing_search_rejects_a_late_provider_retry_completion` failed because
+  overlay cancellation produced no `CancelSearch` command.
+- `provider_quotes_are_filtered_to_the_applied_watchlist_before_mailboxing`
+  failed with 64 unrelated `X192` through `X255` identities and no active AAPL.
+- `explicit_snapshot_filters_unrequested_provider_output` failed with
+  `[AAPL, X9999]` instead of only AAPL.
+- `one_oversized_provider_event_normalizes_to_a_fixed_number_of_slots` failed
+  with 512 normalized entries instead of 64.
+
+## GREEN regression evidence
+
+Focused GREEN runs proved:
+
+- 512 distinct quote/error/history keys never exceed 64/64/32 slots, the total
+  stays at or below 167, the final quote/error/status arrive, and all protected
+  terminal outcomes survive the flood;
+- reverse completion order reaches `Ready` for the current history success and
+  `Unavailable` for the current history failure rather than remaining
+  `Loading`;
+- newer full/provider search generations survive late stale completions;
+- 256 unrelated production provider quotes are removed before mailboxing and
+  an explicit noisy snapshot returns only the requested identity;
+- GPUI pressure with 300 distinct quote and typed-error identities applies the
+  final active AAPL quote, BTC error, and `Paused` status, then closes without
+  deadlock;
+- Yahoo and Binance retries remain active together, repeating Yahoo cancels
+  only Yahoo, and a subsequent full search cancels both retries before either
+  can emit;
+- a real AppModel close cancels two 30-second provider futures, observes both
+  abort guards, reaches active count zero, clears pending search events, and
+  only then reports control synchronization;
+- shutdown drains the full-search handle, both retry handles, snapshot, and
+  history jobs (six provider futures in the regression);
+- hide rejects pre-hide events; restore launches both retries with one new
+  generation, merges both provider results, retains healthy rows, and clears
+  both warnings without exposing the private query.
+
+## Exact final gates
+
+The requested commands ran in order against the committed implementation:
+
+| Order | Command | Result |
+| --- | --- | --- |
+| 1 | `cargo fmt --check` | Pass, exit 0 |
+| 2 | `cargo clippy --workspace --all-targets -- -D warnings` | Pass, exit 0 |
+| 3 | `cargo test --workspace` | Pass, 237 passed, 0 failed, 3 ignored |
+| 4 | `cargo build --release -p kabu-app` | Pass, exit 0 |
+| 5 | `git diff --check` | Pass, exit 0 |
+
+Hermetic breakdown:
+
+- `kabu-app` library: 53 passed;
+- AppModel integration: 65 passed;
+- GPUI interactions: 26 passed;
+- chart/price: 9 passed;
+- startup failure: 4 passed;
+- `kabu-core`: 35 passed;
+- `kabu-data` library: 12 passed;
+- Binance REST: 9 passed;
+- Binance stream: 11 passed;
+- persistence integration: 4 passed;
+- Yahoo integration: 9 passed;
+- live market: 3 ignored by default;
+- binary/doc-test targets: 0 tests.
+
+The hermetic suite increased from 226 to 237 passes. Clippy remains clean under
+`-D warnings`; the only build notice is the pre-existing future-compatibility
+warning for transitive `block v0.1.6`.
+
+## Public provider and native evidence
+
+The three public-network contracts completed naturally:
+
+```text
+$ KABU_LIVE_TESTS=1 cargo test -p kabu-data --test live_market -- \
+    --ignored --nocapture --test-threads=1
+
+test live_binance_snapshot_contract ... ok
+test live_yahoo_search_contract ... ok
+test live_yahoo_snapshot_contract ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; finished in 3.93s
+```
+
+A new native launch was not warranted for this round: no AppKit window,
+layout, rendering, or application-start path changed. The release binary was
+built, all 26 GPUI interaction tests passed, the actual slow-provider close
+path was exercised through AppModel, and the prior native acceptance remains
+the applicable window evidence. Skipping another launch also avoided touching
+the user's real Application Support state. No screenshot was created or
+committed.
+
+## Final self-review and remaining concerns
+
+- Bounds: wake, ordinary command, control notification, persistence
+  notification, and provider channels remain bounded. Mailbox keyed state has
+  the explicit 167-entry upper bound; search ownership is three handles.
+- Cancellation: new query, retry replacement, overlay close, hide, and shutdown
+  all abort and join owned work. Quote floods cannot starve protected state.
+- Redaction: provider bodies and the private query remain absent from warning,
+  terminal-error, and debug-visible error assertions. No path or raw I/O text
+  was introduced.
+- Unsafe boundary: production still has exactly one `unsafe` block, the
+  pre-existing main-thread-guarded AppKit view conversion in
+  `macos_visibility.rs`.
+- Overflow is intentional and deterministic: the final 64 entries of one
+  oversized quote/error batch are considered newest, and later distinct
+  publishes evict the oldest same-family pending entry. An unusually large
+  watchlist can therefore coalesce intermediate rows while GPUI is stalled,
+  but protected state and the newest active values remain bounded and
+  observable.
+- Provider search-result and candle vectors remain governed by existing
+  adapter/request limits; this round bounds semantic mailbox keys and does not
+  change public provider contracts or persisted schema.
+- Public endpoints remain externally variable. The three contracts were green
+  in this run but have no availability SLA.
