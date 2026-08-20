@@ -1,11 +1,13 @@
 use crate::runtime::{
-    ProviderWarning, RuntimeCommand, RuntimeEvent, RuntimeHandle, RuntimeSendError, StreamStatus,
+    PersistenceCategory, PersistenceResult, ProviderWarning, RuntimeCommand, RuntimeEvent,
+    RuntimeHandle, RuntimeSendError, ShutdownOutcome, StreamStatus,
 };
 use kabu_core::{
     AddOutcome, CachedChart, CachedMarketState, ChartPeriod, ChartRequestKey, DataSource,
     Freshness, Generation, GenerationId, Instrument, InstrumentId, MarketDataErrorKind,
     MergeOutcome, PersistedState, PersistenceError, Quote, QuoteState, SearchResult,
     StateRepository, ThemePreference, Watchlist, WatchlistError, classify_freshness,
+    rank_search_results,
 };
 use kabu_data::Recovery;
 use std::{
@@ -55,7 +57,8 @@ enum WarningKey {
     StateLoad,
     CacheLoad,
     History,
-    Persistence,
+    StatePersistence,
+    MarketCachePersistence,
     RuntimeDispatch(RuntimeDispatchKind),
     CacheWrite,
     Catalog,
@@ -68,6 +71,7 @@ enum RuntimeDispatchKind {
     History,
     Control,
     StatePersistence,
+    MarketCachePersistence,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -75,6 +79,7 @@ pub struct SearchState {
     query: String,
     results: Vec<SearchResult>,
     provider_warnings: Vec<ProviderWarning>,
+    failed_providers: HashSet<DataSource>,
     terminal_error: Option<String>,
     loading: bool,
 }
@@ -98,6 +103,10 @@ impl SearchState {
 
     pub fn terminal_error(&self) -> Option<&str> {
         self.terminal_error.as_deref()
+    }
+
+    pub fn provider_retryable(&self, source: DataSource) -> bool {
+        self.failed_providers.contains(&source)
     }
 }
 
@@ -132,6 +141,7 @@ pub struct AppModel {
     committed_window_height: f32,
     search: SearchState,
     search_generation: Generation,
+    current_search_generation: Option<GenerationId>,
     history_generation: Generation,
     selected_chart_period: ChartPeriod,
     current_history: Option<(GenerationId, ChartRequestKey)>,
@@ -246,6 +256,7 @@ impl AppModel {
             committed_window_height: window_height,
             search: SearchState::default(),
             search_generation: Generation::default(),
+            current_search_generation: None,
             history_generation: Generation::default(),
             selected_chart_period: ChartPeriod::OneDay,
             current_history: None,
@@ -437,10 +448,12 @@ impl AppModel {
 
     pub fn begin_search(&mut self, query: impl AsRef<str>) -> GenerationId {
         let generation = self.search_generation.next();
+        self.current_search_generation = Some(generation);
         self.pending_search = None;
         self.search.query = query.as_ref().trim().to_string();
         self.search.results.clear();
         self.search.provider_warnings = self.catalog_warning.iter().cloned().collect();
+        self.search.failed_providers.clear();
         self.search.terminal_error = None;
         self.search.loading = !self.search.query.is_empty();
         generation
@@ -494,13 +507,28 @@ impl AppModel {
             return;
         }
         self.search.results = results;
+        self.search.failed_providers = warnings.iter().map(|warning| warning.source).collect();
         if let Some(catalog_warning) = &self.catalog_warning {
             warnings.retain(|warning| warning.source != DataSource::Binance);
             warnings.push(catalog_warning.clone());
         }
         self.search.provider_warnings = warnings;
-        self.search.terminal_error = None;
+        self.update_search_terminal_error();
         self.search.loading = false;
+    }
+
+    pub fn retry_search_provider(&mut self, source: DataSource) {
+        let Some(generation) = self.current_search_generation else {
+            return;
+        };
+        if self.search.query.is_empty() || !self.search.failed_providers.contains(&source) {
+            return;
+        }
+        _ = self.send_runtime(RuntimeCommand::RetrySearchProvider {
+            generation,
+            query: self.search.query.clone(),
+            source,
+        });
     }
 
     pub fn add_search_result(&mut self, index: usize) -> Result<(), AppModelError> {
@@ -574,6 +602,12 @@ impl AppModel {
                 results,
                 warnings,
             } => self.apply_search_results(generation, results, warnings),
+            RuntimeEvent::SearchProviderCompleted {
+                generation,
+                source,
+                results,
+                warning,
+            } => self.apply_search_provider_result(generation, source, results, warning),
             RuntimeEvent::Quotes(quotes) => {
                 let mut applied = false;
                 for quote in quotes {
@@ -674,6 +708,9 @@ impl AppModel {
                     );
                 }
             },
+            RuntimeEvent::PersistenceCompleted { category, result } => {
+                self.apply_persistence_result(category, result);
+            }
             RuntimeEvent::StreamStatus(status) => self.stream_status = status,
         }
     }
@@ -688,6 +725,12 @@ impl AppModel {
         self.visible = visible;
         if visible {
             self.recompute_freshness_at(now);
+            self.loading_quotes.extend(
+                self.watchlist
+                    .instruments()
+                    .iter()
+                    .map(|instrument| instrument.id.clone()),
+            );
             _ = self.send_runtime(RuntimeCommand::SetWatchlist(
                 self.watchlist.instruments().to_vec(),
             ));
@@ -784,6 +827,15 @@ impl AppModel {
         let cache = self.cached_market_state();
         self.cache_dirty = false;
         self.runtime.begin_shutdown_with_flush(state, cache);
+    }
+
+    pub fn apply_shutdown_outcome(&mut self, outcome: ShutdownOutcome) {
+        if let Some(result) = outcome.state {
+            self.apply_persistence_result(PersistenceCategory::State, result);
+        }
+        if let Some(result) = outcome.market_cache {
+            self.apply_persistence_result(PersistenceCategory::MarketCache, result);
+        }
     }
 
     pub fn select_index(&mut self, index: usize) -> Result<(), AppModelError> {
@@ -930,13 +982,13 @@ impl AppModel {
         let state = self.persisted_state();
         if let Err(error) = repository.save_state(&state) {
             self.upsert_warning(
-                WarningKey::Persistence,
+                WarningKey::StatePersistence,
                 "Your change is kept in this session, but Kabu could not save it to disk.",
                 false,
             );
             return Err(error.into());
         }
-        self.clear_warning(WarningKey::Persistence);
+        self.clear_warning(WarningKey::StatePersistence);
         Ok(())
     }
 
@@ -972,7 +1024,7 @@ impl AppModel {
         if result.is_err() {
             self.upsert_warning(
                 warning_key,
-                "Background market-data work is temporarily unavailable.",
+                runtime_dispatch_failure_message(dispatch_kind),
                 false,
             );
         } else {
@@ -1053,6 +1105,27 @@ impl AppModel {
         result
     }
 
+    fn apply_persistence_result(
+        &mut self,
+        category: PersistenceCategory,
+        result: PersistenceResult,
+    ) {
+        let (key, message) = match category {
+            PersistenceCategory::State => (
+                WarningKey::StatePersistence,
+                "Kabu could not save your settings. Keep Kabu open and close the window to retry.",
+            ),
+            PersistenceCategory::MarketCache => (
+                WarningKey::MarketCachePersistence,
+                "Kabu could not save cached market data. Live data remains available; close the window to retry.",
+            ),
+        };
+        match result {
+            PersistenceResult::Saved => self.clear_warning(key),
+            PersistenceResult::Failed => self.upsert_warning(key, message, false),
+        }
+    }
+
     fn cached_market_state(&self) -> CachedMarketState {
         CachedMarketState {
             schema_version: kabu_core::STATE_SCHEMA_VERSION,
@@ -1061,20 +1134,73 @@ impl AppModel {
             instrument_catalog: self.instrument_catalog.clone(),
         }
     }
+
+    fn apply_search_provider_result(
+        &mut self,
+        generation: GenerationId,
+        source: DataSource,
+        results: Vec<SearchResult>,
+        warning: Option<ProviderWarning>,
+    ) {
+        if !self.search_generation.is_current(generation) {
+            return;
+        }
+        self.search.results.retain(|result| result.source != source);
+        self.search.results.extend(results);
+        self.search.results =
+            rank_search_results(&self.search.query, std::mem::take(&mut self.search.results));
+        self.search.provider_warnings.retain(|candidate| {
+            candidate.source != source || self.catalog_warning.as_ref() == Some(candidate)
+        });
+        match warning {
+            Some(warning) => {
+                self.search.failed_providers.insert(source);
+                self.search.provider_warnings.push(warning);
+            }
+            None => {
+                self.search.failed_providers.remove(&source);
+            }
+        }
+        self.update_search_terminal_error();
+        self.search.loading = false;
+    }
+
+    fn update_search_terminal_error(&mut self) {
+        let both_failed = self.search.failed_providers.contains(&DataSource::Yahoo)
+            && self.search.failed_providers.contains(&DataSource::Binance);
+        self.search.terminal_error = (both_failed && self.search.results.is_empty())
+            .then(|| "Both market-data providers are temporarily unavailable.".into());
+    }
 }
 
 fn runtime_dispatch_kind(command: &RuntimeCommand) -> RuntimeDispatchKind {
     match command {
-        RuntimeCommand::Search { .. } => RuntimeDispatchKind::Search,
+        RuntimeCommand::Search { .. } | RuntimeCommand::RetrySearchProvider { .. } => {
+            RuntimeDispatchKind::Search
+        }
         RuntimeCommand::Snapshot { .. } => RuntimeDispatchKind::Snapshot,
         RuntimeCommand::History { .. } => RuntimeDispatchKind::History,
         RuntimeCommand::SetVisible(_)
         | RuntimeCommand::SetWatchlist(_)
         | RuntimeCommand::SetCryptoWatchlist(_)
         | RuntimeCommand::Shutdown => RuntimeDispatchKind::Control,
-        RuntimeCommand::PersistState(_) | RuntimeCommand::PersistMarketCache { .. } => {
-            RuntimeDispatchKind::StatePersistence
+        RuntimeCommand::PersistState(_) => RuntimeDispatchKind::StatePersistence,
+        RuntimeCommand::PersistMarketCache { .. } => RuntimeDispatchKind::MarketCachePersistence,
+    }
+}
+
+fn runtime_dispatch_failure_message(kind: RuntimeDispatchKind) -> &'static str {
+    match kind {
+        RuntimeDispatchKind::StatePersistence => {
+            "Your changes are kept in this session, but saving them could not be queued."
         }
+        RuntimeDispatchKind::MarketCachePersistence => {
+            "Cached market data could not be queued for saving."
+        }
+        RuntimeDispatchKind::Search
+        | RuntimeDispatchKind::Snapshot
+        | RuntimeDispatchKind::History
+        | RuntimeDispatchKind::Control => "Background market-data work is temporarily unavailable.",
     }
 }
 
@@ -1185,5 +1311,31 @@ fn catalog_refresh_message(kind: MarketDataErrorKind, catalog_available: bool) -
         MarketDataErrorKind::UnsupportedInstrument | MarketDataErrorKind::Internal => {
             "Binance instrument catalog is temporarily unavailable. Crypto search may be incomplete."
         }
+    }
+}
+
+#[cfg(test)]
+mod dispatch_message_tests {
+    use super::{RuntimeDispatchKind, runtime_dispatch_failure_message, runtime_dispatch_kind};
+    use crate::runtime::RuntimeCommand;
+    use kabu_core::{CachedMarketState, PersistedState};
+
+    #[test]
+    fn saturated_persistence_commands_keep_state_and_cache_categories_distinct() {
+        let state_kind =
+            runtime_dispatch_kind(&RuntimeCommand::PersistState(PersistedState::starter()));
+        let cache_kind = runtime_dispatch_kind(&RuntimeCommand::PersistMarketCache {
+            cache: CachedMarketState::default(),
+        });
+
+        assert_eq!(state_kind, RuntimeDispatchKind::StatePersistence);
+        assert_eq!(cache_kind, RuntimeDispatchKind::MarketCachePersistence);
+        let state = runtime_dispatch_failure_message(state_kind);
+        let cache = runtime_dispatch_failure_message(cache_kind);
+        assert_ne!(state, cache);
+        assert!(state.contains("changes"));
+        assert!(cache.contains("Cached market data"));
+        assert!(!state.contains("market-data work"));
+        assert!(!cache.contains("market-data work"));
     }
 }

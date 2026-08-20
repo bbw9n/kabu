@@ -6,5 +6,6 @@ pub mod coordinator;
 pub mod lifecycle;
 pub mod macos_visibility;
 pub mod runtime;
+pub mod startup;
 pub mod theme;
 pub mod views;

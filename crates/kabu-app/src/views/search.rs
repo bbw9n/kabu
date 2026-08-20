@@ -10,16 +10,54 @@ use gpui::{
 };
 use gpui_component::{
     ActiveTheme as _, StyledExt as _,
+    button::Button,
     input::{Input, InputEvent, InputState},
     list::ListItem,
     skeleton::Skeleton,
     v_virtual_list,
 };
+use kabu_core::{DataSource, InstrumentId, SearchResult};
 use std::{ops::Range, rc::Rc, time::Duration};
 
 pub const SEARCH_OVERLAY_KEY_CONTEXT: &str = "SearchOverlay";
 const SEARCH_DEBOUNCE: Duration = Duration::from_millis(250);
 const SEARCH_ROW_HEIGHT: f32 = 58.0;
+
+pub fn search_result_provenance(result: &SearchResult) -> String {
+    match &result.instrument.id {
+        InstrumentId::Equity { venue, .. } => format!(
+            "US Equity · {} · {}",
+            venue.as_deref().unwrap_or(result.venue_label.as_str()),
+            provider_label(result.source)
+        ),
+        InstrumentId::Crypto { .. } => format!(
+            "Crypto · {} · {}",
+            result.instrument.id.canonical_symbol(),
+            provider_label(result.source)
+        ),
+    }
+}
+
+const fn provider_label(source: DataSource) -> &'static str {
+    match source {
+        DataSource::Yahoo => "Yahoo",
+        DataSource::Binance => "Binance Spot",
+    }
+}
+
+const fn provider_slug(source: DataSource) -> &'static str {
+    match source {
+        DataSource::Yahoo => "yahoo",
+        DataSource::Binance => "binance",
+    }
+}
+
+const fn provider_index(source: DataSource) -> usize {
+    match source {
+        DataSource::Yahoo => 0,
+        DataSource::Binance => 1,
+    }
+}
 
 pub enum SearchOverlayEvent {
     Dismissed,
@@ -141,8 +179,8 @@ impl SearchOverlay {
             .filter_map(|index| {
                 let result = results.get(index)?.clone();
                 let symbol = result.instrument.id.canonical_symbol();
+                let provenance = search_result_provenance(&result);
                 let display_name = result.instrument.display_name;
-                let venue = result.venue_label;
                 Some(
                     ListItem::new(("search-result", index))
                         .selected(self.selected_index == index)
@@ -171,9 +209,12 @@ impl SearchOverlay {
                                 )
                                 .child(
                                     div()
+                                        .debug_selector(move || {
+                                            format!("search-result-provenance-{index}")
+                                        })
                                         .text_xs()
                                         .text_color(cx.theme().muted_foreground)
-                                        .child(venue),
+                                        .child(provenance),
                                 ),
                         )
                         .on_click(cx.listener(move |overlay, _, window, cx| {
@@ -240,14 +281,42 @@ impl Render for SearchOverlay {
                     .gap_2()
                     .child(Input::new(&self.input))
                     .children(warnings.into_iter().map(|warning| {
+                        let source = warning.source;
+                        let retryable = search.provider_retryable(source);
+                        let selector = format!("search-provider-retry-{}", provider_slug(source));
+                        let model = self.model.clone();
                         div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_3()
                             .rounded_md()
                             .bg(cx.theme().warning.opacity(0.12))
                             .px_3()
                             .py_2()
                             .text_sm()
                             .text_color(cx.theme().warning)
-                            .child(warning.message)
+                            .child(div().flex_1().child(warning.message))
+                            .when(retryable, |this| {
+                                this.child(
+                                    div().debug_selector(move || selector.clone()).child(
+                                        Button::new((
+                                            "retry-search-provider",
+                                            provider_index(source),
+                                        ))
+                                        .label("Retry")
+                                        .compact()
+                                        .on_click(
+                                            move |_, _, cx| {
+                                                model.update(cx, |model, cx| {
+                                                    model.retry_search_provider(source);
+                                                    cx.notify();
+                                                });
+                                            },
+                                        ),
+                                    ),
+                                )
+                            })
                     }))
                     .children(terminal_error.map(|message| {
                         div()

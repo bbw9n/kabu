@@ -8,7 +8,7 @@ use kabu_core::{
 };
 use kabu_data::{BinanceClient, JsonRepository, Recovery, YahooClient};
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, HashMap, VecDeque},
     fmt, io,
     path::Path,
     sync::{
@@ -19,7 +19,6 @@ use std::{
 };
 
 const COMMAND_CAPACITY: usize = 64;
-const EVENT_CAPACITY: usize = 128;
 const MAX_CONCURRENT_OTHER_JOBS: usize = 31;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -27,6 +26,11 @@ pub enum RuntimeCommand {
     Search {
         generation: GenerationId,
         query: String,
+    },
+    RetrySearchProvider {
+        generation: GenerationId,
+        query: String,
+        source: DataSource,
     },
     Snapshot {
         instruments: Vec<Instrument>,
@@ -61,7 +65,7 @@ pub struct ProviderWarning {
     pub message: String,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum StreamStatus {
     Connecting,
     Live,
@@ -70,12 +74,61 @@ pub enum StreamStatus {
     Stopped,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum PersistenceCategory {
+    State,
+    MarketCache,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PersistenceResult {
+    Saved,
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ShutdownOutcome {
+    pub state: Option<PersistenceResult>,
+    pub market_cache: Option<PersistenceResult>,
+    runtime_failed: bool,
+}
+
+impl ShutdownOutcome {
+    const fn success_without_flush() -> Self {
+        Self {
+            state: None,
+            market_cache: None,
+            runtime_failed: false,
+        }
+    }
+
+    const fn runtime_failed() -> Self {
+        Self {
+            state: None,
+            market_cache: None,
+            runtime_failed: true,
+        }
+    }
+
+    pub const fn is_success(self) -> bool {
+        !self.runtime_failed
+            && !matches!(self.state, Some(PersistenceResult::Failed))
+            && !matches!(self.market_cache, Some(PersistenceResult::Failed))
+    }
+}
+
 #[derive(Debug)]
 pub enum RuntimeEvent {
     SearchCompleted {
         generation: GenerationId,
         results: Vec<SearchResult>,
         warnings: Vec<ProviderWarning>,
+    },
+    SearchProviderCompleted {
+        generation: GenerationId,
+        source: DataSource,
+        results: Vec<SearchResult>,
+        warning: Option<ProviderWarning>,
     },
     Quotes(Vec<Quote>),
     QuoteError {
@@ -96,7 +149,235 @@ pub enum RuntimeEvent {
         result: Result<(), MarketDataErrorKind>,
         catalog_available: bool,
     },
+    PersistenceCompleted {
+        category: PersistenceCategory,
+        result: PersistenceResult,
+    },
     StreamStatus(StreamStatus),
+}
+
+/// A coalescing runtime event mailbox backed by a bounded-one notification
+/// channel. Repeated data-plane updates replace the pending value in their
+/// semantic slot (quote per instrument, error per instrument/error class,
+/// status, persistence category, or request key). This keeps quote floods from
+/// consuming control capacity while retaining the final observable state.
+#[derive(Clone)]
+pub struct RuntimeEvents {
+    state: Arc<Mutex<RuntimeEventState>>,
+    notifications: Receiver<()>,
+}
+
+#[derive(Clone)]
+pub(crate) struct RuntimeEventSender {
+    state: Arc<Mutex<RuntimeEventState>>,
+    notify: Sender<()>,
+}
+
+#[derive(Default)]
+struct RuntimeEventState {
+    next_sequence: u64,
+    slots: HashMap<RuntimeEventSlot, u64>,
+    pending: BTreeMap<u64, RuntimeEvent>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+enum RuntimeEventSlot {
+    Search,
+    SearchProvider(DataSource),
+    Quote(InstrumentId),
+    QuoteError(InstrumentId, MarketDataErrorKind),
+    History(ChartRequestKey),
+    Catalog,
+    Persistence(PersistenceCategory),
+    StreamStatus,
+}
+
+pub(crate) fn runtime_event_channel() -> (RuntimeEventSender, RuntimeEvents) {
+    let (notify, notifications) = async_channel::bounded(1);
+    let state = Arc::new(Mutex::new(RuntimeEventState::default()));
+    (
+        RuntimeEventSender {
+            state: state.clone(),
+            notify,
+        },
+        RuntimeEvents {
+            state,
+            notifications,
+        },
+    )
+}
+
+impl RuntimeEventSender {
+    fn publish(&self, event: RuntimeEvent) -> Result<(), RuntimeEvent> {
+        if self.notify.is_closed() {
+            return Err(event);
+        }
+        let events = normalize_runtime_event(event);
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for (slot, event) in events {
+            state.next_sequence = state
+                .next_sequence
+                .checked_add(1)
+                .expect("runtime event sequence exhausted");
+            let sequence = state.next_sequence;
+            if let Some(previous) = state.slots.insert(slot, sequence) {
+                state.pending.remove(&previous);
+            }
+            state.pending.insert(sequence, event);
+        }
+        drop(state);
+        _ = self.notify.try_send(());
+        Ok(())
+    }
+
+    async fn send(&self, event: RuntimeEvent) -> Result<(), RuntimeEvent> {
+        self.publish(event)
+    }
+
+    pub(crate) fn try_send(&self, event: RuntimeEvent) -> Result<(), RuntimeEvent> {
+        self.publish(event)
+    }
+
+    fn close(&self) {
+        self.notify.close();
+    }
+}
+
+impl RuntimeEvents {
+    pub async fn recv(&self) -> Result<RuntimeEvent, async_channel::RecvError> {
+        loop {
+            if let Some(event) = self.take_next() {
+                return Ok(event);
+            }
+            self.notifications.recv().await?;
+        }
+    }
+
+    pub fn recv_blocking(&self) -> Result<RuntimeEvent, async_channel::RecvError> {
+        loop {
+            if let Some(event) = self.take_next() {
+                return Ok(event);
+            }
+            self.notifications.recv_blocking()?;
+        }
+    }
+
+    pub fn try_recv(&self) -> Result<RuntimeEvent, async_channel::TryRecvError> {
+        if let Some(event) = self.take_next() {
+            return Ok(event);
+        }
+        if self.notifications.is_closed() {
+            Err(async_channel::TryRecvError::Closed)
+        } else {
+            Err(async_channel::TryRecvError::Empty)
+        }
+    }
+
+    fn take_next(&self) -> Option<RuntimeEvent> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (&first_sequence, _) = state.pending.first_key_value()?;
+        let priority_sequence = state
+            .pending
+            .iter()
+            .find_map(|(sequence, event)| event_is_priority(event).then_some(*sequence));
+        let sequence = priority_sequence
+            .and_then(|priority_sequence| {
+                quote_before_error(&state, priority_sequence).or(Some(priority_sequence))
+            })
+            .unwrap_or(first_sequence);
+        let event = state.pending.remove(&sequence)?;
+        let slot = runtime_event_slot(&event);
+        if state.slots.get(&slot) == Some(&sequence) {
+            state.slots.remove(&slot);
+        }
+        Some(event)
+    }
+}
+
+fn normalize_runtime_event(event: RuntimeEvent) -> Vec<(RuntimeEventSlot, RuntimeEvent)> {
+    match event {
+        RuntimeEvent::Quotes(quotes) => quotes
+            .into_iter()
+            .map(|quote| {
+                let slot = RuntimeEventSlot::Quote(quote.instrument_id.clone());
+                (slot, RuntimeEvent::Quotes(vec![quote]))
+            })
+            .collect(),
+        RuntimeEvent::QuoteError {
+            instrument_ids,
+            error,
+        } => instrument_ids
+            .into_iter()
+            .map(|instrument_id| {
+                let slot = RuntimeEventSlot::QuoteError(instrument_id.clone(), error.kind);
+                (
+                    slot,
+                    RuntimeEvent::QuoteError {
+                        instrument_ids: vec![instrument_id],
+                        error: error.clone(),
+                    },
+                )
+            })
+            .collect(),
+        event => vec![(runtime_event_slot(&event), event)],
+    }
+}
+
+fn runtime_event_slot(event: &RuntimeEvent) -> RuntimeEventSlot {
+    match event {
+        RuntimeEvent::SearchCompleted { .. } => RuntimeEventSlot::Search,
+        RuntimeEvent::SearchProviderCompleted { source, .. } => {
+            RuntimeEventSlot::SearchProvider(*source)
+        }
+        RuntimeEvent::Quotes(quotes) => RuntimeEventSlot::Quote(
+            quotes
+                .first()
+                .expect("normalized quote event is non-empty")
+                .instrument_id
+                .clone(),
+        ),
+        RuntimeEvent::QuoteError {
+            instrument_ids,
+            error,
+        } => RuntimeEventSlot::QuoteError(
+            instrument_ids
+                .first()
+                .expect("normalized quote error has an identity")
+                .clone(),
+            error.kind,
+        ),
+        RuntimeEvent::HistoryCompleted { key, .. } | RuntimeEvent::HistoryFailed { key, .. } => {
+            RuntimeEventSlot::History(key.clone())
+        }
+        RuntimeEvent::CatalogRefresh { .. } => RuntimeEventSlot::Catalog,
+        RuntimeEvent::PersistenceCompleted { category, .. } => {
+            RuntimeEventSlot::Persistence(*category)
+        }
+        RuntimeEvent::StreamStatus(_) => RuntimeEventSlot::StreamStatus,
+    }
+}
+
+fn event_is_priority(event: &RuntimeEvent) -> bool {
+    !matches!(event, RuntimeEvent::Quotes(_))
+}
+
+fn quote_before_error(state: &RuntimeEventState, priority_sequence: u64) -> Option<u64> {
+    let RuntimeEvent::QuoteError { instrument_ids, .. } = state.pending.get(&priority_sequence)?
+    else {
+        return None;
+    };
+    let quote_slot = RuntimeEventSlot::Quote(instrument_ids.first()?.clone());
+    state
+        .slots
+        .get(&quote_slot)
+        .copied()
+        .filter(|quote_sequence| *quote_sequence < priority_sequence)
 }
 
 pub trait EquityProvider: InstrumentSearch + QuoteSnapshots + ChartHistory {}
@@ -124,12 +405,33 @@ pub struct ProductionComponents {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProductionStartError {
-    #[error(transparent)]
-    Persistence(#[from] PersistenceError),
-    #[error(transparent)]
-    Http(#[from] reqwest::Error),
-    #[error(transparent)]
-    Io(#[from] io::Error),
+    #[error("persisted state could not be loaded: {0}")]
+    PersistedState(PersistenceError),
+    #[error("market cache could not be loaded: {0}")]
+    MarketCache(PersistenceError),
+    #[error("market-data clients could not be initialized: {0}")]
+    ProviderSetup(reqwest::Error),
+    #[error("background runtime could not be started: {0}")]
+    BackgroundRuntime(io::Error),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StartupFailureCategory {
+    PersistedState,
+    MarketCache,
+    ProviderSetup,
+    BackgroundRuntime,
+}
+
+impl ProductionStartError {
+    pub const fn category(&self) -> StartupFailureCategory {
+        match self {
+            Self::PersistedState(_) => StartupFailureCategory::PersistedState,
+            Self::MarketCache(_) => StartupFailureCategory::MarketCache,
+            Self::ProviderSetup(_) => StartupFailureCategory::ProviderSetup,
+            Self::BackgroundRuntime(_) => StartupFailureCategory::BackgroundRuntime,
+        }
+    }
 }
 
 impl ProductionComponents {
@@ -142,10 +444,15 @@ impl ProductionComponents {
     }
 
     fn from_repository(repository: JsonRepository) -> Result<Self, ProductionStartError> {
-        let state = repository.load_state_with_recovery()?;
-        let cache = repository.load_cache_with_recovery()?;
-        let yahoo = YahooClient::production()?;
-        let binance = BinanceClient::production(cache.value.instrument_catalog.clone())?;
+        let state = repository
+            .load_state_with_recovery()
+            .map_err(ProductionStartError::PersistedState)?;
+        let cache = repository
+            .load_cache_with_recovery()
+            .map_err(ProductionStartError::MarketCache)?;
+        let yahoo = YahooClient::production().map_err(ProductionStartError::ProviderSetup)?;
+        let binance = BinanceClient::production(cache.value.instrument_catalog.clone())
+            .map_err(ProductionStartError::ProviderSetup)?;
         Ok(Self {
             state,
             cache,
@@ -167,7 +474,8 @@ impl ProductionComponents {
             self.repository,
             cache_for_runtime,
             Some(binance),
-        )?;
+        )
+        .map_err(ProductionStartError::BackgroundRuntime)?;
         Ok(ProductionLaunch {
             state: self.state,
             cache: self.cache,
@@ -195,8 +503,8 @@ enum RuntimeMode {
 
 struct RecordingRuntime {
     commands: Mutex<VecDeque<RuntimeCommand>>,
-    events: Receiver<RuntimeEvent>,
-    event_sender: Sender<RuntimeEvent>,
+    events: RuntimeEvents,
+    event_sender: RuntimeEventSender,
     shutdown: AtomicBool,
 }
 
@@ -204,7 +512,9 @@ struct LiveRuntime {
     commands: Sender<RuntimeCommand>,
     controls: Arc<ControlLane>,
     shutdown_signal: Sender<()>,
-    events: Receiver<RuntimeEvent>,
+    events: RuntimeEvents,
+    repository: Arc<dyn StateRepository>,
+    cache_state: Arc<Mutex<CachedMarketState>>,
     final_flush: Arc<Mutex<Option<FinalFlush>>>,
     completion: Arc<ShutdownCompletion>,
     join: Mutex<Option<JoinHandle<()>>>,
@@ -225,10 +535,11 @@ struct ControlLane {
 }
 
 struct ShutdownCompletion {
-    complete: Mutex<bool>,
+    outcome: Mutex<Option<ShutdownOutcome>>,
     changed: Condvar,
 }
 
+#[derive(Clone)]
 struct FinalFlush {
     state: PersistedState,
     cache: CachedMarketState,
@@ -244,7 +555,7 @@ struct NetworkInputs {
     commands: Receiver<RuntimeCommand>,
     controls: Arc<ControlLane>,
     control_notifications: Receiver<()>,
-    events: Sender<RuntimeEvent>,
+    events: RuntimeEventSender,
     shutdown: Receiver<()>,
     providers: ProviderSet,
     storage: RuntimeStorage,
@@ -264,7 +575,7 @@ struct PersistenceLane {
 
 impl Default for RuntimeHandle {
     fn default() -> Self {
-        let (event_sender, events) = async_channel::bounded(1);
+        let (event_sender, events) = runtime_event_channel();
         Self {
             mode: RuntimeMode::Recording(Arc::new(RecordingRuntime {
                 commands: Mutex::new(VecDeque::with_capacity(COMMAND_CAPACITY)),
@@ -303,7 +614,7 @@ impl RuntimeHandle {
         catalog_client: Option<BinanceClient>,
     ) -> io::Result<Self> {
         let (commands, command_receiver) = async_channel::bounded(COMMAND_CAPACITY);
-        let (event_sender, events) = async_channel::bounded(EVENT_CAPACITY);
+        let (event_sender, events) = runtime_event_channel();
         let (shutdown_signal, shutdown_receiver) = async_channel::bounded(1);
         let (control_notify, control_notifications) = async_channel::bounded(1);
         let controls = Arc::new(ControlLane {
@@ -316,13 +627,14 @@ impl RuntimeHandle {
             notify: control_notify,
         });
         let completion = Arc::new(ShutdownCompletion {
-            complete: Mutex::new(false),
+            outcome: Mutex::new(None),
             changed: Condvar::new(),
         });
         let final_flush = Arc::new(Mutex::new(None));
+        let cache_state = Arc::new(Mutex::new(initial_cache));
         let storage = RuntimeStorage {
-            repository,
-            cache: Arc::new(Mutex::new(initial_cache)),
+            repository: repository.clone(),
+            cache: cache_state.clone(),
             final_flush: final_flush.clone(),
         };
         let network_controls = controls.clone();
@@ -330,7 +642,7 @@ impl RuntimeHandle {
         let join = thread::Builder::new()
             .name("kabu-network".into())
             .spawn(move || {
-                run_network(NetworkInputs {
+                let outcome = run_network(NetworkInputs {
                     commands: command_receiver,
                     controls: network_controls,
                     control_notifications,
@@ -341,9 +653,9 @@ impl RuntimeHandle {
                     catalog_client,
                 });
                 *network_completion
-                    .complete
+                    .outcome
                     .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(outcome);
                 network_completion.changed.notify_all();
             })?;
 
@@ -353,6 +665,8 @@ impl RuntimeHandle {
                 controls,
                 shutdown_signal,
                 events,
+                repository,
+                cache_state,
                 final_flush,
                 completion,
                 join: Mutex::new(Some(join)),
@@ -420,10 +734,17 @@ impl RuntimeHandle {
         }
     }
 
-    pub fn events(&self) -> Receiver<RuntimeEvent> {
+    pub fn events(&self) -> RuntimeEvents {
         match &self.mode {
             RuntimeMode::Recording(runtime) => runtime.events.clone(),
             RuntimeMode::Live(runtime) => runtime.events.clone(),
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn publish_recorded_event(&self, event: RuntimeEvent) {
+        if let RuntimeMode::Recording(runtime) = &self.mode {
+            _ = runtime.event_sender.try_send(event);
         }
     }
 
@@ -505,21 +826,80 @@ impl RuntimeHandle {
         }
     }
 
-    pub fn wait_for_shutdown(&self, timeout: std::time::Duration) -> bool {
+    pub fn wait_for_shutdown(&self, timeout: std::time::Duration) -> Option<ShutdownOutcome> {
         match &self.mode {
-            RuntimeMode::Recording(runtime) => runtime.shutdown.load(Ordering::SeqCst),
+            RuntimeMode::Recording(runtime) => runtime
+                .shutdown
+                .load(Ordering::SeqCst)
+                .then(ShutdownOutcome::success_without_flush),
             RuntimeMode::Live(runtime) => wait_for_live_shutdown(runtime, timeout),
         }
+    }
+
+    pub fn shutdown_outcome(&self) -> Option<ShutdownOutcome> {
+        match &self.mode {
+            RuntimeMode::Recording(runtime) => runtime
+                .shutdown
+                .load(Ordering::SeqCst)
+                .then(ShutdownOutcome::success_without_flush),
+            RuntimeMode::Live(runtime) => *runtime
+                .completion
+                .outcome
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        }
+    }
+
+    pub fn retry_shutdown_persistence(&self) -> ShutdownOutcome {
+        let RuntimeMode::Live(runtime) = &self.mode else {
+            return ShutdownOutcome::success_without_flush();
+        };
+        let previous = runtime
+            .completion
+            .outcome
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(ShutdownOutcome::runtime_failed);
+        if previous.runtime_failed {
+            return previous;
+        }
+        let Some(flush) = runtime
+            .final_flush
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+        else {
+            return previous;
+        };
+        *runtime
+            .completion
+            .outcome
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        let outcome = retry_final_flush(
+            runtime.repository.as_ref(),
+            &runtime.cache_state,
+            &flush,
+            previous,
+        );
+        *runtime
+            .completion
+            .outcome
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(outcome);
+        runtime.completion.changed.notify_all();
+        outcome
     }
 
     pub fn is_shutdown_complete(&self) -> bool {
         match &self.mode {
             RuntimeMode::Recording(runtime) => runtime.shutdown.load(Ordering::SeqCst),
-            RuntimeMode::Live(runtime) => *runtime
+            RuntimeMode::Live(runtime) => runtime
                 .completion
-                .complete
+                .outcome
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_some(),
         }
     }
 
@@ -589,16 +969,16 @@ impl Drop for LiveRuntime {
         self.commands.close();
         self.controls.notify.close();
         self.shutdown_signal.close();
-        let mut complete = self
+        let mut outcome = self
             .completion
-            .complete
+            .outcome
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        while !*complete {
-            complete = self
+        while outcome.is_none() {
+            outcome = self
                 .completion
                 .changed
-                .wait_timeout(complete, std::time::Duration::from_secs(2))
+                .wait_timeout(outcome, std::time::Duration::from_secs(2))
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .0;
         }
@@ -668,21 +1048,23 @@ fn initiate_shutdown(runtime: &LiveRuntime) {
     runtime.controls.notify.close();
 }
 
-fn wait_for_live_shutdown(runtime: &LiveRuntime, timeout: std::time::Duration) -> bool {
-    let complete = runtime
+fn wait_for_live_shutdown(
+    runtime: &LiveRuntime,
+    timeout: std::time::Duration,
+) -> Option<ShutdownOutcome> {
+    let outcome = runtime
         .completion
-        .complete
+        .outcome
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let (complete, _) = runtime
+    let (outcome, _) = runtime
         .completion
         .changed
-        .wait_timeout_while(complete, timeout, |complete| !*complete)
+        .wait_timeout_while(outcome, timeout, |outcome| outcome.is_none())
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if !*complete {
-        return false;
-    }
-    drop(complete);
+    let result = *outcome;
+    drop(outcome);
+    result?;
     if let Some(join) = runtime
         .join
         .lock()
@@ -691,22 +1073,22 @@ fn wait_for_live_shutdown(runtime: &LiveRuntime, timeout: std::time::Duration) -
     {
         _ = join.join();
     }
-    true
+    result
 }
 
-fn run_network(inputs: NetworkInputs) {
+fn run_network(inputs: NetworkInputs) -> ShutdownOutcome {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .thread_name("kabu-network")
         .enable_all()
         .build();
     let Ok(runtime) = runtime else {
-        return;
+        return ShutdownOutcome::runtime_failed();
     };
-    runtime.block_on(run_dispatcher(inputs));
+    runtime.block_on(run_dispatcher(inputs))
 }
 
-async fn run_dispatcher(inputs: NetworkInputs) {
+async fn run_dispatcher(inputs: NetworkInputs) -> ShutdownOutcome {
     let NetworkInputs {
         commands,
         controls,
@@ -738,9 +1120,14 @@ async fn run_dispatcher(inputs: NetworkInputs) {
         persistence_notifications,
         repository.clone(),
         cache_state.clone(),
+        events.clone(),
     ));
+    let catalog_repository = repository.clone();
+    let catalog_cache_state = cache_state.clone();
     let mut catalog_job = catalog_client.map(|client| {
         let events = events.clone();
+        let repository = catalog_repository.clone();
+        let cache_state = catalog_cache_state.clone();
         tokio::spawn(async move {
             let result =
                 refresh_catalog_cache(client.clone(), repository.clone(), cache_state.clone())
@@ -826,6 +1213,31 @@ async fn run_dispatcher(inputs: NetworkInputs) {
                             send_search(generation, query, &providers, &events).await;
                         }));
                     }
+                    RuntimeCommand::RetrySearchProvider {
+                        generation,
+                        query,
+                        source,
+                    } => {
+                        if !visible {
+                            continue;
+                        }
+                        if let Some(job) = search_job.take() {
+                            job.abort();
+                            _ = job.await;
+                        }
+                        let events = events.clone();
+                        let providers = providers.clone();
+                        search_job = Some(tokio::spawn(async move {
+                            send_provider_search(
+                                generation,
+                                query,
+                                source,
+                                &providers,
+                                &events,
+                            )
+                            .await;
+                        }));
+                    }
                     RuntimeCommand::Snapshot { .. } | RuntimeCommand::History { .. } => {
                         if !visible {
                             continue;
@@ -886,16 +1298,34 @@ async fn run_dispatcher(inputs: NetworkInputs) {
             _ => {}
         }
     }
-    if let Some(final_flush) = final_flush
+    let final_flush = final_flush
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .take()
-    {
-        persistence.update_state(final_flush.state);
-        persistence.update_cache(final_flush.cache);
-    }
+        .clone();
     persistence.notify.close();
     _ = persistence_job.await;
+    let Some(final_flush) = final_flush else {
+        return ShutdownOutcome::success_without_flush();
+    };
+    let repository_for_flush = repository.clone();
+    let cache_for_flush = cache_state.clone();
+    let outcome = tokio::task::spawn_blocking(move || {
+        persist_final_flush(
+            repository_for_flush.as_ref(),
+            &cache_for_flush,
+            &final_flush,
+        )
+    })
+    .await
+    .unwrap_or_else(|_| ShutdownOutcome::runtime_failed());
+    publish_persistence_outcome(&events, PersistenceCategory::State, outcome.state).await;
+    publish_persistence_outcome(
+        &events,
+        PersistenceCategory::MarketCache,
+        outcome.market_cache,
+    )
+    .await;
+    outcome
 }
 
 impl PersistenceLane {
@@ -930,6 +1360,7 @@ async fn run_persistence(
     notifications: Receiver<()>,
     repository: Arc<dyn StateRepository>,
     cache_state: Arc<Mutex<CachedMarketState>>,
+    events: RuntimeEventSender,
 ) {
     while notifications.recv().await.is_ok() {
         loop {
@@ -939,28 +1370,107 @@ async fn run_persistence(
             }
             let repository = repository.clone();
             let cache_state = cache_state.clone();
-            _ = tokio::task::spawn_blocking(move || {
-                if let Some(state) = desired.state {
-                    _ = repository.save_state(&state);
-                }
-                if let Some(cache) = desired.cache {
+            let attempted_state = desired.state.is_some();
+            let attempted_cache = desired.cache.is_some();
+            let results = tokio::task::spawn_blocking(move || {
+                let state = desired
+                    .state
+                    .map(|state| persistence_result(repository.save_state(&state)));
+                let cache = desired.cache.map(|cache| {
                     let mut current = cache_state
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
                     current.quotes = cache.quotes;
                     current.charts = cache.charts;
-                    _ = repository.save_cache(&current);
-                }
+                    persistence_result(repository.save_cache(&current))
+                });
+                (state, cache)
             })
             .await;
+            let (state, cache) = results.unwrap_or((
+                attempted_state.then_some(PersistenceResult::Failed),
+                attempted_cache.then_some(PersistenceResult::Failed),
+            ));
+            publish_persistence_outcome(&events, PersistenceCategory::State, state).await;
+            publish_persistence_outcome(&events, PersistenceCategory::MarketCache, cache).await;
         }
     }
+}
+
+fn persistence_result(result: Result<(), PersistenceError>) -> PersistenceResult {
+    if result.is_ok() {
+        PersistenceResult::Saved
+    } else {
+        PersistenceResult::Failed
+    }
+}
+
+async fn publish_persistence_outcome(
+    events: &RuntimeEventSender,
+    category: PersistenceCategory,
+    result: Option<PersistenceResult>,
+) {
+    if let Some(result) = result {
+        _ = events
+            .send(RuntimeEvent::PersistenceCompleted { category, result })
+            .await;
+    }
+}
+
+fn persist_final_flush(
+    repository: &dyn StateRepository,
+    cache_state: &Arc<Mutex<CachedMarketState>>,
+    flush: &FinalFlush,
+) -> ShutdownOutcome {
+    ShutdownOutcome {
+        state: Some(persistence_result(repository.save_state(&flush.state))),
+        market_cache: Some(persist_final_cache(repository, cache_state, &flush.cache)),
+        runtime_failed: false,
+    }
+}
+
+fn retry_final_flush(
+    repository: &dyn StateRepository,
+    cache_state: &Arc<Mutex<CachedMarketState>>,
+    flush: &FinalFlush,
+    previous: ShutdownOutcome,
+) -> ShutdownOutcome {
+    let state = match previous.state {
+        Some(PersistenceResult::Failed) => {
+            Some(persistence_result(repository.save_state(&flush.state)))
+        }
+        result => result,
+    };
+    let market_cache = match previous.market_cache {
+        Some(PersistenceResult::Failed) => {
+            Some(persist_final_cache(repository, cache_state, &flush.cache))
+        }
+        result => result,
+    };
+    ShutdownOutcome {
+        state,
+        market_cache,
+        runtime_failed: false,
+    }
+}
+
+fn persist_final_cache(
+    repository: &dyn StateRepository,
+    cache_state: &Arc<Mutex<CachedMarketState>>,
+    cache: &CachedMarketState,
+) -> PersistenceResult {
+    let mut current = cache_state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    current.quotes = cache.quotes.clone();
+    current.charts = cache.charts.clone();
+    persistence_result(repository.save_cache(&current))
 }
 
 fn spawn_other_job(
     command: RuntimeCommand,
     jobs: &mut tokio::task::JoinSet<()>,
-    events: &Sender<RuntimeEvent>,
+    events: &RuntimeEventSender,
     providers: &ProviderSet,
 ) {
     let events = events.clone();
@@ -978,6 +1488,7 @@ fn spawn_other_job(
                 send_history(generation, instrument, period, &providers, &events).await;
             }
             RuntimeCommand::Search { .. }
+            | RuntimeCommand::RetrySearchProvider { .. }
             | RuntimeCommand::SetVisible(_)
             | RuntimeCommand::SetWatchlist(_)
             | RuntimeCommand::SetCryptoWatchlist(_)
@@ -992,7 +1503,7 @@ async fn send_search(
     generation: GenerationId,
     query: String,
     providers: &ProviderSet,
-    events: &Sender<RuntimeEvent>,
+    events: &RuntimeEventSender,
 ) {
     let (equities, crypto) = tokio::join!(
         providers.equities.search(&query),
@@ -1011,12 +1522,44 @@ async fn send_search(
         .await;
 }
 
+async fn send_provider_search(
+    generation: GenerationId,
+    query: String,
+    source: DataSource,
+    providers: &ProviderSet,
+    events: &RuntimeEventSender,
+) {
+    let outcome = match source {
+        DataSource::Yahoo => providers.equities.search(&query).await,
+        DataSource::Binance => providers.crypto.search(&query).await,
+    };
+    let (results, warning) = match outcome {
+        Ok(results) => (rank_search_results(&query, results), None),
+        Err(error) => (
+            Vec::new(),
+            Some(ProviderWarning {
+                source,
+                kind: error.kind,
+                message: search_warning_message(source).into(),
+            }),
+        ),
+    };
+    _ = events
+        .send(RuntimeEvent::SearchProviderCompleted {
+            generation,
+            source,
+            results,
+            warning,
+        })
+        .await;
+}
+
 async fn send_history(
     generation: GenerationId,
     instrument: Instrument,
     period: ChartPeriod,
     providers: &ProviderSet,
-    events: &Sender<RuntimeEvent>,
+    events: &RuntimeEventSender,
 ) {
     let key = ChartRequestKey {
         instrument_id: instrument.id.clone(),
@@ -1052,19 +1595,22 @@ fn collect_search_outcome(
         Err(error) => warnings.push(ProviderWarning {
             source,
             kind: error.kind,
-            message: match source {
-                DataSource::Yahoo => "Yahoo search is temporarily unavailable.",
-                DataSource::Binance => "Binance search is temporarily unavailable.",
-            }
-            .into(),
+            message: search_warning_message(source).into(),
         }),
+    }
+}
+
+fn search_warning_message(source: DataSource) -> &'static str {
+    match source {
+        DataSource::Yahoo => "Yahoo search is temporarily unavailable.",
+        DataSource::Binance => "Binance search is temporarily unavailable.",
     }
 }
 
 async fn send_snapshots(
     instruments: Vec<Instrument>,
     providers: &ProviderSet,
-    events: &Sender<RuntimeEvent>,
+    events: &RuntimeEventSender,
 ) {
     let (equities, crypto): (Vec<_>, Vec<_>) = instruments
         .into_iter()
@@ -1085,7 +1631,7 @@ async fn collect_snapshot_outcome(
     instruments: Vec<Instrument>,
     outcome: Result<Vec<Quote>, MarketDataError>,
     quotes: &mut Vec<Quote>,
-    events: &Sender<RuntimeEvent>,
+    events: &RuntimeEventSender,
 ) {
     match outcome {
         Ok(provider_quotes) => quotes.extend(provider_quotes),
@@ -1124,8 +1670,8 @@ async fn refresh_catalog_cache(
 #[cfg(test)]
 mod tests {
     use super::{
-        ProductionComponents, ProviderSet, RuntimeCommand, RuntimeEvent, RuntimeHandle,
-        StreamStatus, refresh_catalog_cache,
+        PersistenceCategory, PersistenceResult, ProductionComponents, ProviderSet, RuntimeCommand,
+        RuntimeEvent, RuntimeHandle, StreamStatus, refresh_catalog_cache,
     };
     use async_trait::async_trait;
     use kabu_core::{
@@ -1486,6 +2032,87 @@ mod tests {
     }
 
     #[test]
+    fn live_persistence_reports_state_and_cache_failure_then_same_category_recovery() {
+        let repository = Arc::new(FlakyRepository::failing());
+        let providers = ProviderSet {
+            equities: Arc::new(FakeProvider::immediate(DataSource::Yahoo, Vec::new())),
+            crypto: Arc::new(FakeProvider::immediate(DataSource::Binance, Vec::new())),
+        };
+        let runtime = RuntimeHandle::start(providers, repository.clone()).expect("runtime");
+        let events = runtime.events();
+
+        runtime
+            .send(RuntimeCommand::PersistState(PersistedState::starter()))
+            .expect("state command");
+        runtime
+            .send(RuntimeCommand::PersistMarketCache {
+                cache: CachedMarketState::default(),
+            })
+            .expect("cache command");
+
+        assert_persistence_event(
+            &events,
+            PersistenceCategory::State,
+            PersistenceResult::Failed,
+        );
+        assert_persistence_event(
+            &events,
+            PersistenceCategory::MarketCache,
+            PersistenceResult::Failed,
+        );
+
+        repository.recover_state();
+        runtime
+            .send(RuntimeCommand::PersistState(PersistedState::starter()))
+            .expect("state retry");
+        assert_persistence_event(
+            &events,
+            PersistenceCategory::State,
+            PersistenceResult::Saved,
+        );
+
+        repository.recover_cache();
+        runtime
+            .send(RuntimeCommand::PersistMarketCache {
+                cache: CachedMarketState::default(),
+            })
+            .expect("cache retry");
+        assert_persistence_event(
+            &events,
+            PersistenceCategory::MarketCache,
+            PersistenceResult::Saved,
+        );
+        runtime.shutdown();
+    }
+
+    #[test]
+    fn final_persistence_failure_is_a_typed_shutdown_outcome_and_can_be_retried() {
+        let repository = Arc::new(FlakyRepository::failing());
+        let providers = ProviderSet {
+            equities: Arc::new(FakeProvider::immediate(DataSource::Yahoo, Vec::new())),
+            crypto: Arc::new(FakeProvider::immediate(DataSource::Binance, Vec::new())),
+        };
+        let runtime = RuntimeHandle::start(providers, repository.clone()).expect("runtime");
+
+        runtime.begin_shutdown_with_flush(PersistedState::starter(), CachedMarketState::default());
+        let failed = runtime
+            .wait_for_shutdown(Duration::from_secs(2))
+            .expect("finished shutdown");
+        assert!(!failed.is_success());
+        assert_eq!(failed.state, Some(PersistenceResult::Failed));
+        assert_eq!(failed.market_cache, Some(PersistenceResult::Failed));
+
+        repository.recover_state();
+        repository.recover_cache();
+        let recovered = runtime.retry_shutdown_persistence();
+        assert!(recovered.is_success());
+        assert_eq!(recovered.state, Some(PersistenceResult::Saved));
+        assert_eq!(recovered.market_cache, Some(PersistenceResult::Saved));
+        assert_eq!(repository.state_saves.load(Ordering::SeqCst), 2);
+        assert_eq!(repository.cache_saves.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
     fn visibility_and_watchlist_commands_drive_the_coordinator() {
         let probe = Arc::new(OperationProbe::default());
         let providers = ProviderSet {
@@ -1690,12 +2317,16 @@ mod tests {
         repository.wait_until_save_started();
 
         let wait_started = Instant::now();
-        assert!(!runtime.wait_for_shutdown(Duration::from_millis(50)));
+        assert!(
+            runtime
+                .wait_for_shutdown(Duration::from_millis(50))
+                .is_none()
+        );
         assert!(wait_started.elapsed() < Duration::from_secs(2));
         assert!(!runtime.is_shutdown_complete());
 
         repository.release();
-        assert!(runtime.wait_for_shutdown(Duration::from_secs(2)));
+        assert!(runtime.wait_for_shutdown(Duration::from_secs(2)).is_some());
         assert!(runtime.is_shutdown_complete());
         assert_eq!(
             repository.saved_theme(),
@@ -1787,6 +2418,149 @@ mod tests {
         assert!(!warnings[0].message.contains(query));
         assert!(!format!("{:?}", warnings).contains(query));
         runtime.shutdown();
+    }
+
+    #[test]
+    fn retry_search_calls_only_the_failed_provider_and_returns_a_typed_replacement() {
+        let yahoo = SequencedSearchProvider::new(DataSource::Yahoo, vec![Ok(vec![nvda_result()])]);
+        let yahoo_calls = yahoo.calls.clone();
+        let crypto = SequencedSearchProvider::new(
+            DataSource::Binance,
+            vec![
+                Err(MarketDataError {
+                    kind: MarketDataErrorKind::Unavailable,
+                    message: "private-query-provider-body".into(),
+                    retry_after: None,
+                }),
+                Ok(vec![btc_result()]),
+            ],
+        );
+        let crypto_calls = crypto.calls.clone();
+        let providers = ProviderSet {
+            equities: Arc::new(yahoo),
+            crypto: Arc::new(crypto),
+        };
+        let runtime = RuntimeHandle::start(providers, Arc::new(NoopRepository)).expect("runtime");
+        let generation = kabu_core::Generation::default().next();
+
+        runtime
+            .send(RuntimeCommand::Search {
+                generation,
+                query: "btc".into(),
+            })
+            .expect("initial search");
+        let RuntimeEvent::SearchCompleted {
+            results, warnings, ..
+        } = runtime
+            .events()
+            .recv_blocking()
+            .expect("initial completion")
+        else {
+            panic!("expected full search completion");
+        };
+        assert_eq!(results, vec![nvda_result()]);
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].source, DataSource::Binance);
+
+        runtime
+            .send(RuntimeCommand::RetrySearchProvider {
+                generation,
+                query: "btc".into(),
+                source: DataSource::Binance,
+            })
+            .expect("provider retry");
+        let RuntimeEvent::SearchProviderCompleted {
+            source,
+            results,
+            warning,
+            ..
+        } = runtime.events().recv_blocking().expect("retry completion")
+        else {
+            panic!("expected provider completion");
+        };
+
+        assert_eq!(source, DataSource::Binance);
+        assert_eq!(results, vec![btc_result()]);
+        assert!(warning.is_none());
+        assert_eq!(yahoo_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(crypto_calls.load(Ordering::SeqCst), 2);
+        runtime.shutdown();
+    }
+
+    #[test]
+    fn merged_runtime_search_preserves_common_crypto_quote_priority() {
+        let providers = ProviderSet {
+            equities: Arc::new(FakeProvider::immediate(DataSource::Yahoo, Vec::new())),
+            crypto: Arc::new(FakeProvider::immediate(
+                DataSource::Binance,
+                vec![
+                    crypto_result("BTC", "TRY"),
+                    crypto_result("BTC", "ETH"),
+                    crypto_result("BTC", "USDC"),
+                    crypto_result("BTC", "USDT"),
+                ],
+            )),
+        };
+        let runtime = RuntimeHandle::start(providers, Arc::new(NoopRepository)).expect("runtime");
+        runtime
+            .send(RuntimeCommand::Search {
+                generation: kabu_core::Generation::default().next(),
+                query: "BTC".into(),
+            })
+            .expect("search");
+
+        let RuntimeEvent::SearchCompleted { results, .. } =
+            runtime.events().recv_blocking().expect("search result")
+        else {
+            panic!("expected search completion");
+        };
+        assert_eq!(
+            results
+                .iter()
+                .map(|result| result.instrument.id.canonical_symbol())
+                .collect::<Vec<_>>(),
+            vec!["BTC/USDT", "BTC/USDC", "BTC/ETH", "BTC/TRY"]
+        );
+        runtime.shutdown();
+    }
+
+    #[test]
+    fn live_event_pressure_keeps_latest_quote_reconnecting_status_and_typed_error() {
+        let flood = FloodStreamProvider::new(300);
+        let subscriptions = flood.subscriptions.clone();
+        let providers = ProviderSet {
+            equities: Arc::new(FakeProvider::immediate(DataSource::Yahoo, Vec::new())),
+            crypto: Arc::new(flood),
+        };
+        let runtime = RuntimeHandle::start(providers, Arc::new(NoopRepository)).expect("runtime");
+        runtime
+            .send(RuntimeCommand::SetWatchlist(vec![btc_instrument()]))
+            .expect("watchlist");
+
+        wait_for_counter(&subscriptions, 1);
+        thread::sleep(Duration::from_millis(50));
+        let mut latest_quote = None;
+        let mut quote_events = 0;
+        let mut statuses = Vec::new();
+        let mut errors = Vec::new();
+        while let Ok(event) = runtime.events().try_recv() {
+            match event {
+                RuntimeEvent::Quotes(quotes) => {
+                    quote_events += 1;
+                    latest_quote = quotes.into_iter().next();
+                }
+                RuntimeEvent::StreamStatus(status) => statuses.push(status),
+                RuntimeEvent::QuoteError { error, .. } => errors.push(error.kind),
+                _ => {}
+            }
+        }
+
+        assert_eq!(quote_events, 1, "one pending quote slot per instrument");
+        assert_eq!(latest_quote.expect("latest quote").last, 399.0);
+        assert_eq!(statuses.last(), Some(&StreamStatus::Reconnecting));
+        assert!(errors.contains(&MarketDataErrorKind::Disconnected));
+        runtime.shutdown();
+        assert!(runtime.is_shutdown());
     }
 
     #[test]
@@ -1952,6 +2726,50 @@ mod tests {
     }
 
     #[test]
+    fn newer_query_cancels_an_in_flight_provider_retry_before_it_can_emit() {
+        let probe = Arc::new(OperationProbe::default());
+        let providers = ProviderSet {
+            equities: Arc::new(
+                ControlledProvider::new(DataSource::Yahoo, probe.clone(), Duration::ZERO)
+                    .with_slow_search(Duration::from_millis(200)),
+            ),
+            crypto: Arc::new(
+                ControlledProvider::new(DataSource::Binance, probe.clone(), Duration::ZERO)
+                    .with_slow_search(Duration::from_millis(200)),
+            ),
+        };
+        let runtime = RuntimeHandle::start(providers, Arc::new(NoopRepository)).expect("runtime");
+        let mut generations = kabu_core::Generation::default();
+        let retry_generation = generations.next();
+        let current = generations.next();
+        runtime
+            .send(RuntimeCommand::RetrySearchProvider {
+                generation: retry_generation,
+                query: "old".into(),
+                source: DataSource::Yahoo,
+            })
+            .expect("old provider retry");
+        wait_for_counter(&probe.started, 1);
+
+        runtime
+            .send(RuntimeCommand::Search {
+                generation: current,
+                query: "new".into(),
+            })
+            .expect("new query");
+
+        let RuntimeEvent::SearchCompleted { generation, .. } =
+            runtime.events().recv_blocking().expect("new query result")
+        else {
+            panic!("expected current full search completion");
+        };
+        assert_eq!(generation, current);
+        assert_eq!(probe.cancelled.load(Ordering::SeqCst), 1);
+        assert!(runtime.events().try_recv().is_err());
+        runtime.shutdown();
+    }
+
+    #[test]
     fn shutdown_cancels_and_drains_every_tracked_job() {
         let probe = Arc::new(OperationProbe::default());
         let providers = ProviderSet {
@@ -2054,6 +2872,132 @@ mod tests {
         active: Option<Arc<AtomicUsize>>,
         maximum: Option<Arc<AtomicUsize>>,
         delay: Option<Duration>,
+    }
+
+    struct SequencedSearchProvider {
+        source: DataSource,
+        outcomes: Mutex<std::collections::VecDeque<Result<Vec<SearchResult>, MarketDataError>>>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    struct FloodStreamProvider {
+        count: usize,
+        subscriptions: Arc<AtomicUsize>,
+    }
+
+    impl FloodStreamProvider {
+        fn new(count: usize) -> Self {
+            Self {
+                count,
+                subscriptions: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl InstrumentSearch for FloodStreamProvider {
+        async fn search(&self, _: &str) -> Result<Vec<SearchResult>, MarketDataError> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[async_trait]
+    impl QuoteSnapshots for FloodStreamProvider {
+        async fn snapshots(&self, _: &[Instrument]) -> Result<Vec<Quote>, MarketDataError> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[async_trait]
+    impl ChartHistory for FloodStreamProvider {
+        async fn history(
+            &self,
+            _: &Instrument,
+            _: ChartPeriod,
+        ) -> Result<Vec<Candle>, MarketDataError> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[async_trait]
+    impl QuoteSubscription for FloodStreamProvider {
+        async fn subscribe(&self, _: &[Instrument]) -> Result<QuoteStream, MarketDataError> {
+            let attempt = self.subscriptions.fetch_add(1, Ordering::SeqCst);
+            if attempt > 0 {
+                return Ok(QuoteStream::new(futures_util::stream::pending()));
+            }
+            let base_timestamp =
+                chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp");
+            let mut events = (0..self.count)
+                .map(|index| {
+                    let mut quote = test_quote(btc_instrument().id, DataSource::Binance);
+                    quote.last = 100.0 + index as f64;
+                    quote.provider_timestamp =
+                        base_timestamp + chrono::Duration::milliseconds(index as i64);
+                    Ok(quote)
+                })
+                .collect::<Vec<_>>();
+            events.push(Err(MarketDataError {
+                kind: MarketDataErrorKind::Disconnected,
+                message: "private stream frame".into(),
+                retry_after: None,
+            }));
+            Ok(QuoteStream::new(futures_util::stream::iter(events)))
+        }
+    }
+
+    impl SequencedSearchProvider {
+        fn new(
+            source: DataSource,
+            outcomes: Vec<Result<Vec<SearchResult>, MarketDataError>>,
+        ) -> Self {
+            Self {
+                source,
+                outcomes: Mutex::new(outcomes.into()),
+                calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl InstrumentSearch for SequencedSearchProvider {
+        async fn search(&self, _: &str) -> Result<Vec<SearchResult>, MarketDataError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.outcomes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .pop_front()
+                .expect("unexpected extra search call")
+        }
+    }
+
+    #[async_trait]
+    impl QuoteSnapshots for SequencedSearchProvider {
+        async fn snapshots(&self, _: &[Instrument]) -> Result<Vec<Quote>, MarketDataError> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[async_trait]
+    impl ChartHistory for SequencedSearchProvider {
+        async fn history(
+            &self,
+            _: &Instrument,
+            _: ChartPeriod,
+        ) -> Result<Vec<Candle>, MarketDataError> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[async_trait]
+    impl QuoteSubscription for SequencedSearchProvider {
+        async fn subscribe(&self, _: &[Instrument]) -> Result<QuoteStream, MarketDataError> {
+            Err(MarketDataError {
+                kind: MarketDataErrorKind::Unavailable,
+                message: format!("{:?} stream unavailable in test", self.source),
+                retry_after: None,
+            })
+        }
     }
 
     impl FakeProvider {
@@ -2439,6 +3383,83 @@ mod tests {
         }
     }
 
+    struct FlakyRepository {
+        fail_state: std::sync::atomic::AtomicBool,
+        fail_cache: std::sync::atomic::AtomicBool,
+        state_saves: AtomicUsize,
+        cache_saves: AtomicUsize,
+    }
+
+    impl FlakyRepository {
+        fn failing() -> Self {
+            Self {
+                fail_state: std::sync::atomic::AtomicBool::new(true),
+                fail_cache: std::sync::atomic::AtomicBool::new(true),
+                state_saves: AtomicUsize::new(0),
+                cache_saves: AtomicUsize::new(0),
+            }
+        }
+
+        fn recover_state(&self) {
+            self.fail_state.store(false, Ordering::SeqCst);
+        }
+
+        fn recover_cache(&self) {
+            self.fail_cache.store(false, Ordering::SeqCst);
+        }
+    }
+
+    impl StateRepository for FlakyRepository {
+        fn load_state(&self) -> Result<PersistedState, PersistenceError> {
+            Ok(PersistedState::starter())
+        }
+
+        fn save_state(&self, _: &PersistedState) -> Result<(), PersistenceError> {
+            self.state_saves.fetch_add(1, Ordering::SeqCst);
+            if self.fail_state.load(Ordering::SeqCst) {
+                Err(PersistenceError::Io(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "/private/state.json must never reach the UI",
+                )))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn load_cache(&self) -> Result<CachedMarketState, PersistenceError> {
+            Ok(CachedMarketState::default())
+        }
+
+        fn save_cache(&self, _: &CachedMarketState) -> Result<(), PersistenceError> {
+            self.cache_saves.fetch_add(1, Ordering::SeqCst);
+            if self.fail_cache.load(Ordering::SeqCst) {
+                Err(PersistenceError::Io(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "/private/cache.json must never reach the UI",
+                )))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    fn assert_persistence_event(
+        events: &super::RuntimeEvents,
+        expected_category: PersistenceCategory,
+        expected_result: PersistenceResult,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let event = events.recv_blocking().expect("persistence event");
+            if let RuntimeEvent::PersistenceCompleted { category, result } = event {
+                assert_eq!(category, expected_category);
+                assert_eq!(result, expected_result);
+                return;
+            }
+            assert!(Instant::now() < deadline, "persistence event deadline");
+        }
+    }
+
     fn fill_ordinary_queue(runtime: &RuntimeHandle, instrument: &Instrument) {
         let mut generations = kabu_core::Generation::default();
         for _ in 0..10_000 {
@@ -2476,6 +3497,14 @@ mod tests {
             instrument: Instrument::crypto("BTC", "USDT", "Bitcoin").expect("BTC"),
             source: DataSource::Binance,
             venue_label: "Binance".into(),
+        }
+    }
+
+    fn crypto_result(base: &str, quote: &str) -> SearchResult {
+        SearchResult {
+            instrument: Instrument::crypto(base, quote, "Crypto").expect("crypto"),
+            source: DataSource::Binance,
+            venue_label: "Binance Spot".into(),
         }
     }
 }

@@ -1,6 +1,9 @@
 use kabu_app::{
     app_model::{AppModel, AppModelError, ChartAvailability, clamp_window_size_to_display},
-    runtime::{ProviderWarning, RuntimeCommand, RuntimeEvent, RuntimeHandle},
+    runtime::{
+        PersistenceCategory, PersistenceResult, ProviderWarning, RuntimeCommand, RuntimeEvent,
+        RuntimeHandle,
+    },
 };
 use kabu_core::{
     CachedMarketState, Candle, ChartPeriod, ChartRequestKey, DataSource, Freshness, Instrument,
@@ -224,6 +227,47 @@ fn persistence_failure_keeps_the_action_and_enqueues_a_warning() {
 }
 
 #[test]
+fn live_persistence_failures_are_category_safe_bounded_and_clear_on_matching_success() {
+    let mut model = AppModel::new(
+        PersistedState::starter(),
+        CachedMarketState::default(),
+        fake_runtime(),
+    );
+
+    for _ in 0..300 {
+        model.apply_runtime_event(RuntimeEvent::PersistenceCompleted {
+            category: PersistenceCategory::State,
+            result: PersistenceResult::Failed,
+        });
+        model.apply_runtime_event(RuntimeEvent::PersistenceCompleted {
+            category: PersistenceCategory::MarketCache,
+            result: PersistenceResult::Failed,
+        });
+    }
+
+    assert_eq!(model.warnings().len(), 2);
+    assert!(model.warnings()[0].message.contains("settings"));
+    assert!(model.warnings()[1].message.contains("cached market data"));
+    let rendered = format!("{:?}", model.warnings());
+    assert!(!rendered.contains("/private/"));
+    assert!(!rendered.contains("raw IO"));
+    assert!(!rendered.contains("market-data work"));
+
+    model.apply_runtime_event(RuntimeEvent::PersistenceCompleted {
+        category: PersistenceCategory::State,
+        result: PersistenceResult::Saved,
+    });
+    assert_eq!(model.warnings().len(), 1);
+    assert!(model.warnings()[0].message.contains("cached market data"));
+
+    model.apply_runtime_event(RuntimeEvent::PersistenceCompleted {
+        category: PersistenceCategory::MarketCache,
+        result: PersistenceResult::Saved,
+    });
+    assert!(model.warnings().is_empty());
+}
+
+#[test]
 fn search_waits_exactly_250_milliseconds() {
     let runtime = RuntimeHandle::default();
     let mut model = AppModel::new(
@@ -302,6 +346,143 @@ fn current_search_completion_replaces_results_and_provider_warning() {
     assert_eq!(model.search().results(), &[nvda_result()]);
     assert_eq!(model.search().provider_warnings(), &[warning]);
     assert!(!model.search().is_loading());
+}
+
+#[test]
+fn failed_provider_retry_retains_good_results_then_merges_recovery_and_clears_warning() {
+    let runtime = RuntimeHandle::default();
+    let mut model = AppModel::new(
+        PersistedState::starter(),
+        CachedMarketState::default(),
+        runtime.clone(),
+    );
+    let generation = model.begin_search("btc");
+    model.apply_search_results(
+        generation,
+        vec![nvda_result()],
+        vec![ProviderWarning {
+            source: DataSource::Binance,
+            kind: MarketDataErrorKind::Unavailable,
+            message: "Binance search is temporarily unavailable.".into(),
+        }],
+    );
+
+    model.retry_search_provider(DataSource::Binance);
+
+    assert_eq!(model.search().results(), &[nvda_result()]);
+    assert!(matches!(
+        runtime.recorded_commands().last(),
+        Some(RuntimeCommand::RetrySearchProvider {
+            generation: retry_generation,
+            query,
+            source: DataSource::Binance,
+        }) if *retry_generation == generation && query == "btc"
+    ));
+
+    model.apply_runtime_event(RuntimeEvent::SearchProviderCompleted {
+        generation,
+        source: DataSource::Binance,
+        results: vec![btc_result()],
+        warning: None,
+    });
+    assert_eq!(model.search().results().len(), 2);
+    assert!(
+        model
+            .search()
+            .results()
+            .iter()
+            .any(|result| result == &nvda_result())
+    );
+    assert!(
+        model
+            .search()
+            .results()
+            .iter()
+            .any(|result| result == &btc_result())
+    );
+    assert!(model.search().provider_warnings().is_empty());
+}
+
+#[test]
+fn stale_provider_retry_cannot_overwrite_a_new_query_and_dual_failure_is_an_outage() {
+    let mut model = AppModel::new(
+        PersistedState::starter(),
+        CachedMarketState::default(),
+        fake_runtime(),
+    );
+    let old = model.begin_search("btc-private-query");
+    model.apply_search_results(
+        old,
+        Vec::new(),
+        vec![
+            ProviderWarning {
+                source: DataSource::Yahoo,
+                kind: MarketDataErrorKind::Unavailable,
+                message: "Yahoo search is temporarily unavailable.".into(),
+            },
+            ProviderWarning {
+                source: DataSource::Binance,
+                kind: MarketDataErrorKind::Timeout,
+                message: "Binance search is temporarily unavailable.".into(),
+            },
+        ],
+    );
+    assert_eq!(
+        model.search().terminal_error(),
+        Some("Both market-data providers are temporarily unavailable.")
+    );
+    let visible_errors = format!(
+        "{:?} {:?}",
+        model.search().provider_warnings(),
+        model.search().terminal_error()
+    );
+    assert!(!visible_errors.contains("btc-private-query"));
+
+    let current = model.begin_search("nvda");
+    assert!(!model.search().provider_retryable(DataSource::Yahoo));
+    assert!(!model.search().provider_retryable(DataSource::Binance));
+    model.apply_search_results(current, vec![nvda_result()], Vec::new());
+    model.apply_runtime_event(RuntimeEvent::SearchProviderCompleted {
+        generation: old,
+        source: DataSource::Binance,
+        results: vec![btc_result()],
+        warning: None,
+    });
+
+    assert_eq!(model.search().query(), "nvda");
+    assert_eq!(model.search().results(), &[nvda_result()]);
+}
+
+#[test]
+fn closing_search_rejects_a_late_provider_retry_completion() {
+    let mut model = AppModel::new(
+        PersistedState::starter(),
+        CachedMarketState::default(),
+        fake_runtime(),
+    );
+    let generation = model.begin_search("btc");
+    model.apply_search_results(
+        generation,
+        vec![nvda_result()],
+        vec![ProviderWarning {
+            source: DataSource::Binance,
+            kind: MarketDataErrorKind::Timeout,
+            message: "Crypto search is temporarily unavailable.".into(),
+        }],
+    );
+    model.retry_search_provider(DataSource::Binance);
+
+    model.cancel_pending_search();
+    model.apply_runtime_event(RuntimeEvent::SearchProviderCompleted {
+        generation,
+        source: DataSource::Binance,
+        results: vec![btc_result()],
+        warning: None,
+    });
+
+    assert!(model.search().query().is_empty());
+    assert!(model.search().results().is_empty());
+    assert!(!model.search().provider_retryable(DataSource::Binance));
 }
 
 #[test]
@@ -1130,6 +1311,37 @@ fn initial_hidden_probe_dispatches_even_when_model_already_desires_hidden() {
         runtime.recorded_commands().as_slice(),
         [RuntimeCommand::SetVisible(false)]
     ));
+}
+
+#[test]
+fn visible_reconciliation_marks_quotes_loading_until_each_provider_outcome_arrives() {
+    let mut model = AppModel::new(
+        PersistedState::starter(),
+        CachedMarketState::default(),
+        fake_runtime(),
+    );
+    let aapl = InstrumentId::equity("AAPL", Some("NASDAQ")).expect("AAPL");
+    let btc = InstrumentId::crypto("BTC", "USDT").expect("BTC/USDT");
+
+    model.set_visible_at(true, ts(1_000));
+
+    assert!(model.quote_is_loading(&aapl));
+    assert!(model.quote_is_loading(&btc));
+    model.apply_runtime_event_at(
+        RuntimeEvent::Quotes(vec![cached_quote(aapl.clone(), 100.0, 99.0)]),
+        ts(1_001),
+    );
+    model.apply_runtime_event(RuntimeEvent::QuoteError {
+        instrument_ids: vec![btc.clone()],
+        error: MarketDataError {
+            kind: MarketDataErrorKind::Unavailable,
+            message: "private provider body".into(),
+            retry_after: None,
+        },
+    });
+
+    assert!(!model.quote_is_loading(&aapl));
+    assert!(!model.quote_is_loading(&btc));
 }
 
 #[test]

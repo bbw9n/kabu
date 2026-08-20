@@ -27,6 +27,10 @@ pub fn rank_search_results(query: &str, results: Vec<SearchResult>) -> Vec<Searc
         search_rank(&query, &left.instrument)
             .cmp(&search_rank(&query, &right.instrument))
             .then_with(|| {
+                crypto_quote_tiebreak(&query, &left.instrument)
+                    .cmp(&crypto_quote_tiebreak(&query, &right.instrument))
+            })
+            .then_with(|| {
                 left.instrument
                     .id
                     .canonical_symbol()
@@ -34,6 +38,23 @@ pub fn rank_search_results(query: &str, results: Vec<SearchResult>) -> Vec<Searc
             })
     });
     unique
+}
+
+fn crypto_quote_tiebreak(query: &str, instrument: &Instrument) -> (u8, u8) {
+    match &instrument.id {
+        InstrumentId::Crypto { base, quote } if base == query => (0, common_quote_rank(quote)),
+        _ => (1, 0),
+    }
+}
+
+fn common_quote_rank(quote: &str) -> u8 {
+    match quote {
+        "USDT" => 0,
+        "USDC" => 1,
+        "BTC" => 2,
+        "ETH" => 3,
+        _ => 4,
+    }
 }
 
 fn prefers_source(candidate: &SearchResult, current: &SearchResult) -> bool {
@@ -141,6 +162,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn base_crypto_matches_use_common_quote_priority_before_canonical_order() {
+        let ranked = rank_search_results(
+            "btc",
+            vec![
+                crypto_result("BTC", "TRY"),
+                crypto_result("BTC", "ETH"),
+                crypto_result("BTC", "USDC"),
+                crypto_result("ETH", "BTC"),
+                crypto_result("BTC", "USDT"),
+            ],
+        );
+
+        assert_eq!(
+            ranked
+                .iter()
+                .map(|entry| entry.instrument.id.canonical_symbol())
+                .collect::<Vec<_>>(),
+            vec!["BTC/USDT", "BTC/USDC", "BTC/ETH", "BTC/TRY", "ETH/BTC"]
+        );
+        assert!(Instrument::crypto("BTC", "BTC", "Impossible").is_err());
+    }
+
     fn apple_btc_name() -> SearchResult {
         result(
             Instrument::equity("AAPL", Some("NASDAQ"), "BTC Holdings Apple", "USD")
@@ -185,5 +229,13 @@ mod tests {
             source,
             venue_label: "fixture".into(),
         }
+    }
+
+    fn crypto_result(base: &str, quote: &str) -> SearchResult {
+        result(
+            Instrument::crypto(base, quote, format!("{base} {quote}").as_str())
+                .expect("instrument"),
+            DataSource::Binance,
+        )
     }
 }

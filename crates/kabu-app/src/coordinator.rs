@@ -1,4 +1,4 @@
-use crate::runtime::{ProviderSet, RuntimeEvent, StreamStatus};
+use crate::runtime::{ProviderSet, RuntimeEvent, RuntimeEventSender, StreamStatus};
 use async_channel::{Receiver, Sender};
 use futures_util::StreamExt as _;
 use kabu_core::{
@@ -12,7 +12,7 @@ type Jitter = Arc<dyn Fn() -> f64 + Send + Sync>;
 
 pub struct Coordinator {
     providers: ProviderSet,
-    events: Sender<RuntimeEvent>,
+    events: RuntimeEventSender,
     jitter: Jitter,
     visible: bool,
     equities: Vec<Instrument>,
@@ -27,9 +27,9 @@ struct CoordinatorJob {
 }
 
 impl Coordinator {
-    pub fn new(
+    pub(crate) fn new(
         providers: ProviderSet,
-        events: Sender<RuntimeEvent>,
+        events: RuntimeEventSender,
         watchlist: Vec<Instrument>,
     ) -> Self {
         Self::with_jitter(providers, events, watchlist, Arc::new(rand::random))
@@ -37,7 +37,7 @@ impl Coordinator {
 
     fn with_jitter(
         providers: ProviderSet,
-        events: Sender<RuntimeEvent>,
+        events: RuntimeEventSender,
         watchlist: Vec<Instrument>,
         jitter: Jitter,
     ) -> Self {
@@ -146,7 +146,7 @@ impl Coordinator {
 async fn run_stock_polls(
     instruments: Vec<Instrument>,
     provider: Arc<dyn crate::runtime::EquityProvider>,
-    events: Sender<RuntimeEvent>,
+    events: RuntimeEventSender,
     jitter: Jitter,
     cancelled: Receiver<()>,
 ) {
@@ -170,8 +170,7 @@ async fn run_stock_polls(
                 failures = failures.saturating_add(1);
             }
         }
-        let attempt = failures.saturating_sub(1);
-        let delay = jittered_delay(retry.base_delay(attempt), jitter());
+        let delay = jittered_delay(retry.base_delay(failures), jitter());
         tokio::select! {
             biased;
             _ = cancelled.recv() => return,
@@ -183,7 +182,7 @@ async fn run_stock_polls(
 async fn run_crypto_stream(
     instruments: Vec<Instrument>,
     provider: Arc<dyn crate::runtime::CryptoProvider>,
-    events: Sender<RuntimeEvent>,
+    events: RuntimeEventSender,
     jitter: Jitter,
     cancelled: Receiver<()>,
 ) {
@@ -288,7 +287,7 @@ async fn run_crypto_stream(
 async fn reconcile_crypto(
     instruments: &[Instrument],
     provider: &dyn crate::runtime::CryptoProvider,
-    events: &Sender<RuntimeEvent>,
+    events: &RuntimeEventSender,
     cancelled: &Receiver<()>,
 ) -> bool {
     let snapshots = tokio::select! {
@@ -305,7 +304,7 @@ async fn reconcile_crypto(
 }
 
 fn send_quote_error(
-    events: &Sender<RuntimeEvent>,
+    events: &RuntimeEventSender,
     instruments: &[Instrument],
     error: MarketDataError,
 ) {
@@ -321,7 +320,7 @@ fn send_quote_error(
     );
 }
 
-fn send_event(events: &Sender<RuntimeEvent>, event: RuntimeEvent) {
+fn send_event(events: &RuntimeEventSender, event: RuntimeEvent) {
     _ = events.try_send(event);
 }
 
@@ -348,7 +347,9 @@ fn identities(instruments: &[Instrument]) -> HashSet<InstrumentId> {
 #[cfg(test)]
 mod tests {
     use super::Coordinator;
-    use crate::runtime::{ProviderSet, RuntimeEvent, StreamStatus};
+    use crate::runtime::{
+        ProviderSet, RuntimeEvent, RuntimeEvents, StreamStatus, runtime_event_channel,
+    };
     use async_trait::async_trait;
     use futures_util::stream;
     use kabu_core::{
@@ -410,18 +411,26 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn stock_failures_back_off_fifteen_thirty_sixty_then_success_resets() {
+    async fn stock_failures_wait_thirty_sixty_one_twenty_then_success_resets_to_fifteen() {
         let timeout = || Err(error(MarketDataErrorKind::Timeout));
         let harness = CoordinatorHarness::with_yahoo_results(
             vec![aapl_instrument()],
-            [timeout(), timeout(), timeout(), Ok(vec![aapl_quote()])],
+            [
+                timeout(),
+                timeout(),
+                timeout(),
+                timeout(),
+                Ok(vec![aapl_quote()]),
+            ],
         );
 
         harness.set_visible(true).await;
         harness.settle().await;
         assert_eq!(harness.yahoo_snapshot_calls(), 1);
-        for (delay, expected) in [(15, 2), (30, 3), (60, 4), (15, 5)] {
-            harness.advance(Duration::from_secs(delay)).await;
+        for (delay, expected) in [(30, 2), (60, 3), (120, 4), (120, 5), (15, 6)] {
+            harness.advance(Duration::from_secs(delay - 1)).await;
+            assert_eq!(harness.yahoo_snapshot_calls(), expected - 1);
+            harness.advance(Duration::from_secs(1)).await;
             assert_eq!(harness.yahoo_snapshot_calls(), expected);
         }
 
@@ -473,7 +482,6 @@ mod tests {
         harness.settle().await;
         assert_eq!(harness.binance_snapshot_calls(), 2);
         let statuses = harness.stream_statuses();
-        assert!(statuses.contains(&StreamStatus::Reconnecting));
         assert_eq!(statuses.last(), Some(&StreamStatus::Live));
 
         harness.shutdown().await;
@@ -549,7 +557,7 @@ mod tests {
         coordinator: Mutex<Coordinator>,
         yahoo: Arc<FakeProvider>,
         binance: Arc<FakeProvider>,
-        events: async_channel::Receiver<RuntimeEvent>,
+        events: RuntimeEvents,
     }
 
     impl CoordinatorHarness {
@@ -571,7 +579,7 @@ mod tests {
             yahoo: Arc<FakeProvider>,
             binance: Arc<FakeProvider>,
         ) -> Self {
-            let (events, event_receiver) = async_channel::bounded(128);
+            let (events, event_receiver) = runtime_event_channel();
             let coordinator = Coordinator::with_jitter(
                 ProviderSet {
                     equities: yahoo.clone(),

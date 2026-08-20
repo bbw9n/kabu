@@ -72,7 +72,6 @@ pub struct AppShell {
     _bounds_subscription: Subscription,
     _action_target_subscription: Subscription,
     _search_subscription: Subscription,
-    _runtime_event_forwarder: Task<()>,
     _runtime_event_task: Task<()>,
     visibility: VisibilityTracker<Box<dyn VisibilityProbe>>,
     _visibility_task: Task<()>,
@@ -141,16 +140,8 @@ impl AppShell {
             },
         );
         let runtime_events = model.read(cx).runtime().events();
-        let (main_event_sender, main_events) = async_channel::bounded(32);
-        let runtime_event_forwarder = cx.background_spawn(async move {
-            while let Ok(event) = runtime_events.recv().await {
-                if main_event_sender.send(event).await.is_err() {
-                    break;
-                }
-            }
-        });
         let runtime_event_task = cx.spawn(async move |shell, cx| {
-            while let Ok(event) = main_events.recv().await {
+            while let Ok(event) = runtime_events.recv().await {
                 if cx
                     .update(|cx| {
                         if let Some(shell) = shell.upgrade() {
@@ -218,8 +209,41 @@ impl AppShell {
                 return true;
             };
             let runtime = model.read(cx).runtime().clone();
-            if runtime.is_shutdown_complete() {
-                return true;
+            if let Some(outcome) = runtime.shutdown_outcome() {
+                model.update(cx, |model, cx| {
+                    model.apply_shutdown_outcome(outcome);
+                    cx.notify();
+                });
+                if outcome.is_success() {
+                    return true;
+                }
+                if close_started.swap(true, Ordering::SeqCst) {
+                    return false;
+                }
+                let mut async_window = window.to_async(cx);
+                let retry_runtime = runtime.clone();
+                let retry =
+                    cx.background_spawn(async move { retry_runtime.retry_shutdown_persistence() });
+                let retry_model = close_model.clone();
+                let retry_started = close_started.clone();
+                cx.spawn(async move |_| {
+                    let outcome = retry.await;
+                    _ = async_window.update(|window, cx| {
+                        if let Some(model) = retry_model.upgrade() {
+                            model.update(cx, |model, cx| {
+                                model.apply_shutdown_outcome(outcome);
+                                cx.notify();
+                            });
+                        }
+                        if outcome.is_success() {
+                            window.remove_window();
+                        } else {
+                            retry_started.store(false, Ordering::SeqCst);
+                        }
+                    });
+                })
+                .detach();
+                return false;
             }
             if close_started.swap(true, Ordering::SeqCst) {
                 return false;
@@ -231,20 +255,42 @@ impl AppShell {
                 model.begin_flush_and_shutdown();
                 cx.notify();
             });
-            if runtime.is_shutdown_complete() {
-                return true;
+            if let Some(outcome) = runtime.shutdown_outcome() {
+                model.update(cx, |model, cx| {
+                    model.apply_shutdown_outcome(outcome);
+                    cx.notify();
+                });
+                if outcome.is_success() {
+                    return true;
+                }
+                close_started.store(false, Ordering::SeqCst);
+                return false;
             }
             let mut async_window = window.to_async(cx);
+            let outcome_model = close_model.clone();
+            let outcome_started = close_started.clone();
             let shutdown_wait = cx.background_spawn(async move {
                 loop {
-                    if runtime.wait_for_shutdown(Duration::from_secs(2)) {
-                        break;
+                    if let Some(outcome) = runtime.wait_for_shutdown(Duration::from_secs(2)) {
+                        return outcome;
                     }
                 }
             });
             cx.spawn(async move |_| {
-                shutdown_wait.await;
-                _ = async_window.update(|window, _| window.remove_window());
+                let outcome = shutdown_wait.await;
+                _ = async_window.update(|window, cx| {
+                    if let Some(model) = outcome_model.upgrade() {
+                        model.update(cx, |model, cx| {
+                            model.apply_shutdown_outcome(outcome);
+                            cx.notify();
+                        });
+                    }
+                    if outcome.is_success() {
+                        window.remove_window();
+                    } else {
+                        outcome_started.store(false, Ordering::SeqCst);
+                    }
+                });
             })
             .detach();
             false
@@ -265,7 +311,6 @@ impl AppShell {
             _bounds_subscription: bounds_subscription,
             _action_target_subscription: action_target_subscription,
             _search_subscription: search_subscription,
-            _runtime_event_forwarder: runtime_event_forwarder,
             _runtime_event_task: runtime_event_task,
             visibility,
             _visibility_task: visibility_timer,

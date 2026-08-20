@@ -1,6 +1,6 @@
 use kabu_app::views::{
     ChartDirection, QuoteDetailData, freshness_label, normalize_closes, series_direction,
-    watchlist_quote_status,
+    single_point_marker, watchlist_quote_status,
 };
 use kabu_core::{Candle, DataSource, Freshness, Instrument, MarketState, Quote};
 use std::time::Duration;
@@ -16,7 +16,11 @@ fn flat_series_is_centered_and_finite() {
 #[test]
 fn empty_and_single_series_are_safe() {
     assert!(normalize_closes(&[]).is_empty());
-    assert_eq!(normalize_closes(&[candle(10.0)]), vec![(0.5, 0.5)]);
+    let point = normalize_closes(&[candle(10.0)]);
+    assert_eq!(point, vec![(0.5, 0.5)]);
+    assert_eq!(single_point_marker(&point), Some((0.5, 0.5)));
+    assert_eq!(single_point_marker(&[]), None);
+    assert_eq!(single_point_marker(&[(0.0, 0.5), (1.0, 0.5)]), None);
 }
 
 #[test]

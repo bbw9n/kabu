@@ -1,6 +1,6 @@
 use gpui::{AppContext as _, Entity, Modifiers, WindowAppearance, px, size};
 use gpui_component::{Root, WindowExt as _};
-use kabu_app::runtime::{RuntimeCommand, RuntimeHandle};
+use kabu_app::runtime::{ProviderSet, RuntimeCommand, RuntimeEvent, RuntimeHandle, StreamStatus};
 use kabu_app::{
     app_model::AppModel,
     commands::{
@@ -10,16 +10,25 @@ use kabu_app::{
     theme::{KabuTheme, ThemeSelection},
     views::{
         AppShell, DEFAULT_WINDOW_HEIGHT, DEFAULT_WINDOW_WIDTH, MIN_WINDOW_HEIGHT, MIN_WINDOW_WIDTH,
-        SIDEBAR_WIDTH, SelectedQuoteAvailability,
+        SIDEBAR_WIDTH, SelectedQuoteAvailability, search_result_provenance,
     },
 };
 use kabu_core::{
-    CachedChart, CachedMarketState, Candle, ChartPeriod, ChartRequestKey, DataSource, Instrument,
-    InstrumentId, MarketDataError, MarketDataErrorKind, MarketState, PersistedState, Quote,
+    CachedChart, CachedMarketState, Candle, ChartHistory, ChartPeriod, ChartRequestKey, DataSource,
+    Instrument, InstrumentId, InstrumentSearch, MarketDataError, MarketDataErrorKind, MarketState,
+    PersistedState, PersistenceError, Quote, QuoteSnapshots, QuoteStream, QuoteSubscription,
     SearchResult, StateRepository, ThemePreference,
 };
 use kabu_data::{JsonRepository, Recovery};
-use std::{cell::RefCell, rc::Rc, sync::Arc, time::Duration};
+use std::{
+    cell::RefCell,
+    rc::Rc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
 #[test]
 fn window_shell_uses_approved_geometry() {
@@ -193,13 +202,13 @@ fn selected_quote_header_distinguishes_missing_and_loading_without_zero_values(
         let header = shell.selected_quote_header(cx);
         assert_eq!(header.price, "—");
         assert_eq!(header.change, "—");
-        assert_eq!(header.status, "No cached quote");
-        assert_eq!(header.availability, SelectedQuoteAvailability::Unavailable);
+        assert_eq!(header.status, "Loading quote");
+        assert_eq!(header.availability, SelectedQuoteAvailability::Loading);
     });
 
     model.update(cx, |model, cx| {
         let selected = model.selected_identity().expect("selection").clone();
-        model.set_quote_loading(selected, true);
+        model.set_quote_loading(selected, false);
         cx.notify();
     });
 
@@ -207,8 +216,8 @@ fn selected_quote_header_distinguishes_missing_and_loading_without_zero_values(
         let header = shell.selected_quote_header(cx);
         assert_eq!(header.price, "—");
         assert_eq!(header.change, "—");
-        assert_eq!(header.status, "Loading quote");
-        assert_eq!(header.availability, SelectedQuoteAvailability::Loading);
+        assert_eq!(header.status, "No cached quote");
+        assert_eq!(header.availability, SelectedQuoteAvailability::Unavailable);
     });
 }
 
@@ -427,6 +436,125 @@ fn quote_error_renders_an_inline_retry_that_dispatches_a_snapshot(cx: &mut gpui:
 }
 
 #[gpui::test]
+fn gpui_event_pressure_applies_final_quote_status_and_typed_error_without_deadlock(
+    cx: &mut gpui::TestAppContext,
+) {
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        kabu_app::commands::init(cx);
+    });
+    let runtime = RuntimeHandle::default();
+    let model = cx.update(|cx| {
+        cx.new(|_| {
+            AppModel::new(
+                PersistedState::starter(),
+                CachedMarketState::default(),
+                runtime.clone(),
+            )
+        })
+    });
+    let aapl = InstrumentId::equity("AAPL", Some("NASDAQ")).expect("AAPL");
+    let btc = InstrumentId::crypto("BTC", "USDT").expect("BTC/USDT");
+    let window_model = model.clone();
+    let (_, window_cx) = cx
+        .add_window_view(move |window, cx| AppShell::with_model(window_model.clone(), window, cx));
+
+    runtime.publish_recorded_event(RuntimeEvent::StreamStatus(StreamStatus::Connecting));
+    runtime.publish_recorded_event(RuntimeEvent::StreamStatus(StreamStatus::Live));
+    for index in 0..300 {
+        let mut quote = cached_quote(aapl.clone(), 100.0 + index as f64, 99.0);
+        quote.provider_timestamp += chrono::Duration::milliseconds(index as i64);
+        runtime.publish_recorded_event(RuntimeEvent::Quotes(vec![quote]));
+    }
+    runtime.publish_recorded_event(RuntimeEvent::QuoteError {
+        instrument_ids: vec![btc.clone()],
+        error: MarketDataError {
+            kind: MarketDataErrorKind::Disconnected,
+            message: "private websocket frame".into(),
+            retry_after: None,
+        },
+    });
+    runtime.publish_recorded_event(RuntimeEvent::StreamStatus(StreamStatus::Reconnecting));
+    runtime.publish_recorded_event(RuntimeEvent::StreamStatus(StreamStatus::Paused));
+    window_cx.run_until_parked();
+
+    model.read_with(window_cx, |model, _| {
+        assert_eq!(model.quote(&aapl).expect("final AAPL quote").last, 399.0);
+        assert_eq!(model.stream_status(), StreamStatus::Paused);
+        assert_eq!(
+            model.quote_error_message(&btc),
+            Some("The live market-data connection was interrupted. Reconnecting…")
+        );
+    });
+    assert!(window_cx.simulate_close());
+    window_cx.run_until_parked();
+    assert!(runtime.is_shutdown());
+}
+
+#[gpui::test]
+fn final_persistence_failure_vetoes_close_and_second_close_retries_successfully(
+    cx: &mut gpui::TestAppContext,
+) {
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        kabu_app::commands::init(cx);
+    });
+    let repository = Arc::new(CloseRetryRepository::default());
+    let provider = Arc::new(IdleProvider);
+    let runtime = RuntimeHandle::start(
+        ProviderSet {
+            equities: provider.clone(),
+            crypto: provider,
+        },
+        repository.clone(),
+    )
+    .expect("live runtime");
+    let model = cx.update(|cx| {
+        cx.new(|_| {
+            AppModel::new(
+                PersistedState::starter(),
+                CachedMarketState::default(),
+                runtime.clone(),
+            )
+        })
+    });
+    let window_model = model.clone();
+    let (_, window_cx) = cx
+        .add_window_view(move |window, cx| AppShell::with_model(window_model.clone(), window, cx));
+
+    assert!(!window_cx.simulate_close());
+    let first = runtime
+        .wait_for_shutdown(Duration::from_secs(2))
+        .expect("first shutdown outcome");
+    assert!(!first.is_success());
+    window_cx.run_until_parked();
+    assert_eq!(
+        window_cx.windows().len(),
+        1,
+        "failed save keeps window visible"
+    );
+    model.read_with(window_cx, |model, _| {
+        let warning = model
+            .warnings()
+            .iter()
+            .find(|warning| warning.message.contains("settings"))
+            .expect("state persistence warning");
+        assert!(!warning.message.contains("/private/close-state.json"));
+    });
+
+    assert!(!window_cx.simulate_close());
+    window_cx.run_until_parked();
+    assert_eq!(repository.state_saves.load(Ordering::SeqCst), 3);
+    assert!(
+        runtime
+            .shutdown_outcome()
+            .expect("retry outcome")
+            .is_success()
+    );
+    assert!(window_cx.windows().is_empty());
+}
+
+#[gpui::test]
 fn window_geometry_persists_after_exactly_250_milliseconds(cx: &mut gpui::TestAppContext) {
     cx.update(|cx| {
         gpui_component::init(cx);
@@ -597,6 +725,80 @@ fn command_k_opens_search_and_focuses_its_input(cx: &mut gpui::TestAppContext) {
         assert!(focus.is_focused(window));
     });
     assert!(cx.debug_bounds("search-overlay").is_some());
+}
+
+#[test]
+fn search_result_provenance_names_asset_venue_pair_and_provider_exactly() {
+    let equity = aapl_result();
+    let crypto = SearchResult {
+        instrument: Instrument::crypto("btc", "usdt", "Bitcoin").expect("BTC/USDT"),
+        source: DataSource::Binance,
+        venue_label: "spot".into(),
+    };
+
+    assert_eq!(
+        search_result_provenance(&equity),
+        "US Equity · NASDAQ · Yahoo"
+    );
+    assert_eq!(
+        search_result_provenance(&crypto),
+        "Crypto · BTC/USDT · Binance Spot"
+    );
+}
+
+#[gpui::test]
+fn provider_warning_renders_an_inline_retry_for_only_the_failed_provider(
+    cx: &mut gpui::TestAppContext,
+) {
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        kabu_app::commands::init(cx);
+    });
+    let runtime = RuntimeHandle::default();
+    let model = cx.update(|cx| {
+        cx.new(|_| {
+            let mut model = AppModel::new(
+                PersistedState::starter(),
+                CachedMarketState::default(),
+                runtime.clone(),
+            );
+            let generation = model.begin_search("a");
+            model.apply_search_results(
+                generation,
+                vec![aapl_result()],
+                vec![kabu_app::runtime::ProviderWarning {
+                    source: DataSource::Binance,
+                    kind: MarketDataErrorKind::Unavailable,
+                    message: "Crypto search is temporarily unavailable.".into(),
+                }],
+            );
+            model
+        })
+    });
+    let (_, cx) = cx.add_window_view(move |window, cx| {
+        let shell = cx.new(|cx| AppShell::with_model(model.clone(), window, cx));
+        Root::new(shell, window, cx)
+    });
+
+    cx.simulate_keystrokes("cmd-k");
+    cx.refresh().expect("render provider warning");
+
+    assert!(cx.debug_bounds("search-result-provenance-0").is_some());
+    assert!(cx.debug_bounds("search-provider-retry-binance").is_some());
+    assert!(cx.debug_bounds("search-provider-retry-yahoo").is_none());
+    let retry = cx
+        .debug_bounds("search-provider-retry-binance")
+        .expect("Binance retry button bounds");
+    cx.simulate_click(retry.center(), Modifiers::none());
+
+    assert!(matches!(
+        runtime.recorded_commands().last(),
+        Some(RuntimeCommand::RetrySearchProvider {
+            query,
+            source: DataSource::Binance,
+            ..
+        }) if query == "a"
+    ));
 }
 
 #[gpui::test]
@@ -839,5 +1041,72 @@ fn nvda_result() -> SearchResult {
         instrument: Instrument::equity("NVDA", Some("NASDAQ"), "NVIDIA", "USD").expect("NVDA"),
         source: DataSource::Yahoo,
         venue_label: "NASDAQ".into(),
+    }
+}
+
+struct IdleProvider;
+
+#[async_trait::async_trait]
+impl InstrumentSearch for IdleProvider {
+    async fn search(&self, _: &str) -> Result<Vec<SearchResult>, MarketDataError> {
+        Ok(Vec::new())
+    }
+}
+
+#[async_trait::async_trait]
+impl QuoteSnapshots for IdleProvider {
+    async fn snapshots(&self, _: &[Instrument]) -> Result<Vec<Quote>, MarketDataError> {
+        Ok(Vec::new())
+    }
+}
+
+#[async_trait::async_trait]
+impl ChartHistory for IdleProvider {
+    async fn history(
+        &self,
+        _: &Instrument,
+        _: ChartPeriod,
+    ) -> Result<Vec<Candle>, MarketDataError> {
+        Ok(Vec::new())
+    }
+}
+
+#[async_trait::async_trait]
+impl QuoteSubscription for IdleProvider {
+    async fn subscribe(&self, _: &[Instrument]) -> Result<QuoteStream, MarketDataError> {
+        Err(MarketDataError {
+            kind: MarketDataErrorKind::Unavailable,
+            message: "idle provider".into(),
+            retry_after: None,
+        })
+    }
+}
+
+#[derive(Default)]
+struct CloseRetryRepository {
+    state_saves: AtomicUsize,
+}
+
+impl StateRepository for CloseRetryRepository {
+    fn load_state(&self) -> Result<PersistedState, PersistenceError> {
+        Ok(PersistedState::starter())
+    }
+
+    fn save_state(&self, _: &PersistedState) -> Result<(), PersistenceError> {
+        if self.state_saves.fetch_add(1, Ordering::SeqCst) < 2 {
+            Err(PersistenceError::Io(std::io::Error::other(
+                "/private/close-state.json",
+            )))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn load_cache(&self) -> Result<CachedMarketState, PersistenceError> {
+        Ok(CachedMarketState::default())
+    }
+
+    fn save_cache(&self, _: &CachedMarketState) -> Result<(), PersistenceError> {
+        Ok(())
     }
 }

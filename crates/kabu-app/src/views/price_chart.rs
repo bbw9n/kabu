@@ -1,6 +1,6 @@
 use gpui::{
-    App, InteractiveElement as _, IntoElement, ParentElement as _, PathBuilder, RenderOnce,
-    SharedString, Styled as _, Window, canvas, div, point, px,
+    App, Bounds, InteractiveElement as _, IntoElement, ParentElement as _, PathBuilder, RenderOnce,
+    SharedString, Styled as _, Window, canvas, div, point, px, quad, size,
 };
 use gpui_component::ActiveTheme as _;
 use kabu_core::Candle;
@@ -71,6 +71,13 @@ pub fn series_direction(candles: &[Candle]) -> Option<ChartDirection> {
     })
 }
 
+pub fn single_point_marker(points: &[(f32, f32)]) -> Option<(f32, f32)> {
+    match points {
+        [point] => Some(*point),
+        _ => None,
+    }
+}
+
 #[derive(IntoElement)]
 pub struct PriceChart {
     candles: Vec<Candle>,
@@ -95,6 +102,7 @@ impl PriceChart {
 impl RenderOnce for PriceChart {
     fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
         let points = normalize_closes(&self.candles);
+        let marker = single_point_marker(&points);
         let direction = series_direction(&self.candles).unwrap_or(ChartDirection::Gain);
         let signal_color = match direction {
             ChartDirection::Gain => cx.theme().success,
@@ -131,6 +139,24 @@ impl RenderOnce for PriceChart {
                                 )
                             })
                             .collect::<Vec<_>>();
+
+                        if let Some((x, y)) = marker {
+                            let center = point(
+                                bounds.left() + bounds.size.width * x,
+                                bounds.top() + bounds.size.height * y,
+                            );
+                            window.paint_quad(quad(
+                                Bounds::new(
+                                    point(center.x - px(3.0), center.y - px(3.0)),
+                                    size(px(6.0), px(6.0)),
+                                ),
+                                px(3.0),
+                                signal_color,
+                                px(0.0),
+                                gpui::transparent_black(),
+                                Default::default(),
+                            ));
+                        }
 
                         if chart_points.len() >= 2 {
                             let mut fill = PathBuilder::fill();
