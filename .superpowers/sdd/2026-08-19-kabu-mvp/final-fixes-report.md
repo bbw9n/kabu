@@ -504,3 +504,112 @@ committed.
   change public provider contracts or persisted schema.
 - Public endpoints remain externally variable. The three contracts were green
   in this run but have no availability SLA.
+
+# Fix Round 3/5
+
+Implementation commit: `ccdf5061a5c7528a9c526ebc94a45c68afb1678f`
+(`fix: retain current history under pressure`). This round started from
+`7de277facdbd9ca1d3a5ce70b66246acc44ede30`. The progress ledger was not
+modified.
+
+## Scope and deterministic history overflow
+
+The history-family mailbox still has a fixed capacity of 32 semantic slots,
+but admission is now ranked globally across distinct chart request keys. At
+capacity, it retains the 32 terminal events with the highest `GenerationId`.
+The lowest generation is the eviction candidate; arrival sequence breaks ties
+within that generation. An incoming lower-generation terminal is discarded,
+an incoming higher-generation terminal evicts the lowest retained generation,
+and an equal-generation terminal is admitted by evicting the oldest equal
+arrival. Therefore the newest terminal wins an equal-generation tie.
+
+The existing same-key generation guard remains in force before family
+admission, so a late lower generation can never replace a newer terminal for
+the same chart request. The sequence counter retains its checked overflow
+behavior. Quote and typed-error families keep their previous oldest-arrival
+policy, and fixed status, persistence, catalog, and search slots remain
+protected. The mailbox does not inspect AppModel selection state.
+
+## Strict RED evidence
+
+Two regressions were written and observed failing against the prior
+implementation before production code changed:
+
+- `current_selected_history_survives_lower_generation_distinct_key_pressure`
+  published the current selected chart terminal first, then 40 stale
+  lower-generation distinct-key completions while consumption was stalled.
+  Draining through the real AppModel failed with `left: Loading, right: Ready`,
+  proving oldest-arrival eviction lost the current terminal.
+- `history_capacity_retains_highest_generations_and_newest_equal_arrival`
+  filled all 32 history slots, then exercised lower, equal, and higher incoming
+  generations. The old policy evicted by arrival and failed with
+  `expected retained history key`.
+
+## GREEN regression evidence
+
+Focused runs proved both success and failure paths through the actual model:
+
+- a selected current terminal published before 40 lower-generation distinct
+  keys reaches `Ready` after success and `Unavailable` after failure, rather
+  than remaining `Loading`;
+- history cardinality remains exactly at or below 32 under pressure;
+- a lower-generation candidate is discarded without disturbing retained
+  entries;
+- a newer candidate evicts the globally lowest retained generation;
+- for equal generations, the newest arrival is retained and the oldest equal
+  arrival is evicted;
+- draining removes every history slot and pending sequence;
+- the existing same-key generation guard, distinct-family pressure test, and
+  watchlist/search cleanup regression remain green.
+
+## Exact final gates
+
+The requested commands ran in order against the committed implementation:
+
+| Order | Command | Result |
+| --- | --- | --- |
+| 1 | `cargo fmt --check` | Pass, exit 0 |
+| 2 | `cargo clippy --workspace --all-targets -- -D warnings` | Pass, exit 0 |
+| 3 | `cargo test --workspace` | Pass, 239 passed, 0 failed, 3 ignored |
+| 4 | `cargo build --release -p kabu-app` | Pass, exit 0 |
+| 5 | `git diff --check` | Pass, exit 0 |
+
+Hermetic breakdown:
+
+- `kabu-app` library: 55 passed;
+- AppModel integration: 65 passed;
+- GPUI interactions: 26 passed;
+- chart/price: 9 passed;
+- startup failure: 4 passed;
+- `kabu-core`: 35 passed;
+- `kabu-data` library: 12 passed;
+- Binance REST: 9 passed;
+- Binance stream: 11 passed;
+- persistence integration: 4 passed;
+- Yahoo integration: 9 passed;
+- live market: 3 ignored by default;
+- binary/doc-test targets: 0 tests.
+
+The hermetic suite increased from 237 to 239 passes. Clippy remains clean
+under `-D warnings`; the only build notice is the pre-existing
+future-compatibility warning for transitive `block v0.1.6`.
+
+## Live/native scope and self-review
+
+No public-provider or native launch rerun was warranted: this round changes
+only in-memory history-terminal admission and unit regressions. It does not
+touch provider adapters, network requests, AppKit, rendering, startup,
+persistence, persisted schemas, or unsafe code. The release application build
+is green, and prior live/native evidence remains applicable.
+
+The mailbox remains structurally bounded: its wake channel is one, history is
+32 entries, all other family caps and fixed protected slots are unchanged, and
+the comparison scans no more than one bounded family. No await, send, job, or
+cancellation path changed, so the existing non-deadlocking shutdown and hide
+invariants remain intact. No provider body, query text, path, raw I/O error, or
+other sensitive content was added.
+
+The only architectural assumption is the existing one: `GenerationId` is a
+monotonic runtime request domain, as generated by AppModel. If a future design
+introduces independent, non-comparable generation domains into the same
+history mailbox, it must add a domain identifier or revise the global ranking.
