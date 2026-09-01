@@ -37,6 +37,7 @@ tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "time", "
 tokio-util = { version = "0.7", features = ["rt"] }
 tokio-tungstenite = { version = "0.30.0", features = ["rustls-tls-native-roots", "url"] }
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
 url = "2"
 wiremock = "0.6.5"
 zeroize = { version = "1", features = ["derive"] }

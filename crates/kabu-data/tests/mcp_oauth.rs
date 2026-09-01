@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    io::{self, Write},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -15,6 +16,8 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
 };
+use tracing::{Level, instrument::WithSubscriber};
+use tracing_subscriber::fmt::MakeWriter;
 use url::Url;
 use wiremock::{
     Mock, MockServer, Request, ResponseTemplate,
@@ -22,6 +25,55 @@ use wiremock::{
 };
 
 const SERVICE: &str = "com.kabu.mcp.oauth";
+const PRIVATE_AUTHORIZATION_CODE: &str = "kabu-private-authorization-code-8317";
+const PRIVATE_ACCESS_TOKEN: &str = "kabu-private-access-token-9428";
+const PRIVATE_REFRESH_TOKEN: &str = "kabu-private-refresh-token-0539";
+
+#[derive(Clone)]
+struct TraceCapture {
+    bytes: Arc<Mutex<Vec<u8>>>,
+}
+
+impl TraceCapture {
+    fn new() -> Self {
+        Self {
+            bytes: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn contents(&self) -> String {
+        String::from_utf8(self.bytes.lock().expect("trace capture lock").clone())
+            .expect("trace capture is UTF-8")
+    }
+}
+
+struct TraceCaptureWriter {
+    bytes: Arc<Mutex<Vec<u8>>>,
+}
+
+impl Write for TraceCaptureWriter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.bytes
+            .lock()
+            .map_err(|_| io::Error::other("trace capture lock failed"))?
+            .extend_from_slice(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'writer> MakeWriter<'writer> for TraceCapture {
+    type Writer = TraceCaptureWriter;
+
+    fn make_writer(&'writer self) -> Self::Writer {
+        TraceCaptureWriter {
+            bytes: self.bytes.clone(),
+        }
+    }
+}
 
 #[derive(Default)]
 struct MemorySecretStore {
@@ -227,9 +279,9 @@ async fn oauth_fixture() -> (BrokerOAuth, Arc<AtomicUsize>, Arc<MemorySecretStor
         .respond_with(move |_request: &Request| {
             token_counter.fetch_add(1, Ordering::SeqCst);
             ResponseTemplate::new(200).set_body_json(json!({
-                "access_token": "access-secret",
+                "access_token": PRIVATE_ACCESS_TOKEN,
                 "token_type": "bearer",
-                "refresh_token": "refresh-secret",
+                "refresh_token": PRIVATE_REFRESH_TOKEN,
                 "expires_in": 3600
             }))
         })
@@ -301,6 +353,41 @@ async fn oauth_callback_exchanges_code_and_saves_credentials() {
 
     assert_eq!(exchange_counter.load(Ordering::SeqCst), 1);
     assert!(stored.is_some());
+}
+
+#[tokio::test]
+async fn successful_oauth_exchange_keeps_secrets_out_of_debug_tracing() {
+    let (oauth, exchange_counter, _secrets) = oauth_fixture().await;
+    let pending = oauth.begin_authorization().await.expect("begin");
+    let state = authorization_state(&pending.authorization_url);
+    let callback = format!("code={PRIVATE_AUTHORIZATION_CODE}&state={state}");
+    let capture = TraceCapture::new();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(Level::DEBUG)
+        .without_time()
+        .with_writer(capture.clone())
+        .finish();
+
+    oauth
+        .complete_authorization(pending, &callback)
+        .with_subscriber(subscriber)
+        .await
+        .expect("complete authorization");
+    let traces = capture.contents();
+
+    assert_eq!(exchange_counter.load(Ordering::SeqCst), 1);
+    assert!(
+        !traces.contains(PRIVATE_AUTHORIZATION_CODE),
+        "authorization code entered debug tracing"
+    );
+    assert!(
+        !traces.contains(PRIVATE_ACCESS_TOKEN),
+        "access token entered debug tracing"
+    );
+    assert!(
+        !traces.contains(PRIVATE_REFRESH_TOKEN),
+        "refresh token entered debug tracing"
+    );
 }
 
 #[tokio::test]

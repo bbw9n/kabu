@@ -1,4 +1,4 @@
-use std::{net::Ipv4Addr, sync::Arc, time::Duration};
+use std::{future::Future, net::Ipv4Addr, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use kabu_core::{Brokerage, BrokerageError, BrokerageErrorKind};
@@ -14,6 +14,7 @@ use tokio::{
     task::spawn_blocking,
     time::Instant,
 };
+use tracing::{instrument::WithSubscriber, subscriber::NoSubscriber};
 use url::{Url, form_urlencoded};
 use zeroize::Zeroizing;
 
@@ -24,6 +25,13 @@ const CALLBACK_TTL: Duration = Duration::from_secs(600);
 const MAX_REQUEST_LINE_BYTES: usize = 8 * 1024;
 const CALLBACK_SUCCESS_PAGE: &str = "<!doctype html><title>Kabu authorization</title><p>Authorization received. You can return to Kabu.</p>";
 const CALLBACK_FAILURE_PAGE: &str = "<!doctype html><title>Kabu authorization</title><p>Authorization failed. Return to Kabu and try again.</p>";
+
+async fn suppress_oauth_tracing<F>(future: F) -> F::Output
+where
+    F: Future,
+{
+    future.with_subscriber(NoSubscriber::default()).await
+}
 
 /// OAuth credentials scoped to one brokerage account in secure storage.
 #[derive(Clone)]
@@ -296,10 +304,12 @@ impl BrokerOAuth {
         let (callback, redirect_uri) = OneShotCallback::bind().await?;
         let started_at = Instant::now();
         let mut manager = self.authorization_manager().await?;
-        let resolution = manager.resolve_metadata().await.map_err(map_auth_error)?;
+        let resolution = suppress_oauth_tracing(manager.resolve_metadata())
+            .await
+            .map_err(map_auth_error)?;
         manager.set_metadata(resolution.metadata);
         let request = AuthorizationRequest::new(redirect_uri.as_str()).with_client_name("Kabu");
-        let session = AuthorizationSession::new(manager, request)
+        let session = suppress_oauth_tracing(AuthorizationSession::new(manager, request))
             .await
             .map_err(|(_, _)| brokerage_error(BrokerageErrorKind::AuthorizationDenied))?;
         let authorization_url = Url::parse(session.get_authorization_url())
@@ -334,15 +344,13 @@ impl BrokerOAuth {
             return Err(brokerage_error(BrokerageErrorKind::AuthorizationDenied));
         }
 
-        pending
-            .session
-            .handle_callback_with_issuer(
-                &callback.code,
-                &callback.state,
-                callback.issuer.as_deref(),
-            )
-            .await
-            .map_err(|_| brokerage_error(BrokerageErrorKind::AuthorizationDenied))?;
+        suppress_oauth_tracing(pending.session.handle_callback_with_issuer(
+            &callback.code,
+            &callback.state,
+            callback.issuer.as_deref(),
+        ))
+        .await
+        .map_err(|_| brokerage_error(BrokerageErrorKind::AuthorizationDenied))?;
         Ok(())
     }
 
@@ -355,10 +363,11 @@ impl BrokerOAuth {
 
     pub async fn authorized_http_client(&self) -> Result<AuthorizedHttpClient, BrokerageError> {
         let mut manager = self.authorization_manager().await?;
-        let resolution = manager.resolve_metadata().await.map_err(map_auth_error)?;
+        let resolution = suppress_oauth_tracing(manager.resolve_metadata())
+            .await
+            .map_err(map_auth_error)?;
         manager.set_metadata(resolution.metadata);
-        let initialized = manager
-            .initialize_from_store()
+        let initialized = suppress_oauth_tracing(manager.initialize_from_store())
             .await
             .map_err(map_auth_error)?;
         if !initialized {
@@ -368,7 +377,7 @@ impl BrokerOAuth {
     }
 
     async fn authorization_manager(&self) -> Result<AuthorizationManager, BrokerageError> {
-        let mut manager = AuthorizationManager::new(self.endpoint.clone())
+        let mut manager = suppress_oauth_tracing(AuthorizationManager::new(self.endpoint.clone()))
             .await
             .map_err(map_auth_error)?;
         manager.set_credential_store((*self.credentials).clone());
