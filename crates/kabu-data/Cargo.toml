@@ -13,14 +13,20 @@ futures-util.workspace = true
 kabu-core = { path = "../kabu-core" }
 reqwest.workspace = true
 rand.workspace = true
+rmcp.workspace = true
 rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 tokio-tungstenite.workspace = true
 url.workspace = true
+zeroize.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3.7"
 [dev-dependencies]
 rustls = { workspace = true, features = ["ring"] }
 wiremock.workspace = true
