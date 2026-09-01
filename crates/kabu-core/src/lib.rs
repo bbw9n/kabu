@@ -1,3 +1,4 @@
+pub mod brokerage;
 pub mod freshness;
 pub mod instrument;
 pub mod provider;
@@ -7,11 +8,15 @@ pub mod search;
 pub mod state;
 pub mod watchlist;
 
+pub use brokerage::{
+    Brokerage, BrokerageAccount, BrokerageAccountId, BrokerageAssetKind, BrokerageConnectionState,
+    BrokerageError, BrokerageErrorKind, BrokeragePosition, PortfolioSnapshot,
+};
 pub use freshness::{Freshness, classify_freshness};
 pub use instrument::{AssetClass, Instrument, InstrumentError, InstrumentId};
 pub use provider::{
     ChartHistory, InstrumentSearch, MarketDataError, MarketDataErrorKind, PersistenceError,
-    QuoteSnapshots, QuoteStream, QuoteSubscription, StateRepository,
+    PortfolioProvider, QuoteSnapshots, QuoteStream, QuoteSubscription, StateRepository,
 };
 pub use quote::{Candle, ChartPeriod, DataSource, MarketState, Quote};
 pub use retry::{RetryPolicy, jittered_delay};

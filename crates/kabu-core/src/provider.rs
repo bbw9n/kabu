@@ -1,5 +1,6 @@
 use crate::{
-    CachedMarketState, Candle, ChartPeriod, Instrument, PersistedState, Quote, SearchResult,
+    Brokerage, BrokerageError, CachedMarketState, Candle, ChartPeriod, Instrument, PersistedState,
+    PortfolioSnapshot, Quote, SearchResult,
 };
 use std::{
     future::Future,
@@ -108,6 +109,13 @@ pub trait ChartHistory: Send + Sync {
 #[async_trait::async_trait]
 pub trait QuoteSubscription: Send + Sync {
     async fn subscribe(&self, instruments: &[Instrument]) -> Result<QuoteStream, MarketDataError>;
+}
+
+#[async_trait::async_trait]
+pub trait PortfolioProvider: Send + Sync {
+    fn brokerage(&self) -> Brokerage;
+    async fn refresh_portfolio(&self) -> Result<PortfolioSnapshot, BrokerageError>;
+    async fn disconnect(&self) -> Result<(), BrokerageError>;
 }
 
 pub trait StateRepository: Send + Sync {
