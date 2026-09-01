@@ -39,7 +39,7 @@ impl fmt::Debug for BrokerageAccountId {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct BrokerageAccount {
     pub brokerage: Brokerage,
     pub id: BrokerageAccountId,
@@ -50,7 +50,13 @@ pub struct BrokerageAccount {
     pub buying_power: Option<Decimal>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+impl fmt::Debug for BrokerageAccount {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("BrokerageAccount([REDACTED])")
+    }
+}
+
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct BrokeragePosition {
     pub brokerage: Brokerage,
     pub account_id: BrokerageAccountId,
@@ -65,12 +71,24 @@ pub struct BrokeragePosition {
     pub currency: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+impl fmt::Debug for BrokeragePosition {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("BrokeragePosition([REDACTED])")
+    }
+}
+
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct PortfolioSnapshot {
     pub brokerage: Brokerage,
     pub accounts: Vec<BrokerageAccount>,
     pub positions: Vec<BrokeragePosition>,
     pub received_at: DateTime<Utc>,
+}
+
+impl fmt::Debug for PortfolioSnapshot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PortfolioSnapshot([REDACTED])")
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -194,4 +212,68 @@ fn brokerage_errors_expose_only_fixed_safe_messages() {
         "Connect this broker to load its portfolio."
     );
     assert!(!format!("{error:?}").contains("token"));
+}
+
+#[test]
+fn brokerage_account_debug_redacts_portfolio_values() {
+    let account = BrokerageAccount {
+        brokerage: Brokerage::Robinhood,
+        id: BrokerageAccountId::new("RH-123456789"),
+        display_label: "Robinhood ••••6789".into(),
+        base_currency: "USD".into(),
+        equity: Some(Decimal::new(123_456, 2)),
+        cash: Some(Decimal::new(7_890, 2)),
+        buying_power: Some(Decimal::new(5_000, 2)),
+    };
+
+    let debug = format!("{account:?}");
+    assert!(!debug.contains("1234.56"));
+    assert!(!debug.contains("78.90"));
+    assert!(!debug.contains("50.00"));
+}
+
+#[test]
+fn brokerage_position_debug_redacts_portfolio_values() {
+    let position = BrokeragePosition {
+        brokerage: Brokerage::Longbridge,
+        account_id: BrokerageAccountId::new("LB-987654321"),
+        native_symbol: "SECRET".into(),
+        display_name: "Confidential position".into(),
+        asset_kind: BrokerageAssetKind::Equity,
+        instrument: None,
+        quantity: Decimal::new(42_000, 3),
+        average_cost: Some(Decimal::new(321_000, 2)),
+        market_value: Some(Decimal::new(654_000, 2)),
+        unrealized_pnl: Some(Decimal::new(333_000, 2)),
+        currency: "USD".into(),
+    };
+
+    let debug = format!("{position:?}");
+    assert!(!debug.contains("SECRET"));
+    assert!(!debug.contains("42.000"));
+    assert!(!debug.contains("3210.00"));
+    assert!(!debug.contains("6540.00"));
+    assert!(!debug.contains("3330.00"));
+}
+
+#[test]
+fn portfolio_snapshot_debug_redacts_its_contents() {
+    let snapshot = PortfolioSnapshot {
+        brokerage: Brokerage::Robinhood,
+        accounts: vec![BrokerageAccount {
+            brokerage: Brokerage::Robinhood,
+            id: BrokerageAccountId::new("RH-246801357"),
+            display_label: "Robinhood ••••1357".into(),
+            base_currency: "USD".into(),
+            equity: Some(Decimal::new(9_999_999, 2)),
+            cash: None,
+            buying_power: None,
+        }],
+        positions: vec![],
+        received_at: Utc::now(),
+    };
+
+    let debug = format!("{snapshot:?}");
+    assert!(!debug.contains("246801357"));
+    assert!(!debug.contains("99999.99"));
 }
