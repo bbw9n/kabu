@@ -6,19 +6,26 @@ use std::{
     time::Duration,
 };
 
+use futures_util::{StreamExt, future::ready, stream::BoxStream};
 use kabu_core::{Brokerage, BrokerageError, BrokerageErrorKind};
+use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderName, HeaderValue, WWW_AUTHENTICATE};
 use rmcp::{
     RoleClient, ServiceError, ServiceExt,
-    model::{CallToolRequestParams, CallToolResult, Tool},
+    model::{
+        CallToolRequestParams, CallToolResult, ClientJsonRpcMessage, ClientRequest, ErrorData,
+        JsonRpcMessage, ServerJsonRpcMessage, Tool,
+    },
     service::RunningService,
     transport::{
         auth::AuthClient,
         streamable_http_client::{
-            StreamableHttpClientTransport, StreamableHttpClientTransportConfig,
+            AuthRequiredError, SseError, StreamableHttpClient, StreamableHttpClientTransport,
+            StreamableHttpClientTransportConfig, StreamableHttpError, StreamableHttpPostResponse,
         },
     },
 };
 use serde_json::{Map, Value, json};
+use sse_stream::{Sse, SseStream};
 use url::Url;
 
 const MAX_RAW_RESULT_BYTES: usize = 1_048_576;
@@ -32,6 +39,11 @@ const WRITE_ORIENTED_FRAGMENTS: &[&str] = &[
     "update", "delete",
 ];
 const DESCRIPTIVE_SCHEMA_KEYS: &[&str] = &["title", "description", "examples", "$comment"];
+const HEADER_SESSION_ID: &str = "Mcp-Session-Id";
+const HEADER_LAST_EVENT_ID: &str = "Last-Event-Id";
+const HEADER_PROTOCOL_VERSION: &str = "MCP-Protocol-Version";
+const EVENT_STREAM_MIME_TYPE: &str = "text/event-stream";
+const JSON_MIME_TYPE: &str = "application/json";
 
 /// A compile-time role for one approved, read-only broker operation.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -40,6 +52,49 @@ pub enum ReadCapability {
     PortfolioSummary,
     EquityPositions,
     CryptoPositions,
+}
+
+/// Closed, capability-specific inputs accepted by the read-only session.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ReadCapabilityInput {
+    Accounts { currency: Option<String> },
+    PortfolioSummary,
+    EquityPositions,
+    CryptoPositions,
+}
+
+impl ReadCapabilityInput {
+    fn capability(&self) -> ReadCapability {
+        match self {
+            Self::Accounts { .. } => ReadCapability::Accounts,
+            Self::PortfolioSummary => ReadCapability::PortfolioSummary,
+            Self::EquityPositions => ReadCapability::EquityPositions,
+            Self::CryptoPositions => ReadCapability::CryptoPositions,
+        }
+    }
+
+    fn into_arguments(
+        self,
+        schema: InputSchema,
+    ) -> Result<Option<Map<String, Value>>, BrokerageError> {
+        match (self, schema) {
+            (Self::Accounts { currency: None }, InputSchema::EmptyObject)
+            | (Self::Accounts { currency: None }, InputSchema::OptionalString("currency"))
+            | (Self::PortfolioSummary, InputSchema::EmptyObject)
+            | (Self::EquityPositions, InputSchema::EmptyObject)
+            | (Self::CryptoPositions, InputSchema::EmptyObject) => Ok(None),
+            (
+                Self::Accounts {
+                    currency: Some(currency),
+                },
+                InputSchema::OptionalString("currency"),
+            ) => Ok(Some(Map::from_iter([(
+                "currency".to_string(),
+                Value::String(currency),
+            )]))),
+            _ => Err(incompatible_schema()),
+        }
+    }
 }
 
 /// The exact provider tool names accepted for one connected session.
@@ -221,6 +276,15 @@ fn incompatible_schema() -> BrokerageError {
     BrokerageError::new(BrokerageErrorKind::IncompatibleToolSchema)
 }
 
+fn capability_descriptor(
+    brokerage: Brokerage,
+    capability: ReadCapability,
+) -> Option<&'static CapabilityDescriptor> {
+    CAPABILITY_DESCRIPTORS
+        .iter()
+        .find(|descriptor| descriptor.brokerage == brokerage && descriptor.capability == capability)
+}
+
 /// JSON returned by a broker tool after all Kabu wire bounds have passed.
 #[derive(Debug)]
 pub struct BoundedToolResult(Value);
@@ -384,15 +448,498 @@ fn malformed_response() -> BrokerageError {
     BrokerageError::new(BrokerageErrorKind::MalformedResponse)
 }
 
+/// Reqwest MCP backend that rejects oversized bodies before protocol decoding.
+#[derive(Clone)]
+pub struct BrokerMcpHttpClient {
+    inner: reqwest::Client,
+}
+
+impl BrokerMcpHttpClient {
+    pub fn new(inner: reqwest::Client) -> Self {
+        Self { inner }
+    }
+
+    async fn send(
+        &self,
+        request: reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response, StreamableHttpError<io::Error>> {
+        request
+            .send()
+            .await
+            .map_err(|error| StreamableHttpError::Client(http_io_error(&error)))
+    }
+
+    fn apply_headers(
+        &self,
+        mut request: reqwest::RequestBuilder,
+        custom_headers: MapHeaders,
+    ) -> Result<reqwest::RequestBuilder, StreamableHttpError<io::Error>> {
+        for (name, value) in custom_headers {
+            if is_reserved_header(&name)
+                && !name.as_str().eq_ignore_ascii_case(HEADER_PROTOCOL_VERSION)
+            {
+                return Err(StreamableHttpError::ReservedHeaderConflict(
+                    name.to_string(),
+                ));
+            }
+            request = request.header(name, value);
+        }
+        Ok(request)
+    }
+
+    fn authenticate(
+        mut request: reqwest::RequestBuilder,
+        auth_token: Option<String>,
+    ) -> reqwest::RequestBuilder {
+        if let Some(token) = auth_token {
+            request = request.bearer_auth(token);
+        }
+        request
+    }
+}
+
+impl Default for BrokerMcpHttpClient {
+    fn default() -> Self {
+        Self::new(reqwest::Client::new())
+    }
+}
+
+type MapHeaders = std::collections::HashMap<HeaderName, HeaderValue>;
+
+impl StreamableHttpClient for BrokerMcpHttpClient {
+    type Error = io::Error;
+
+    async fn post_message(
+        &self,
+        uri: Arc<str>,
+        message: ClientJsonRpcMessage,
+        session_id: Option<Arc<str>>,
+        auth_token: Option<String>,
+        custom_headers: MapHeaders,
+    ) -> Result<StreamableHttpPostResponse, StreamableHttpError<Self::Error>> {
+        self.post_message_with_max_sse_event_size(
+            uri,
+            message,
+            session_id,
+            auth_token,
+            custom_headers,
+            MAX_RAW_RESULT_BYTES,
+        )
+        .await
+    }
+
+    async fn post_message_with_max_sse_event_size(
+        &self,
+        uri: Arc<str>,
+        message: ClientJsonRpcMessage,
+        session_id: Option<Arc<str>>,
+        auth_token: Option<String>,
+        custom_headers: MapHeaders,
+        max_response_bytes: usize,
+    ) -> Result<StreamableHttpPostResponse, StreamableHttpError<Self::Error>> {
+        let session_was_attached = session_id.is_some();
+        let is_control = matches!(
+            message,
+            ClientJsonRpcMessage::Notification(_)
+                | ClientJsonRpcMessage::Response(_)
+                | ClientJsonRpcMessage::Error(_)
+        );
+        let mut request = self
+            .inner
+            .post(uri.as_ref())
+            .header(ACCEPT, [EVENT_STREAM_MIME_TYPE, JSON_MIME_TYPE].join(", "));
+        request = Self::authenticate(request, auth_token);
+        request = self.apply_headers(request, custom_headers)?;
+        if let Some(session_id) = session_id {
+            request = request.header(HEADER_SESSION_ID, session_id.as_ref());
+        }
+        let response = self.send(request.json(&message)).await?;
+        let status = response.status();
+        if let Some(error) = authentication_response_error(&response)? {
+            return Err(error);
+        }
+        if matches!(
+            status,
+            reqwest::StatusCode::ACCEPTED | reqwest::StatusCode::NO_CONTENT
+        ) {
+            return Ok(StreamableHttpPostResponse::Accepted);
+        }
+        if status == reqwest::StatusCode::NOT_FOUND && session_was_attached {
+            return Err(StreamableHttpError::SessionExpired);
+        }
+
+        let content_type = response_content_type(&response);
+        let content_length = response.content_length();
+        let response_session_id = response_session_id(&response);
+        if status.is_success() && content_length == Some(0) && is_control {
+            return Ok(StreamableHttpPostResponse::Accepted);
+        }
+        if !status.is_success() {
+            let body = read_bounded_body(response, max_response_bytes).await?;
+            if content_type
+                .as_deref()
+                .is_some_and(|value| value.as_bytes().starts_with(JSON_MIME_TYPE.as_bytes()))
+                && let Ok(message) = serde_json::from_slice::<ServerJsonRpcMessage>(&body)
+                && matches!(message, JsonRpcMessage::Error(_))
+            {
+                return Ok(StreamableHttpPostResponse::Json(
+                    message,
+                    response_session_id,
+                ));
+            }
+            if let Some(message) = legacy_discover_error(&message, session_was_attached, status) {
+                return Ok(StreamableHttpPostResponse::Json(message, None));
+            }
+            return Err(StreamableHttpError::UnexpectedServerResponse(
+                format!("HTTP {status}").into(),
+            ));
+        }
+        if content_type.as_deref().is_some_and(|value| {
+            value
+                .as_bytes()
+                .starts_with(EVENT_STREAM_MIME_TYPE.as_bytes())
+        }) {
+            return Ok(StreamableHttpPostResponse::Sse(
+                bounded_sse_response(response, max_response_bytes),
+                response_session_id,
+            ));
+        }
+
+        let body = read_bounded_body(response, max_response_bytes).await?;
+        if !content_type
+            .as_deref()
+            .is_some_and(|value| value.as_bytes().starts_with(JSON_MIME_TYPE.as_bytes()))
+        {
+            return Err(StreamableHttpError::UnexpectedContentType(content_type));
+        }
+        let message = serde_json::from_slice(&body)?;
+        Ok(StreamableHttpPostResponse::Json(
+            message,
+            response_session_id,
+        ))
+    }
+
+    async fn delete_session(
+        &self,
+        uri: Arc<str>,
+        session_id: Arc<str>,
+        auth_token: Option<String>,
+        custom_headers: MapHeaders,
+    ) -> Result<(), StreamableHttpError<Self::Error>> {
+        let request = self.inner.delete(uri.as_ref());
+        let mut request = Self::authenticate(request, auth_token);
+        request = self.apply_headers(request, custom_headers)?;
+        request = request.header(HEADER_SESSION_ID, session_id.as_ref());
+        let response = self.send(request).await?;
+        if response.status() == reqwest::StatusCode::METHOD_NOT_ALLOWED {
+            return Ok(());
+        }
+        if let Some(error) = authentication_response_error(&response)? {
+            return Err(error);
+        }
+        if !response.status().is_success() {
+            return Err(StreamableHttpError::UnexpectedServerResponse(
+                format!("HTTP {}", response.status()).into(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn get_stream(
+        &self,
+        uri: Arc<str>,
+        session_id: Option<Arc<str>>,
+        last_event_id: Option<String>,
+        auth_token: Option<String>,
+        custom_headers: MapHeaders,
+    ) -> Result<BoxStream<'static, Result<Sse, SseError>>, StreamableHttpError<Self::Error>> {
+        self.get_stream_with_max_sse_event_size(
+            uri,
+            session_id,
+            last_event_id,
+            auth_token,
+            custom_headers,
+            MAX_RAW_RESULT_BYTES,
+        )
+        .await
+    }
+
+    async fn get_stream_with_max_sse_event_size(
+        &self,
+        uri: Arc<str>,
+        session_id: Option<Arc<str>>,
+        last_event_id: Option<String>,
+        auth_token: Option<String>,
+        custom_headers: MapHeaders,
+        max_event_bytes: usize,
+    ) -> Result<BoxStream<'static, Result<Sse, SseError>>, StreamableHttpError<Self::Error>> {
+        let request = self
+            .inner
+            .get(uri.as_ref())
+            .header(ACCEPT, [EVENT_STREAM_MIME_TYPE, JSON_MIME_TYPE].join(", "));
+        let mut request = Self::authenticate(request, auth_token);
+        request = self.apply_headers(request, custom_headers)?;
+        if let Some(session_id) = session_id {
+            request = request.header(HEADER_SESSION_ID, session_id.as_ref());
+        }
+        if let Some(last_event_id) = last_event_id {
+            request = request.header(HEADER_LAST_EVENT_ID, last_event_id);
+        }
+        let response = self.send(request).await?;
+        if response.status() == reqwest::StatusCode::METHOD_NOT_ALLOWED {
+            return Err(StreamableHttpError::ServerDoesNotSupportSse);
+        }
+        if let Some(error) = authentication_response_error(&response)? {
+            return Err(error);
+        }
+        if !response.status().is_success() {
+            return Err(StreamableHttpError::UnexpectedServerResponse(
+                format!("HTTP {}", response.status()).into(),
+            ));
+        }
+        let content_type = response_content_type(&response);
+        if !content_type.as_deref().is_some_and(|value| {
+            value
+                .as_bytes()
+                .starts_with(EVENT_STREAM_MIME_TYPE.as_bytes())
+                || value.as_bytes().starts_with(JSON_MIME_TYPE.as_bytes())
+        }) {
+            return Err(StreamableHttpError::UnexpectedContentType(content_type));
+        }
+        Ok(bounded_sse_response(response, max_event_bytes))
+    }
+}
+
+fn is_reserved_header(name: &HeaderName) -> bool {
+    [
+        "accept",
+        HEADER_SESSION_ID,
+        HEADER_PROTOCOL_VERSION,
+        HEADER_LAST_EVENT_ID,
+    ]
+    .iter()
+    .any(|reserved| name.as_str().eq_ignore_ascii_case(reserved))
+}
+
+fn http_io_error(error: &reqwest::Error) -> io::Error {
+    let kind = if error.is_timeout() {
+        io::ErrorKind::TimedOut
+    } else {
+        io::ErrorKind::Other
+    };
+    io::Error::new(kind, "broker HTTP request failed")
+}
+
+fn authentication_response_error(
+    response: &reqwest::Response,
+) -> Result<Option<StreamableHttpError<io::Error>>, StreamableHttpError<io::Error>> {
+    if !matches!(
+        response.status(),
+        reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+    ) {
+        return Ok(None);
+    }
+    let Some(header) = response.headers().get(WWW_AUTHENTICATE) else {
+        return Ok(None);
+    };
+    let header = header
+        .to_str()
+        .map_err(|_| StreamableHttpError::UnexpectedServerResponse("invalid auth header".into()))?
+        .to_string();
+    if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+        Ok(Some(StreamableHttpError::AuthRequired(
+            AuthRequiredError::new(header),
+        )))
+    } else {
+        Ok(Some(StreamableHttpError::Client(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "broker rejected the requested scope",
+        ))))
+    }
+}
+
+fn response_content_type(response: &reqwest::Response) -> Option<String> {
+    response
+        .headers()
+        .get(CONTENT_TYPE)
+        .map(|value| String::from_utf8_lossy(value.as_bytes()).to_string())
+}
+
+fn response_session_id(response: &reqwest::Response) -> Option<String> {
+    response
+        .headers()
+        .get(HEADER_SESSION_ID)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string)
+}
+
+async fn read_bounded_body(
+    response: reqwest::Response,
+    max_bytes: usize,
+) -> Result<Vec<u8>, StreamableHttpError<io::Error>> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > max_bytes as u64)
+    {
+        return Err(response_too_large());
+    }
+    let mut bytes = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| StreamableHttpError::Client(http_io_error(&error)))?;
+        if chunk.len() > max_bytes.saturating_sub(bytes.len()) {
+            return Err(response_too_large());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
+fn response_too_large() -> StreamableHttpError<io::Error> {
+    StreamableHttpError::Client(io::Error::new(
+        io::ErrorKind::InvalidData,
+        "broker response exceeds byte limit",
+    ))
+}
+
+fn legacy_discover_error(
+    message: &ClientJsonRpcMessage,
+    session_was_attached: bool,
+    status: reqwest::StatusCode,
+) -> Option<ServerJsonRpcMessage> {
+    if session_was_attached
+        || !status.is_client_error()
+        || matches!(
+            status,
+            reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+        )
+    {
+        return None;
+    }
+    let ClientJsonRpcMessage::Request(request) = message else {
+        return None;
+    };
+    if !matches!(request.request, ClientRequest::DiscoverRequest(_)) {
+        return None;
+    }
+    Some(ServerJsonRpcMessage::error(
+        ErrorData::invalid_request("server/discover rejected", None),
+        Some(request.id.clone()),
+    ))
+}
+
+fn bounded_sse_response(
+    response: reqwest::Response,
+    max_event_bytes: usize,
+) -> BoxStream<'static, Result<Sse, SseError>> {
+    let bytes = response
+        .bytes_stream()
+        .scan(SseByteLimit::new(max_event_bytes), |limit, item| {
+            let next = if limit.failed {
+                None
+            } else {
+                Some(match item {
+                    Ok(chunk) => match limit.observe(&chunk) {
+                        Ok(()) => Ok(chunk),
+                        Err(()) => {
+                            limit.failed = true;
+                            Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "broker SSE event exceeds byte limit",
+                            ))
+                        }
+                    },
+                    Err(error) => {
+                        limit.failed = true;
+                        Err(http_io_error(&error))
+                    }
+                })
+            };
+            ready(next)
+        });
+    SseStream::from_bytes_stream(bytes).boxed()
+}
+
+struct SseByteLimit {
+    max: usize,
+    retained: usize,
+    line: usize,
+    line_is_comment: bool,
+    previous_was_cr: bool,
+    failed: bool,
+}
+
+impl SseByteLimit {
+    fn new(max: usize) -> Self {
+        Self {
+            max,
+            retained: 0,
+            line: 0,
+            line_is_comment: false,
+            previous_was_cr: false,
+            failed: false,
+        }
+    }
+
+    fn observe(&mut self, chunk: &[u8]) -> Result<(), ()> {
+        for byte in chunk {
+            if self.previous_was_cr {
+                self.previous_was_cr = false;
+                if *byte == b'\n' {
+                    continue;
+                }
+            }
+            match byte {
+                b'\r' => {
+                    self.finish_line()?;
+                    self.previous_was_cr = true;
+                }
+                b'\n' => self.finish_line()?,
+                _ => {
+                    if self.line == 0 {
+                        self.line_is_comment = *byte == b':';
+                    }
+                    self.line = self.line.saturating_add(1);
+                    self.check()?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn finish_line(&mut self) -> Result<(), ()> {
+        if self.line == 0 {
+            self.retained = 0;
+        } else if !self.line_is_comment {
+            self.retained = self.retained.saturating_add(self.line).saturating_add(1);
+        }
+        self.line = 0;
+        self.line_is_comment = false;
+        self.check()
+    }
+
+    fn check(&self) -> Result<(), ()> {
+        if self.retained.saturating_add(self.line) > self.max {
+            Err(())
+        } else {
+            Ok(())
+        }
+    }
+}
+
 /// Inputs required to establish one authenticated broker MCP session.
 pub struct BrokerMcpConfig {
     brokerage: Brokerage,
     endpoint: Url,
-    client: AuthClient<reqwest::Client>,
+    client: AuthClient<BrokerMcpHttpClient>,
 }
 
 impl BrokerMcpConfig {
-    pub fn new(brokerage: Brokerage, endpoint: Url, client: AuthClient<reqwest::Client>) -> Self {
+    pub fn new(
+        brokerage: Brokerage,
+        endpoint: Url,
+        client: AuthClient<BrokerMcpHttpClient>,
+    ) -> Self {
         Self {
             brokerage,
             endpoint,
@@ -403,6 +950,7 @@ impl BrokerMcpConfig {
 
 /// A live read-only MCP service whose tool names were resolved at connection time.
 pub struct BrokerMcpSession {
+    brokerage: Brokerage,
     service: RunningService<RoleClient, ()>,
     capabilities: ResolvedCapabilities,
 }
@@ -436,6 +984,7 @@ impl BrokerMcpSession {
         };
 
         Ok(Self {
+            brokerage: config.brokerage,
             service,
             capabilities,
         })
@@ -443,13 +992,17 @@ impl BrokerMcpSession {
 
     pub async fn call_read(
         &self,
-        capability: ReadCapability,
-        arguments: Option<Map<String, Value>>,
+        input: ReadCapabilityInput,
     ) -> Result<BoundedToolResult, BrokerageError> {
+        let capability = input.capability();
         let name = self
             .capabilities
             .get(capability)
             .ok_or_else(incompatible_schema)?;
+        let schema = capability_descriptor(self.brokerage, capability)
+            .map(|descriptor| descriptor.schema)
+            .ok_or_else(incompatible_schema)?;
+        let arguments = input.into_arguments(schema)?;
         let mut request = CallToolRequestParams::new(Cow::Owned(name.to_string()));
         if let Some(arguments) = arguments {
             request = request.with_arguments(arguments);
@@ -475,8 +1028,33 @@ fn map_service_error(error: ServiceError) -> BrokerageError {
         ServiceError::TransportClosed | ServiceError::Cancelled { .. } => {
             BrokerageError::new(BrokerageErrorKind::Disconnected)
         }
+        ServiceError::TransportSend(error) => {
+            BrokerageError::new(classify_transport_error(error.error.as_ref()))
+        }
         _ => unavailable(),
     }
+}
+
+fn classify_transport_error(error: &(dyn std::error::Error + 'static)) -> BrokerageErrorKind {
+    let mut current = Some(error);
+    while let Some(error) = current {
+        if let Some(stream_error) = error.downcast_ref::<StreamableHttpError<io::Error>>() {
+            match stream_error {
+                StreamableHttpError::Client(error) => match error.kind() {
+                    io::ErrorKind::InvalidData => return BrokerageErrorKind::MalformedResponse,
+                    io::ErrorKind::TimedOut => return BrokerageErrorKind::Timeout,
+                    io::ErrorKind::PermissionDenied => return BrokerageErrorKind::Permission,
+                    _ => {}
+                },
+                StreamableHttpError::AuthRequired(_) => {
+                    return BrokerageErrorKind::AuthorizationRequired;
+                }
+                _ => {}
+            }
+        }
+        current = error.source();
+    }
+    BrokerageErrorKind::Unavailable
 }
 
 fn unavailable() -> BrokerageError {

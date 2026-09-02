@@ -17,6 +17,7 @@ rmcp.workspace = true
 rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sse-stream.workspace = true
 thiserror.workspace = true
 tempfile.workspace = true
 tokio.workspace = true

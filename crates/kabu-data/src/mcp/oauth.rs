@@ -20,6 +20,8 @@ use zeroize::Zeroizing;
 
 use crate::{SecretStore, SecretStoreError};
 
+use super::capabilities::BrokerMcpHttpClient;
+
 const KEYCHAIN_SERVICE: &str = "com.kabu.mcp.oauth";
 const CALLBACK_TTL: Duration = Duration::from_secs(600);
 const MAX_REQUEST_LINE_BYTES: usize = 8 * 1024;
@@ -456,9 +458,9 @@ impl BrokerOAuth {
     /// Build the rmcp authentication wrapper used by streamable HTTP sessions.
     pub async fn authorized_transport_client(
         &self,
-    ) -> Result<AuthClient<reqwest::Client>, BrokerageError> {
+    ) -> Result<AuthClient<BrokerMcpHttpClient>, BrokerageError> {
         let manager = self.initialized_authorization_manager().await?;
-        Ok(AuthClient::new(reqwest::Client::new(), manager))
+        Ok(AuthClient::new(BrokerMcpHttpClient::default(), manager))
     }
 
     async fn initialized_authorization_manager(
