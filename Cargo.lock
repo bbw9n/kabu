@@ -3415,6 +3415,7 @@ dependencies = [
  "rand 0.9.5",
  "reqwest",
  "rmcp",
+ "rust_decimal",
  "rustls",
  "security-framework",
  "serde",

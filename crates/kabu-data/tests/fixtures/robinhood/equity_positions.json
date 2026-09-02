@@ -1,0 +1,17 @@
+{
+  "results": [
+    {
+      "account_number": "RH-ABC-1234567890",
+      "symbol": "AAPL",
+      "name": "Apple Inc.",
+      "asset_type": "equity",
+      "quantity": "0",
+      "average_buy_price": null,
+      "unrealized_pl": "0",
+      "currency": "USD",
+      "updated_at": "2026-09-01T12:00:00Z"
+    }
+  ],
+  "next": null,
+  "previous": null
+}

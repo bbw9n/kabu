@@ -14,6 +14,7 @@ kabu-core = { path = "../kabu-core" }
 reqwest.workspace = true
 rand.workspace = true
 rmcp.workspace = true
+rust_decimal.workspace = true
 rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true

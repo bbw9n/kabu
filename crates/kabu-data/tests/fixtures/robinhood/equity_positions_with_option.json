@@ -1,0 +1,54 @@
+{
+  "results": [
+    {
+      "account_number": "RH-ABC-1234567890",
+      "symbol": "AAPL  270115C00200000",
+      "name": "AAPL Jan 15 2027 200 Call",
+      "asset_type": "option",
+      "quantity": "1",
+      "average_buy_price": "12.3456",
+      "market_value": null,
+      "unrealized_pl": null,
+      "currency": "USD",
+      "updated_at": "2026-09-01T12:00:00Z"
+    },
+    {
+      "account_number": "RH-ABC-1234567890",
+      "symbol": "SPY",
+      "name": "SPDR S&P 500 ETF Trust",
+      "asset_type": "fund",
+      "quantity": "2.5",
+      "average_buy_price": "500.00",
+      "market_value": "1250.00",
+      "unrealized_pl": "0",
+      "currency": "USD",
+      "updated_at": "2026-09-01T12:00:00Z"
+    },
+    {
+      "account_number": "RH-ABC-1234567890",
+      "symbol": "USD",
+      "name": "US Dollar",
+      "asset_type": "cash",
+      "quantity": "0",
+      "average_buy_price": null,
+      "market_value": "0",
+      "unrealized_pl": null,
+      "currency": "USD",
+      "updated_at": "2026-09-01T12:00:00Z"
+    },
+    {
+      "account_number": "RH-ABC-1234567890",
+      "symbol": "MYSTERY-ASSET",
+      "name": "Unrecognized broker asset",
+      "asset_type": "structured_note",
+      "quantity": "3",
+      "average_buy_price": null,
+      "market_value": null,
+      "unrealized_pl": null,
+      "currency": "USD",
+      "updated_at": "2026-09-01T12:00:00Z"
+    }
+  ],
+  "next": null,
+  "previous": null
+}

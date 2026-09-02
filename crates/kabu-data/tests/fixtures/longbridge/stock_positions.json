@@ -1,0 +1,29 @@
+{
+  "list": [
+    {
+      "account_channel": null,
+      "stock_info": [
+        {
+          "symbol": "AAPL.US",
+          "symbol_name": "Apple Inc.",
+          "quantity": "12.345678",
+          "available_quantity": "12.345678",
+          "currency": "USD",
+          "cost_price": "192.123456789",
+          "market": "US",
+          "init_quantity": null
+        },
+        {
+          "symbol": "2800.HK",
+          "symbol_name": "Tracker Fund of Hong Kong",
+          "quantity": "0",
+          "available_quantity": "0",
+          "currency": "HKD",
+          "cost_price": "0",
+          "market": "HK",
+          "init_quantity": "0"
+        }
+      ]
+    }
+  ]
+}
