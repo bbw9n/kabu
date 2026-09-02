@@ -11,7 +11,8 @@ use tokio::sync::Mutex;
 use url::Url;
 
 use crate::{
-    BrokerOAuth, BrokerageClient, SecretStore, broker_oauth, malformed_response,
+    BrokerOAuth, BrokerageClient, SecretStore, broker_oauth, disconnect_after_close,
+    malformed_response,
     mcp::{BrokerMcpConfig, BrokerMcpSession, ReadCapabilityInput},
     parse_bounded_decimal, safe_account_label,
 };
@@ -282,10 +283,12 @@ impl PortfolioProvider for LongbridgePortfolioProvider {
     }
 
     async fn disconnect(&self) -> Result<(), BrokerageError> {
-        if let Some(session) = self.session.lock().await.take() {
-            session.close().await?;
-        }
-        self.oauth.disconnect().await
+        let session = self.session.lock().await.take();
+        let close_result = match session {
+            Some(session) => session.close().await,
+            None => Ok(()),
+        };
+        disconnect_after_close(close_result, self.oauth.disconnect()).await
     }
 }
 

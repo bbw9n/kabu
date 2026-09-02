@@ -175,6 +175,63 @@ fn account_display_labels_never_expose_the_raw_identifier() {
 }
 
 #[test]
+fn explicit_position_account_not_in_the_account_page_is_rejected() {
+    let mut equities = fixture("robinhood/equity_positions.json");
+    equities["results"][0]["account_number"] = json!("RH-STALE-0000");
+
+    let error = normalize_robinhood(
+        fixture("robinhood/accounts.json"),
+        fixture("robinhood/portfolio.json"),
+        equities,
+        fixture("robinhood/crypto_positions.json"),
+        fixed_now(),
+    )
+    .expect_err("unknown account must not be assigned to another account");
+
+    assert_eq!(error.kind, BrokerageErrorKind::MalformedResponse);
+}
+
+#[test]
+fn missing_position_account_is_rejected_when_the_account_page_is_ambiguous() {
+    let mut accounts = fixture("robinhood/accounts.json");
+    let mut second = accounts["results"][0].clone();
+    second["account_number"] = json!("RH-SECOND-1234");
+    accounts["results"]
+        .as_array_mut()
+        .expect("results array")
+        .push(second);
+
+    let mut equities = fixture("robinhood/equity_positions.json");
+    equities["results"][0]["account_number"] = Value::Null;
+    let error = normalize_robinhood(
+        accounts,
+        fixture("robinhood/portfolio.json"),
+        equities,
+        fixture("robinhood/crypto_positions.json"),
+        fixed_now(),
+    )
+    .expect_err("ambiguous account assignment must fail");
+
+    assert_eq!(error.kind, BrokerageErrorKind::MalformedResponse);
+}
+
+#[test]
+fn missing_position_account_uses_the_only_available_account() {
+    let mut equities = fixture("robinhood/equity_positions.json");
+    equities["results"][0]["account_number"] = Value::Null;
+    let snapshot = normalize_robinhood(
+        fixture("robinhood/accounts.json"),
+        fixture("robinhood/portfolio.json"),
+        equities,
+        fixture("robinhood/crypto_positions.json"),
+        fixed_now(),
+    )
+    .expect("one account makes a missing position account unambiguous");
+
+    assert_eq!(snapshot.positions[0].account_id, snapshot.accounts[0].id);
+}
+
+#[test]
 fn malformed_decimal_is_a_typed_sanitized_failure() {
     let mut balances = fixture("longbridge/account_balance.json");
     balances[0]["total_cash"] = json!("NaN-secret");

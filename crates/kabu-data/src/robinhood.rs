@@ -11,7 +11,8 @@ use tokio::sync::Mutex;
 use url::Url;
 
 use crate::{
-    BrokerOAuth, BrokerageClient, SecretStore, broker_oauth, malformed_response,
+    BrokerOAuth, BrokerageClient, SecretStore, broker_oauth, disconnect_after_close,
+    malformed_response,
     mcp::{BrokerMcpConfig, BrokerMcpSession, ReadCapabilityInput},
     parse_bounded_decimal, parse_optional_decimal, safe_account_label,
 };
@@ -117,19 +118,17 @@ pub fn normalize_robinhood(
         });
     }
 
-    let default_account = normalized_accounts[0].id.clone();
     let mut positions = Vec::with_capacity(equities.results.len() + crypto.results.len());
     for position in equities.results.into_iter().chain(crypto.results) {
-        let account_id = position
-            .account_number
-            .as_deref()
-            .and_then(|id| {
-                normalized_accounts
-                    .iter()
-                    .find(|account| account.id.as_str() == id)
-            })
-            .map(|account| account.id.clone())
-            .unwrap_or_else(|| default_account.clone());
+        let account_id = match position.account_number.as_deref() {
+            Some(id) => normalized_accounts
+                .iter()
+                .find(|account| account.id.as_str() == id)
+                .map(|account| account.id.clone())
+                .ok_or_else(malformed_response)?,
+            None if normalized_accounts.len() == 1 => normalized_accounts[0].id.clone(),
+            None => return Err(malformed_response()),
+        };
         positions.push(normalize_position(position, account_id)?);
     }
     Ok(PortfolioSnapshot {
@@ -295,10 +294,12 @@ impl PortfolioProvider for RobinhoodPortfolioProvider {
     }
 
     async fn disconnect(&self) -> Result<(), BrokerageError> {
-        if let Some(session) = self.session.lock().await.take() {
-            session.close().await?;
-        }
-        self.oauth.disconnect().await
+        let session = self.session.lock().await.take();
+        let close_result = match session {
+            Some(session) => session.close().await,
+            None => Ok(()),
+        };
+        disconnect_after_close(close_result, self.oauth.disconnect()).await
     }
 }
 

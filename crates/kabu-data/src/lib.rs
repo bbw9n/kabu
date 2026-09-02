@@ -9,6 +9,7 @@ mod robinhood;
 mod secret_store;
 mod yahoo;
 
+use std::future::Future;
 use std::sync::Arc;
 
 use kabu_core::{BrokerageError, BrokerageErrorKind, PortfolioProvider};
@@ -109,4 +110,45 @@ fn broker_oauth(
         endpoint,
         Arc::new(BrokerCredentialStore::new(brokerage, secrets)),
     )
+}
+
+async fn disconnect_after_close(
+    close_result: Result<(), BrokerageError>,
+    clear_credentials: impl Future<Output = Result<(), BrokerageError>>,
+) -> Result<(), BrokerageError> {
+    match clear_credentials.await {
+        Err(error) => Err(error),
+        Ok(()) => close_result,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    use kabu_core::{BrokerageError, BrokerageErrorKind};
+
+    use super::disconnect_after_close;
+
+    #[tokio::test]
+    async fn credential_clearing_is_attempted_after_close_failure_and_its_safe_error_wins() {
+        let cleared = Arc::new(AtomicBool::new(false));
+        let clear_flag = cleared.clone();
+        let error = disconnect_after_close(
+            Err(BrokerageError::new(BrokerageErrorKind::Unavailable)),
+            async move {
+                clear_flag.store(true, Ordering::SeqCst);
+                Err(BrokerageError::new(BrokerageErrorKind::SecureStorage))
+            },
+        )
+        .await
+        .expect_err("failed credential clearing is reported after close failure");
+
+        assert!(cleared.load(Ordering::SeqCst));
+        assert_eq!(error.kind, BrokerageErrorKind::SecureStorage);
+        assert!(!error.to_string().contains("credential"));
+    }
 }
