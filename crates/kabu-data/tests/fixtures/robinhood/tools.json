@@ -1,0 +1,70 @@
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "tools": [
+      {
+        "name": "get_accounts",
+        "title": "Accounts",
+        "description": "Returns brokerage accounts.",
+        "inputSchema": { "type": "object", "properties": {} },
+        "outputSchema": { "type": "object" },
+        "annotations": { "title": "Accounts", "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false },
+        "_meta": { "provider": "robinhood" }
+      },
+      {
+        "name": "get_portfolio",
+        "title": "Portfolio",
+        "description": "Returns a portfolio summary.",
+        "inputSchema": { "type": "object", "properties": {} },
+        "outputSchema": { "type": "object" },
+        "annotations": { "title": "Portfolio", "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false },
+        "_meta": { "provider": "robinhood" }
+      },
+      {
+        "name": "get_equity_positions",
+        "title": "Equity positions",
+        "description": "Returns equity positions.",
+        "inputSchema": { "type": "object", "properties": {} },
+        "outputSchema": { "type": "object" },
+        "annotations": { "title": "Equity positions", "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false },
+        "_meta": { "provider": "robinhood" }
+      },
+      {
+        "name": "get_crypto_positions",
+        "title": "Crypto positions",
+        "description": "Returns crypto positions.",
+        "inputSchema": { "type": "object", "properties": {} },
+        "outputSchema": { "type": "object" },
+        "annotations": { "title": "Crypto positions", "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false },
+        "_meta": { "provider": "robinhood" }
+      },
+      {
+        "name": "place_order",
+        "title": "Place order",
+        "description": "Places an order.",
+        "inputSchema": {
+          "type": "object",
+          "properties": { "symbol": { "type": "string" }, "quantity": { "type": "string" } },
+          "required": ["symbol", "quantity"]
+        },
+        "outputSchema": { "type": "object" },
+        "annotations": { "title": "Place order", "readOnlyHint": false, "destructiveHint": true, "idempotentHint": false, "openWorldHint": true },
+        "_meta": { "provider": "robinhood" }
+      },
+      {
+        "name": "transfer_funds",
+        "title": "Transfer funds",
+        "description": "Transfers cash.",
+        "inputSchema": {
+          "type": "object",
+          "properties": { "amount": { "type": "string" } },
+          "required": ["amount"]
+        },
+        "outputSchema": { "type": "object" },
+        "annotations": { "title": "Transfer funds", "readOnlyHint": false, "destructiveHint": true, "idempotentHint": false, "openWorldHint": true },
+        "_meta": { "provider": "robinhood" }
+      }
+    ]
+  }
+}

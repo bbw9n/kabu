@@ -11,6 +11,9 @@ use std::{
 use kabu_core::{Brokerage, BrokerageErrorKind};
 use kabu_data::{BrokerCredentialStore, BrokerOAuth, SecretStore, SecretStoreError};
 use rmcp::transport::auth::{CredentialStore, StoredCredentials};
+use rmcp::transport::streamable_http_client::{
+    StreamableHttpClient, StreamableHttpClientTransport, StreamableHttpClientTransportConfig,
+};
 use serde_json::json;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -568,4 +571,51 @@ async fn authorized_http_client_uses_stored_credentials() {
         .await
         .expect("authorized request");
     assert!(saw_bearer.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn initialized_oauth_client_satisfies_streamable_transport_boundary() {
+    let server = MockServer::start().await;
+    let endpoint = Url::parse(&server.uri()).expect("server URL");
+
+    Mock::given(method("GET"))
+        .and(path("/"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "resource": endpoint.as_str(),
+            "authorization_servers": [server.uri()]
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/.well-known/oauth-authorization-server"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "issuer": server.uri(),
+            "authorization_endpoint": server.uri() + "/authorize",
+            "token_endpoint": server.uri() + "/token",
+            "registration_endpoint": server.uri() + "/register",
+            "code_challenge_methods_supported": ["S256"]
+        })))
+        .mount(&server)
+        .await;
+
+    let secrets = Arc::new(MemorySecretStore::default());
+    let credentials = Arc::new(BrokerCredentialStore::new(Brokerage::Robinhood, secrets));
+    credentials
+        .save(fixture_credentials("access-secret", "refresh-secret"))
+        .await
+        .expect("save fixture credentials");
+    let oauth = BrokerOAuth::new(Brokerage::Robinhood, endpoint.clone(), credentials);
+
+    let client = oauth
+        .authorized_transport_client()
+        .await
+        .expect("authorized transport client");
+    fn assert_streamable<C: StreamableHttpClient>(_client: &C) {}
+    assert_streamable(&client);
+
+    let transport = StreamableHttpClientTransport::with_client(
+        client,
+        StreamableHttpClientTransportConfig::with_uri(endpoint.as_str()),
+    );
+    drop(transport);
 }

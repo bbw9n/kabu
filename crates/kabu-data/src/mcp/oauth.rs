@@ -3,7 +3,7 @@ use std::{collections::HashMap, future::Future, net::Ipv4Addr, sync::Arc, time::
 use async_trait::async_trait;
 use kabu_core::{Brokerage, BrokerageError, BrokerageErrorKind};
 use rmcp::transport::auth::{
-    AuthError, AuthorizationManager, AuthorizationRequest, AuthorizationSession,
+    AuthClient, AuthError, AuthorizationManager, AuthorizationRequest, AuthorizationSession,
     AuthorizedHttpClient, CredentialRefreshGuard, CredentialStore, StateStore,
     StoredAuthorizationState, StoredCredentials,
 };
@@ -449,6 +449,21 @@ impl BrokerOAuth {
     }
 
     pub async fn authorized_http_client(&self) -> Result<AuthorizedHttpClient, BrokerageError> {
+        let manager = self.initialized_authorization_manager().await?;
+        Ok(AuthorizedHttpClient::new(Arc::new(manager), None))
+    }
+
+    /// Build the rmcp authentication wrapper used by streamable HTTP sessions.
+    pub async fn authorized_transport_client(
+        &self,
+    ) -> Result<AuthClient<reqwest::Client>, BrokerageError> {
+        let manager = self.initialized_authorization_manager().await?;
+        Ok(AuthClient::new(reqwest::Client::new(), manager))
+    }
+
+    async fn initialized_authorization_manager(
+        &self,
+    ) -> Result<AuthorizationManager, BrokerageError> {
         let mut manager = self.authorization_manager().await?;
         let resolution = suppress_oauth_tracing(manager.resolve_metadata())
             .await
@@ -460,7 +475,7 @@ impl BrokerOAuth {
         if !initialized {
             return Err(brokerage_error(BrokerageErrorKind::AuthorizationRequired));
         }
-        Ok(AuthorizedHttpClient::new(Arc::new(manager), None))
+        Ok(manager)
     }
 
     /// Number of live, in-memory authorization attempts.
