@@ -1,4 +1,4 @@
-use std::{future::Future, net::Ipv4Addr, sync::Arc, time::Duration};
+use std::{collections::HashMap, future::Future, net::Ipv4Addr, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use kabu_core::{Brokerage, BrokerageError, BrokerageErrorKind};
@@ -10,9 +10,9 @@ use rmcp::transport::auth::{
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    sync::Mutex,
+    sync::{Mutex, RwLock},
     task::spawn_blocking,
-    time::Instant,
+    time::{Instant, sleep_until},
 };
 use tracing::{instrument::WithSubscriber, subscriber::NoSubscriber};
 use url::{Url, form_urlencoded};
@@ -127,24 +127,91 @@ impl CredentialStore for BrokerCredentialStore {
     }
 }
 
-struct SharedStateStore(Arc<dyn StateStore>);
+struct AuthorizationStateEntry {
+    state: StoredAuthorizationState,
+    expires_at: Instant,
+}
+
+/// Ephemeral PKCE state owned by one OAuth client instance.
+///
+/// It is deliberately memory-only: callback state and PKCE verifiers must not
+/// survive a process restart, cancellation, or the ten-minute callback window.
+#[derive(Clone)]
+struct ExpiringStateStore {
+    states: Arc<RwLock<HashMap<String, AuthorizationStateEntry>>>,
+}
+
+impl ExpiringStateStore {
+    fn new() -> Self {
+        Self {
+            states: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    async fn discard(&self, csrf_token: &str) -> bool {
+        let now = Instant::now();
+        let mut states = self.states.write().await;
+        match states.remove(csrf_token) {
+            Some(entry) if entry.expires_at > now => true,
+            Some(_) | None => false,
+        }
+    }
+
+    async fn live_count(&self) -> usize {
+        let now = Instant::now();
+        let mut states = self.states.write().await;
+        states.retain(|_, entry| entry.expires_at > now);
+        states.len()
+    }
+}
 
 #[async_trait]
-impl StateStore for SharedStateStore {
+impl StateStore for ExpiringStateStore {
     async fn save(
         &self,
         csrf_token: &str,
         state: StoredAuthorizationState,
     ) -> Result<(), AuthError> {
-        self.0.save(csrf_token, state).await
+        let expires_at = Instant::now() + CALLBACK_TTL;
+        self.states.write().await.insert(
+            csrf_token.to_string(),
+            AuthorizationStateEntry { state, expires_at },
+        );
+
+        let states = Arc::downgrade(&self.states);
+        let csrf_token = csrf_token.to_string();
+        tokio::spawn(async move {
+            sleep_until(expires_at).await;
+            let Some(states) = states.upgrade() else {
+                return;
+            };
+            let mut states = states.write().await;
+            if states
+                .get(&csrf_token)
+                .is_some_and(|entry| entry.expires_at <= Instant::now())
+            {
+                states.remove(&csrf_token);
+            }
+        });
+        Ok(())
     }
 
     async fn load(&self, csrf_token: &str) -> Result<Option<StoredAuthorizationState>, AuthError> {
-        self.0.load(csrf_token).await
+        let now = Instant::now();
+        let mut states = self.states.write().await;
+        if states
+            .get(csrf_token)
+            .is_some_and(|entry| entry.expires_at <= now)
+        {
+            states.remove(csrf_token);
+            return Ok(None);
+        }
+        Ok(states.get(csrf_token).map(|entry| entry.state.clone()))
     }
 
     async fn delete(&self, csrf_token: &str) -> Result<(), AuthError> {
-        self.0.delete(csrf_token).await
+        self.discard(csrf_token).await;
+        Ok(())
     }
 }
 
@@ -269,11 +336,21 @@ pub struct PendingAuthorization {
     callback: OneShotCallback,
     brokerage: Brokerage,
     session: AuthorizationSession,
+    states: ExpiringStateStore,
 }
 
 impl PendingAuthorization {
     pub async fn wait_for_callback(&mut self) -> Result<String, BrokerageError> {
         self.callback.wait().await
+    }
+
+    /// Abandon this authorization attempt and securely discard its PKCE state.
+    pub async fn cancel(self) -> Result<(), BrokerageError> {
+        if self.states.discard(&self.csrf_token).await {
+            Ok(())
+        } else {
+            Err(brokerage_error(BrokerageErrorKind::AuthorizationDenied))
+        }
     }
 }
 
@@ -282,7 +359,7 @@ pub struct BrokerOAuth {
     brokerage: Brokerage,
     endpoint: Url,
     credentials: Arc<BrokerCredentialStore>,
-    states: Arc<dyn StateStore>,
+    states: ExpiringStateStore,
 }
 
 impl BrokerOAuth {
@@ -290,13 +367,12 @@ impl BrokerOAuth {
         brokerage: Brokerage,
         endpoint: Url,
         credentials: Arc<BrokerCredentialStore>,
-        states: Arc<dyn StateStore>,
     ) -> Self {
         Self {
             brokerage,
             endpoint,
             credentials,
-            states,
+            states: ExpiringStateStore::new(),
         }
     }
 
@@ -325,6 +401,7 @@ impl BrokerOAuth {
             callback,
             brokerage: self.brokerage,
             session,
+            states: self.states.clone(),
         })
     }
 
@@ -333,14 +410,24 @@ impl BrokerOAuth {
         pending: PendingAuthorization,
         callback_query: &str,
     ) -> Result<(), BrokerageError> {
+        let result = self
+            .complete_authorization_inner(&pending, callback_query)
+            .await;
+        pending.states.discard(&pending.csrf_token).await;
+        result
+    }
+
+    async fn complete_authorization_inner(
+        &self,
+        pending: &PendingAuthorization,
+        callback_query: &str,
+    ) -> Result<(), BrokerageError> {
         if pending.brokerage != self.brokerage || pending.started_at.elapsed() > CALLBACK_TTL {
-            self.discard_state(&pending.csrf_token).await;
             return Err(brokerage_error(BrokerageErrorKind::AuthorizationDenied));
         }
 
         let callback = ParsedCallback::parse(callback_query)?;
         if callback.state != pending.csrf_token {
-            self.discard_state(&pending.csrf_token).await;
             return Err(brokerage_error(BrokerageErrorKind::AuthorizationDenied));
         }
 
@@ -376,17 +463,18 @@ impl BrokerOAuth {
         Ok(AuthorizedHttpClient::new(Arc::new(manager), None))
     }
 
+    /// Number of live, in-memory authorization attempts.
+    pub async fn pending_authorization_count(&self) -> usize {
+        self.states.live_count().await
+    }
+
     async fn authorization_manager(&self) -> Result<AuthorizationManager, BrokerageError> {
         let mut manager = suppress_oauth_tracing(AuthorizationManager::new(self.endpoint.clone()))
             .await
             .map_err(map_auth_error)?;
         manager.set_credential_store((*self.credentials).clone());
-        manager.set_state_store(SharedStateStore(self.states.clone()));
+        manager.set_state_store(self.states.clone());
         Ok(manager)
-    }
-
-    async fn discard_state(&self, csrf_token: &str) {
-        let _ = self.states.delete(csrf_token).await;
     }
 }
 

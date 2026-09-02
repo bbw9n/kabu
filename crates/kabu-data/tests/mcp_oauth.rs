@@ -10,7 +10,7 @@ use std::{
 
 use kabu_core::{Brokerage, BrokerageErrorKind};
 use kabu_data::{BrokerCredentialStore, BrokerOAuth, SecretStore, SecretStoreError};
-use rmcp::transport::auth::{CredentialStore, InMemoryStateStore, StateStore, StoredCredentials};
+use rmcp::transport::auth::{CredentialStore, StoredCredentials};
 use serde_json::json;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -293,8 +293,7 @@ async fn oauth_fixture() -> (BrokerOAuth, Arc<AtomicUsize>, Arc<MemorySecretStor
         Brokerage::Robinhood,
         secrets.clone(),
     ));
-    let states: Arc<dyn StateStore> = Arc::new(InMemoryStateStore::new());
-    let oauth = BrokerOAuth::new(Brokerage::Robinhood, endpoint, credentials, states);
+    let oauth = BrokerOAuth::new(Brokerage::Robinhood, endpoint, credentials);
     (oauth, exchange_counter, secrets)
 }
 
@@ -315,6 +314,7 @@ async fn oauth_callback_rejects_wrong_state_before_exchanging_code() {
 
     assert_eq!(error.kind, BrokerageErrorKind::AuthorizationDenied);
     assert_eq!(exchange_counter.load(Ordering::SeqCst), 0);
+    assert_eq!(oauth.pending_authorization_count().await, 0);
 }
 
 #[tokio::test]
@@ -332,6 +332,53 @@ async fn oauth_callback_expires_after_ten_minutes_before_exchanging_code() {
         .expect_err("expired callback");
 
     assert_eq!(error.kind, BrokerageErrorKind::AuthorizationDenied);
+    assert_eq!(exchange_counter.load(Ordering::SeqCst), 0);
+    assert_eq!(oauth.pending_authorization_count().await, 0);
+}
+
+#[tokio::test]
+async fn cancelling_pending_authorization_deletes_state() {
+    let (oauth, exchange_counter, _secrets) = oauth_fixture().await;
+    let pending = oauth.begin_authorization().await.expect("begin");
+    assert_eq!(oauth.pending_authorization_count().await, 1);
+
+    pending.cancel().await.expect("cancel authorization");
+
+    assert_eq!(oauth.pending_authorization_count().await, 0);
+    assert_eq!(exchange_counter.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn callback_missing_state_deletes_pending_authorization() {
+    let (oauth, exchange_counter, _secrets) = oauth_fixture().await;
+    let pending = oauth.begin_authorization().await.expect("begin");
+    assert_eq!(oauth.pending_authorization_count().await, 1);
+
+    let error = oauth
+        .complete_authorization(pending, "code=abc")
+        .await
+        .expect_err("missing state");
+
+    assert_eq!(error.kind, BrokerageErrorKind::AuthorizationDenied);
+    assert_eq!(oauth.pending_authorization_count().await, 0);
+    assert_eq!(exchange_counter.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn expired_authorization_state_becomes_unavailable_without_a_callback() {
+    let (oauth, exchange_counter, _secrets) = oauth_fixture().await;
+    let pending = oauth.begin_authorization().await.expect("begin");
+    assert_eq!(oauth.pending_authorization_count().await, 1);
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(601)).await;
+    tokio::task::yield_now().await;
+
+    let error = pending
+        .cancel()
+        .await
+        .expect_err("expired state is unavailable");
+    assert_eq!(error.kind, BrokerageErrorKind::AuthorizationDenied);
+    assert_eq!(oauth.pending_authorization_count().await, 0);
     assert_eq!(exchange_counter.load(Ordering::SeqCst), 0);
 }
 
@@ -353,6 +400,7 @@ async fn oauth_callback_exchanges_code_and_saves_credentials() {
 
     assert_eq!(exchange_counter.load(Ordering::SeqCst), 1);
     assert!(stored.is_some());
+    assert_eq!(oauth.pending_authorization_count().await, 0);
 }
 
 #[tokio::test]
@@ -509,8 +557,7 @@ async fn authorized_http_client_uses_stored_credentials() {
         .save(fixture_credentials("access-secret", "refresh-secret"))
         .await
         .expect("save fixture credentials");
-    let states: Arc<dyn StateStore> = Arc::new(InMemoryStateStore::new());
-    let oauth = BrokerOAuth::new(Brokerage::Robinhood, endpoint.clone(), credentials, states);
+    let oauth = BrokerOAuth::new(Brokerage::Robinhood, endpoint.clone(), credentials);
     let client = oauth
         .authorized_http_client()
         .await
