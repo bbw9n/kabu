@@ -246,6 +246,13 @@ impl BrokerageClient for RobinhoodPortfolioProvider {
         *session = Some(self.start_session().await?);
         Ok(())
     }
+
+    async fn close_session(&self) -> Result<(), BrokerageError> {
+        match self.session.lock().await.take() {
+            Some(session) => session.close().await,
+            None => Ok(()),
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -294,12 +301,7 @@ impl PortfolioProvider for RobinhoodPortfolioProvider {
     }
 
     async fn disconnect(&self) -> Result<(), BrokerageError> {
-        let session = self.session.lock().await.take();
-        let close_result = match session {
-            Some(session) => session.close().await,
-            None => Ok(()),
-        };
-        disconnect_after_close(close_result, self.oauth.disconnect()).await
+        disconnect_after_close(self.close_session().await, self.oauth.disconnect()).await
     }
 }
 
@@ -307,4 +309,75 @@ pub fn robinhood_provider(
     secrets: Arc<dyn SecretStore>,
 ) -> Result<Arc<dyn BrokerageClient>, BrokerageError> {
     Ok(Arc::new(RobinhoodPortfolioProvider::new(secrets)?))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use kabu_core::PortfolioProvider;
+
+    use super::RobinhoodPortfolioProvider;
+    use crate::{BrokerageClient, SecretStore, SecretStoreError};
+
+    #[derive(Default)]
+    struct MemorySecretStore {
+        value: Mutex<Option<Vec<u8>>>,
+    }
+
+    impl SecretStore for MemorySecretStore {
+        fn get(&self, _service: &str, _account: &str) -> Result<Option<Vec<u8>>, SecretStoreError> {
+            Ok(self
+                .value
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone())
+        }
+
+        fn set(
+            &self,
+            _service: &str,
+            _account: &str,
+            value: &[u8],
+        ) -> Result<(), SecretStoreError> {
+            *self
+                .value
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(value.to_vec());
+            Ok(())
+        }
+
+        fn delete(&self, _service: &str, _account: &str) -> Result<(), SecretStoreError> {
+            *self
+                .value
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn closing_a_session_preserves_credentials_while_disconnect_clears_them() {
+        let secrets = Arc::new(MemorySecretStore::default());
+        secrets
+            .set("test-service", "test-account", b"stored-credentials")
+            .expect("seed credentials");
+        let provider = RobinhoodPortfolioProvider::new(secrets.clone()).expect("provider");
+
+        provider.close_session().await.expect("close session");
+        assert!(
+            secrets
+                .get("test-service", "test-account")
+                .expect("read retained credentials")
+                .is_some()
+        );
+
+        provider.disconnect().await.expect("explicit disconnect");
+        assert_eq!(
+            secrets
+                .get("test-service", "test-account")
+                .expect("read cleared credentials"),
+            None
+        );
+    }
 }

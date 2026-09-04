@@ -1,16 +1,18 @@
 use crate::coordinator::Coordinator;
 use async_channel::{Receiver, Sender, TrySendError};
 use kabu_core::{
-    AssetClass, CachedMarketState, Candle, ChartHistory, ChartPeriod, ChartRequestKey, DataSource,
+    AssetClass, Brokerage, BrokerageConnectionState, BrokerageError, BrokerageErrorKind,
+    CachedMarketState, Candle, ChartHistory, ChartPeriod, ChartRequestKey, DataSource,
     GenerationId, Instrument, InstrumentId, InstrumentSearch, MarketDataError, MarketDataErrorKind,
-    PersistedState, PersistenceError, Quote, QuoteSnapshots, QuoteSubscription, SearchResult,
-    StateRepository, rank_search_results,
+    PersistedState, PersistenceError, PortfolioSnapshot, Quote, QuoteSnapshots, QuoteSubscription,
+    SearchResult, StateRepository, rank_search_results,
 };
-use kabu_data::{BinanceClient, JsonRepository, Recovery, YahooClient};
+use kabu_data::{BinanceClient, BrokerageClient, JsonRepository, Recovery, YahooClient};
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     fmt, io,
     path::Path,
+    process::Command,
     sync::{
         Arc, Condvar, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -44,6 +46,11 @@ pub enum RuntimeCommand {
     SetVisible(bool),
     SetWatchlist(Vec<Instrument>),
     SetCryptoWatchlist(Vec<Instrument>),
+    ConnectBroker(Brokerage),
+    CancelBrokerConnection(Brokerage),
+    RefreshPortfolio(Brokerage),
+    DisconnectBroker(Brokerage),
+    SetPortfolioVisible(bool),
     PersistState(PersistedState),
     PersistMarketCache {
         cache: CachedMarketState,
@@ -92,6 +99,7 @@ pub struct ShutdownOutcome {
     pub state: Option<PersistenceResult>,
     pub market_cache: Option<PersistenceResult>,
     runtime_failed: bool,
+    brokerage_shutdown_failed: bool,
 }
 
 impl ShutdownOutcome {
@@ -100,6 +108,7 @@ impl ShutdownOutcome {
             state: None,
             market_cache: None,
             runtime_failed: false,
+            brokerage_shutdown_failed: false,
         }
     }
 
@@ -108,11 +117,13 @@ impl ShutdownOutcome {
             state: None,
             market_cache: None,
             runtime_failed: true,
+            brokerage_shutdown_failed: false,
         }
     }
 
     pub const fn is_success(self) -> bool {
         !self.runtime_failed
+            && !self.brokerage_shutdown_failed
             && !matches!(self.state, Some(PersistenceResult::Failed))
             && !matches!(self.market_cache, Some(PersistenceResult::Failed))
     }
@@ -155,6 +166,11 @@ pub enum RuntimeEvent {
         result: PersistenceResult,
     },
     StreamStatus(StreamStatus),
+    BrokerConnectionChanged {
+        brokerage: Brokerage,
+        state: BrokerageConnectionState,
+    },
+    PortfolioUpdated(PortfolioSnapshot),
 }
 
 /// A coalescing runtime event mailbox backed by a bounded-one notification
@@ -194,6 +210,8 @@ enum RuntimeEventSlot {
     Catalog,
     Persistence(PersistenceCategory),
     StreamStatus,
+    BrokerConnection(Brokerage),
+    Portfolio(Brokerage),
 }
 
 const QUOTE_EVENT_SLOT_CAPACITY: usize = 64;
@@ -279,6 +297,17 @@ impl RuntimeEventSender {
         );
     }
 
+    fn clear_brokerage(&self, brokerage: Brokerage) {
+        self.remove_slots(|slot| {
+            matches!(
+                slot,
+                RuntimeEventSlot::BrokerConnection(candidate)
+                    | RuntimeEventSlot::Portfolio(candidate)
+                    if *candidate == brokerage
+            )
+        });
+    }
+
     fn retain_watchlist_events(&self, watchlist: &[Instrument]) {
         self.remove_slots(|slot| {
             let instrument_id = match slot {
@@ -289,7 +318,9 @@ impl RuntimeEventSender {
                 | RuntimeEventSlot::SearchProvider(_)
                 | RuntimeEventSlot::Catalog
                 | RuntimeEventSlot::Persistence(_)
-                | RuntimeEventSlot::StreamStatus => None,
+                | RuntimeEventSlot::StreamStatus
+                | RuntimeEventSlot::BrokerConnection(_)
+                | RuntimeEventSlot::Portfolio(_) => None,
             };
             instrument_id.is_some_and(|instrument_id| {
                 !watchlist
@@ -336,7 +367,9 @@ fn runtime_event_generation(event: &RuntimeEvent) -> Option<GenerationId> {
         | RuntimeEvent::QuoteError { .. }
         | RuntimeEvent::CatalogRefresh { .. }
         | RuntimeEvent::PersistenceCompleted { .. }
-        | RuntimeEvent::StreamStatus(_) => None,
+        | RuntimeEvent::StreamStatus(_)
+        | RuntimeEvent::BrokerConnectionChanged { .. }
+        | RuntimeEvent::PortfolioUpdated(_) => None,
     }
 }
 
@@ -361,7 +394,9 @@ fn dynamic_event_family(slot: &RuntimeEventSlot) -> Option<(DynamicEventFamily, 
         | RuntimeEventSlot::SearchProvider(_)
         | RuntimeEventSlot::Catalog
         | RuntimeEventSlot::Persistence(_)
-        | RuntimeEventSlot::StreamStatus => None,
+        | RuntimeEventSlot::StreamStatus
+        | RuntimeEventSlot::BrokerConnection(_)
+        | RuntimeEventSlot::Portfolio(_) => None,
     }
 }
 
@@ -540,6 +575,10 @@ fn runtime_event_slot(event: &RuntimeEvent) -> RuntimeEventSlot {
             RuntimeEventSlot::Persistence(*category)
         }
         RuntimeEvent::StreamStatus(_) => RuntimeEventSlot::StreamStatus,
+        RuntimeEvent::BrokerConnectionChanged { brokerage, .. } => {
+            RuntimeEventSlot::BrokerConnection(*brokerage)
+        }
+        RuntimeEvent::PortfolioUpdated(snapshot) => RuntimeEventSlot::Portfolio(snapshot.brokerage),
     }
 }
 
@@ -573,6 +612,24 @@ impl<T: InstrumentSearch + QuoteSnapshots + ChartHistory + QuoteSubscription> Cr
 pub struct ProviderSet {
     pub equities: Arc<dyn EquityProvider>,
     pub crypto: Arc<dyn CryptoProvider>,
+}
+
+pub type BrokerageProviders = HashMap<Brokerage, Arc<dyn BrokerageClient>>;
+
+pub trait AuthorizationUrlOpener: Send + Sync {
+    fn open(&self, url: &url::Url) -> Result<(), BrokerageError>;
+}
+
+struct ProductionAuthorizationUrlOpener;
+
+impl AuthorizationUrlOpener for ProductionAuthorizationUrlOpener {
+    fn open(&self, url: &url::Url) -> Result<(), BrokerageError> {
+        Command::new("/usr/bin/open")
+            .arg(url.as_str())
+            .spawn()
+            .map(|_| ())
+            .map_err(|_| BrokerageError::new(BrokerageErrorKind::Internal))
+    }
 }
 
 pub struct ProductionComponents {
@@ -651,6 +708,8 @@ impl ProductionComponents {
         };
         let runtime = RuntimeHandle::start_inner(
             providers,
+            BrokerageProviders::new(),
+            Arc::new(ProductionAuthorizationUrlOpener),
             self.repository,
             cache_for_runtime,
             Some(binance),
@@ -691,6 +750,8 @@ struct RecordingRuntime {
 struct LiveRuntime {
     commands: Sender<RuntimeCommand>,
     controls: Arc<ControlLane>,
+    brokerage_commands: Arc<BrokerageCommandLane>,
+    brokerage_providers: BrokerageProviders,
     shutdown_signal: Sender<()>,
     events: RuntimeEvents,
     repository: Arc<dyn StateRepository>,
@@ -734,6 +795,11 @@ struct ControlLane {
     notify: Sender<()>,
 }
 
+struct BrokerageCommandLane {
+    pending: Mutex<VecDeque<RuntimeCommand>>,
+    notify: Sender<()>,
+}
+
 struct ShutdownCompletion {
     outcome: Mutex<Option<ShutdownOutcome>>,
     changed: Condvar,
@@ -758,6 +824,10 @@ struct NetworkInputs {
     events: RuntimeEventSender,
     shutdown: Receiver<()>,
     providers: ProviderSet,
+    brokerage_providers: BrokerageProviders,
+    authorization_url_opener: Arc<dyn AuthorizationUrlOpener>,
+    brokerage_commands: Arc<BrokerageCommandLane>,
+    brokerage_notifications: Receiver<()>,
     storage: RuntimeStorage,
     catalog_client: Option<BinanceClient>,
 }
@@ -785,6 +855,17 @@ struct DesiredPersistence {
 struct PersistenceLane {
     desired: Mutex<DesiredPersistence>,
     notify: Sender<()>,
+}
+
+struct BrokerageRuntime {
+    providers: BrokerageProviders,
+    authorization_url_opener: Arc<dyn AuthorizationUrlOpener>,
+    authorization_jobs: HashMap<Brokerage, tokio::task::JoinHandle<()>>,
+    refresh_jobs: HashMap<Brokerage, tokio::task::JoinHandle<()>>,
+    refresh_locks: HashMap<Brokerage, Arc<tokio::sync::Mutex<()>>>,
+    states: Arc<Mutex<HashMap<Brokerage, BrokerageConnectionState>>>,
+    snapshots: Arc<Mutex<HashMap<Brokerage, chrono::DateTime<chrono::Utc>>>>,
+    visible: bool,
 }
 
 impl Default for RuntimeHandle {
@@ -818,11 +899,20 @@ impl fmt::Debug for RuntimeHandle {
 
 impl RuntimeHandle {
     pub fn start(providers: ProviderSet, repository: Arc<dyn StateRepository>) -> io::Result<Self> {
-        Self::start_inner(providers, repository, CachedMarketState::default(), None)
+        Self::start_inner(
+            providers,
+            BrokerageProviders::new(),
+            Arc::new(ProductionAuthorizationUrlOpener),
+            repository,
+            CachedMarketState::default(),
+            None,
+        )
     }
 
     fn start_inner(
         providers: ProviderSet,
+        brokerage_providers: BrokerageProviders,
+        authorization_url_opener: Arc<dyn AuthorizationUrlOpener>,
         repository: Arc<dyn StateRepository>,
         initial_cache: CachedMarketState,
         catalog_client: Option<BinanceClient>,
@@ -831,6 +921,11 @@ impl RuntimeHandle {
         let (event_sender, events) = runtime_event_channel();
         let (shutdown_signal, shutdown_receiver) = async_channel::bounded(1);
         let (control_notify, control_notifications) = async_channel::bounded(1);
+        let (brokerage_notify, brokerage_notifications) = async_channel::bounded(1);
+        let brokerage_commands = Arc::new(BrokerageCommandLane {
+            pending: Mutex::new(VecDeque::new()),
+            notify: brokerage_notify,
+        });
         let controls = Arc::new(ControlLane {
             desired: Mutex::new(DesiredControlState {
                 revision: 0,
@@ -853,6 +948,8 @@ impl RuntimeHandle {
             final_flush: final_flush.clone(),
         };
         let network_controls = controls.clone();
+        let network_brokerage_commands = brokerage_commands.clone();
+        let network_brokerage_providers = brokerage_providers.clone();
         let network_completion = completion.clone();
         let join = thread::Builder::new()
             .name("kabu-network".into())
@@ -864,6 +961,10 @@ impl RuntimeHandle {
                     events: event_sender,
                     shutdown: shutdown_receiver,
                     providers,
+                    brokerage_providers: network_brokerage_providers,
+                    authorization_url_opener,
+                    brokerage_commands: network_brokerage_commands,
+                    brokerage_notifications,
                     storage,
                     catalog_client,
                 });
@@ -878,6 +979,8 @@ impl RuntimeHandle {
             mode: RuntimeMode::Live(Arc::new(LiveRuntime {
                 commands,
                 controls,
+                brokerage_commands,
+                brokerage_providers,
                 shutdown_signal,
                 events,
                 repository,
@@ -900,6 +1003,11 @@ impl RuntimeHandle {
                     .commands
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if is_brokerage_command(&command) {
+                    coalesce_recording_brokerage(&mut commands, &command);
+                    commands.push_back(command);
+                    return Ok(());
+                }
                 if is_control_command(&command) {
                     coalesce_recording_control(&mut commands, &command);
                     commands.push_back(command);
@@ -923,6 +1031,10 @@ impl RuntimeHandle {
                 }
                 if runtime.shutdown.load(Ordering::SeqCst) {
                     return Err(RuntimeSendError::Closed);
+                }
+                if is_brokerage_command(&command) {
+                    runtime.brokerage_commands.push(command);
+                    return Ok(());
                 }
                 match command {
                     RuntimeCommand::SetVisible(visible) => {
@@ -1087,7 +1199,7 @@ impl RuntimeHandle {
         let RuntimeMode::Live(runtime) = &self.mode else {
             return ShutdownOutcome::success_without_flush();
         };
-        let previous = runtime
+        let mut previous = runtime
             .completion
             .outcome
             .lock()
@@ -1096,12 +1208,24 @@ impl RuntimeHandle {
         if previous.runtime_failed {
             return previous;
         }
+        if previous.brokerage_shutdown_failed {
+            if !close_broker_sessions(&runtime.brokerage_providers) {
+                return previous;
+            }
+            previous.brokerage_shutdown_failed = false;
+        }
         let Some(flush) = runtime
             .final_flush
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
         else {
+            *runtime
+                .completion
+                .outcome
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(previous);
+            runtime.completion.changed.notify_all();
             return previous;
         };
         *runtime
@@ -1179,7 +1303,37 @@ fn is_control_command(command: &RuntimeCommand) -> bool {
             | RuntimeCommand::SetVisible(_)
             | RuntimeCommand::SetWatchlist(_)
             | RuntimeCommand::SetCryptoWatchlist(_)
+            | RuntimeCommand::ConnectBroker(_)
+            | RuntimeCommand::CancelBrokerConnection(_)
+            | RuntimeCommand::RefreshPortfolio(_)
+            | RuntimeCommand::DisconnectBroker(_)
+            | RuntimeCommand::SetPortfolioVisible(_)
     )
+}
+
+fn is_brokerage_command(command: &RuntimeCommand) -> bool {
+    matches!(
+        command,
+        RuntimeCommand::ConnectBroker(_)
+            | RuntimeCommand::CancelBrokerConnection(_)
+            | RuntimeCommand::RefreshPortfolio(_)
+            | RuntimeCommand::DisconnectBroker(_)
+            | RuntimeCommand::SetPortfolioVisible(_)
+    )
+}
+
+fn coalesce_recording_brokerage(
+    commands: &mut VecDeque<RuntimeCommand>,
+    incoming: &RuntimeCommand,
+) {
+    commands.retain(|existing| match incoming {
+        RuntimeCommand::RefreshPortfolio(brokerage) => !matches!(
+            existing,
+            RuntimeCommand::RefreshPortfolio(existing_brokerage)
+                if existing_brokerage == brokerage
+        ),
+        _ => true,
+    });
 }
 
 fn coalesce_recording_control(commands: &mut VecDeque<RuntimeCommand>, incoming: &RuntimeCommand) {
@@ -1202,6 +1356,11 @@ fn coalesce_recording_control(commands: &mut VecDeque<RuntimeCommand>, incoming:
         RuntimeCommand::SetCryptoWatchlist(_) => {
             !matches!(existing, RuntimeCommand::SetCryptoWatchlist(_))
         }
+        RuntimeCommand::ConnectBroker(_)
+        | RuntimeCommand::CancelBrokerConnection(_)
+        | RuntimeCommand::RefreshPortfolio(_)
+        | RuntimeCommand::DisconnectBroker(_)
+        | RuntimeCommand::SetPortfolioVisible(_) => true,
         RuntimeCommand::Snapshot { .. }
         | RuntimeCommand::History { .. }
         | RuntimeCommand::PersistState(_)
@@ -1217,6 +1376,7 @@ impl Drop for LiveRuntime {
         _ = self.commands.try_send(RuntimeCommand::Shutdown);
         self.commands.close();
         self.controls.notify.close();
+        self.brokerage_commands.notify.close();
         self.shutdown_signal.close();
         let mut outcome = self
             .completion
@@ -1310,6 +1470,36 @@ impl ControlLane {
     }
 }
 
+impl BrokerageCommandLane {
+    fn push(&self, command: RuntimeCommand) {
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let RuntimeCommand::RefreshPortfolio(brokerage) = &command {
+            pending.retain(|candidate| {
+                !matches!(
+                    candidate,
+                    RuntimeCommand::RefreshPortfolio(candidate_brokerage)
+                        if candidate_brokerage == brokerage
+                )
+            });
+        }
+        pending.push_back(command);
+        drop(pending);
+        _ = self.notify.try_send(());
+    }
+
+    fn take(&self) -> VecDeque<RuntimeCommand> {
+        std::mem::take(
+            &mut *self
+                .pending
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        )
+    }
+}
+
 impl DesiredSearchState {
     fn replace_full(&mut self, request: SearchRequest) {
         self.full.replace(Some(request));
@@ -1375,6 +1565,396 @@ async fn abort_and_join(job: &mut Option<tokio::task::JoinHandle<()>>) {
     }
 }
 
+impl BrokerageRuntime {
+    fn new(
+        providers: BrokerageProviders,
+        authorization_url_opener: Arc<dyn AuthorizationUrlOpener>,
+    ) -> Self {
+        let states = providers
+            .keys()
+            .copied()
+            .map(|brokerage| (brokerage, BrokerageConnectionState::Disconnected))
+            .collect();
+        let refresh_locks = providers
+            .keys()
+            .copied()
+            .map(|brokerage| (brokerage, Arc::new(tokio::sync::Mutex::new(()))))
+            .collect();
+        Self {
+            providers,
+            authorization_url_opener,
+            authorization_jobs: HashMap::new(),
+            refresh_jobs: HashMap::new(),
+            refresh_locks,
+            states: Arc::new(Mutex::new(states)),
+            snapshots: Arc::new(Mutex::new(HashMap::new())),
+            visible: true,
+        }
+    }
+
+    async fn apply(&mut self, command: RuntimeCommand, events: &RuntimeEventSender) {
+        match command {
+            RuntimeCommand::ConnectBroker(brokerage) => self.connect(brokerage, events).await,
+            RuntimeCommand::CancelBrokerConnection(brokerage) => {
+                self.cancel_connection(brokerage, events).await;
+            }
+            RuntimeCommand::RefreshPortfolio(brokerage) => {
+                if self.visible {
+                    self.refresh(brokerage, events).await;
+                }
+            }
+            RuntimeCommand::DisconnectBroker(brokerage) => {
+                self.disconnect(brokerage, events).await;
+            }
+            RuntimeCommand::SetPortfolioVisible(visible) => {
+                self.set_visible(visible, events).await;
+            }
+            _ => {}
+        }
+    }
+
+    async fn connect(&mut self, brokerage: Brokerage, events: &RuntimeEventSender) {
+        abort_brokerage_job(&mut self.authorization_jobs, brokerage).await;
+        abort_brokerage_job(&mut self.refresh_jobs, brokerage).await;
+        let Some(provider) = self.providers.get(&brokerage).cloned() else {
+            publish_brokerage_error(
+                &self.states,
+                events,
+                brokerage,
+                &BrokerageError::new(BrokerageErrorKind::Unavailable),
+            );
+            return;
+        };
+        let refresh_lock = self
+            .refresh_locks
+            .get(&brokerage)
+            .cloned()
+            .expect("brokerage provider has a refresh lock");
+        publish_brokerage_state(
+            &self.states,
+            events,
+            brokerage,
+            BrokerageConnectionState::Connecting,
+        );
+        let opener = self.authorization_url_opener.clone();
+        let states = self.states.clone();
+        let snapshots = self.snapshots.clone();
+        let events = events.clone();
+        self.authorization_jobs.insert(
+            brokerage,
+            tokio::spawn(async move {
+                let open_authorization_url = |url: &url::Url| {
+                    publish_brokerage_state(
+                        &states,
+                        &events,
+                        brokerage,
+                        BrokerageConnectionState::Authorizing,
+                    );
+                    opener.open(url)
+                };
+                let result = async {
+                    provider.connect(&open_authorization_url).await?;
+                    let _refresh_guard = refresh_lock.lock().await;
+                    provider.refresh_portfolio().await
+                }
+                .await;
+                match result {
+                    Ok(snapshot) if snapshot.brokerage == brokerage => {
+                        snapshots
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .insert(brokerage, snapshot.received_at);
+                        let last_synced_at = snapshot.received_at;
+                        _ = events.try_send(RuntimeEvent::PortfolioUpdated(snapshot));
+                        publish_brokerage_state(
+                            &states,
+                            &events,
+                            brokerage,
+                            BrokerageConnectionState::Connected {
+                                last_synced_at: Some(last_synced_at),
+                            },
+                        );
+                    }
+                    Ok(_) => publish_brokerage_error(
+                        &states,
+                        &events,
+                        brokerage,
+                        &BrokerageError::new(BrokerageErrorKind::MalformedResponse),
+                    ),
+                    Err(error) => {
+                        publish_brokerage_error(&states, &events, brokerage, &error);
+                    }
+                }
+            }),
+        );
+    }
+
+    async fn refresh(&mut self, brokerage: Brokerage, events: &RuntimeEventSender) {
+        abort_brokerage_job(&mut self.refresh_jobs, brokerage).await;
+        let Some(provider) = self.providers.get(&brokerage).cloned() else {
+            publish_brokerage_error(
+                &self.states,
+                events,
+                brokerage,
+                &BrokerageError::new(BrokerageErrorKind::Unavailable),
+            );
+            return;
+        };
+        let refresh_lock = self
+            .refresh_locks
+            .get(&brokerage)
+            .cloned()
+            .expect("brokerage provider has a refresh lock");
+        let last_synced_at = brokerage_last_synced(&self.states, brokerage);
+        publish_brokerage_state(
+            &self.states,
+            events,
+            brokerage,
+            BrokerageConnectionState::Refreshing { last_synced_at },
+        );
+        let states = self.states.clone();
+        let snapshots = self.snapshots.clone();
+        let events = events.clone();
+        self.refresh_jobs.insert(
+            brokerage,
+            tokio::spawn(async move {
+                let _refresh_guard = refresh_lock.lock().await;
+                match provider.refresh_portfolio().await {
+                    Ok(snapshot) if snapshot.brokerage == brokerage => {
+                        snapshots
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .insert(brokerage, snapshot.received_at);
+                        let last_synced_at = snapshot.received_at;
+                        _ = events.try_send(RuntimeEvent::PortfolioUpdated(snapshot));
+                        publish_brokerage_state(
+                            &states,
+                            &events,
+                            brokerage,
+                            BrokerageConnectionState::Connected {
+                                last_synced_at: Some(last_synced_at),
+                            },
+                        );
+                    }
+                    Ok(_) => publish_brokerage_error(
+                        &states,
+                        &events,
+                        brokerage,
+                        &BrokerageError::new(BrokerageErrorKind::MalformedResponse),
+                    ),
+                    Err(error) => {
+                        publish_brokerage_error(&states, &events, brokerage, &error);
+                    }
+                }
+            }),
+        );
+    }
+
+    async fn cancel_connection(&mut self, brokerage: Brokerage, events: &RuntimeEventSender) {
+        abort_brokerage_job(&mut self.authorization_jobs, brokerage).await;
+        abort_brokerage_job(&mut self.refresh_jobs, brokerage).await;
+        let result = match self.providers.get(&brokerage) {
+            Some(provider) => provider.close_session().await,
+            None => Err(BrokerageError::new(BrokerageErrorKind::Unavailable)),
+        };
+        events.clear_brokerage(brokerage);
+        match result {
+            Ok(()) => publish_brokerage_state(
+                &self.states,
+                events,
+                brokerage,
+                BrokerageConnectionState::Disconnected,
+            ),
+            Err(error) => publish_brokerage_error(&self.states, events, brokerage, &error),
+        }
+    }
+
+    async fn disconnect(&mut self, brokerage: Brokerage, events: &RuntimeEventSender) {
+        abort_brokerage_job(&mut self.authorization_jobs, brokerage).await;
+        abort_brokerage_job(&mut self.refresh_jobs, brokerage).await;
+        let result = match self.providers.get(&brokerage) {
+            Some(provider) => provider.disconnect().await,
+            None => Err(BrokerageError::new(BrokerageErrorKind::Unavailable)),
+        };
+        events.clear_brokerage(brokerage);
+        self.snapshots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&brokerage);
+        match result {
+            Ok(()) => publish_brokerage_state(
+                &self.states,
+                events,
+                brokerage,
+                BrokerageConnectionState::Disconnected,
+            ),
+            Err(error) => publish_brokerage_error(&self.states, events, brokerage, &error),
+        }
+    }
+
+    async fn set_visible(&mut self, visible: bool, events: &RuntimeEventSender) {
+        self.visible = visible;
+        if !visible {
+            let authorizing = abort_all_brokerage_jobs(&mut self.authorization_jobs).await;
+            let refreshing = abort_all_brokerage_jobs(&mut self.refresh_jobs).await;
+            for brokerage in &authorizing {
+                let result = match self.providers.get(brokerage) {
+                    Some(provider) => provider.close_session().await,
+                    None => Err(BrokerageError::new(BrokerageErrorKind::Unavailable)),
+                };
+                match result {
+                    Ok(()) => publish_brokerage_state(
+                        &self.states,
+                        events,
+                        *brokerage,
+                        BrokerageConnectionState::Disconnected,
+                    ),
+                    Err(error) => {
+                        publish_brokerage_error(&self.states, events, *brokerage, &error);
+                    }
+                }
+            }
+            for brokerage in refreshing {
+                if authorizing.contains(&brokerage) {
+                    continue;
+                }
+                publish_brokerage_state(
+                    &self.states,
+                    events,
+                    brokerage,
+                    BrokerageConnectionState::Connected {
+                        last_synced_at: brokerage_last_synced(&self.states, brokerage),
+                    },
+                );
+            }
+            return;
+        }
+
+        let stale = self.connected_brokers_needing_refresh();
+        for brokerage in stale {
+            self.refresh(brokerage, events).await;
+        }
+    }
+
+    fn connected_brokers_needing_refresh(&self) -> Vec<Brokerage> {
+        let states = self
+            .states
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let snapshots = self
+            .snapshots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now = chrono::Utc::now();
+        states
+            .iter()
+            .filter_map(|(brokerage, state)| {
+                matches!(state, BrokerageConnectionState::Connected { .. }).then_some(*brokerage)
+            })
+            .filter(|brokerage| {
+                snapshots.get(brokerage).is_none_or(|received_at| {
+                    now.signed_duration_since(*received_at) >= chrono::Duration::seconds(60)
+                })
+            })
+            .collect()
+    }
+
+    async fn scheduled_refresh(&mut self, events: &RuntimeEventSender) {
+        if !self.visible {
+            return;
+        }
+        let stale = self.connected_brokers_needing_refresh();
+        for brokerage in stale {
+            self.refresh(brokerage, events).await;
+        }
+    }
+
+    async fn shutdown(&mut self, events: &RuntimeEventSender) -> bool {
+        abort_all_brokerage_jobs(&mut self.authorization_jobs).await;
+        abort_all_brokerage_jobs(&mut self.refresh_jobs).await;
+        let mut succeeded = true;
+        for (brokerage, provider) in &self.providers {
+            if let Err(error) = provider.close_session().await {
+                succeeded = false;
+                publish_brokerage_error(&self.states, events, *brokerage, &error);
+            }
+        }
+        succeeded
+    }
+}
+
+async fn abort_brokerage_job(
+    jobs: &mut HashMap<Brokerage, tokio::task::JoinHandle<()>>,
+    brokerage: Brokerage,
+) -> bool {
+    let Some(job) = jobs.remove(&brokerage) else {
+        return false;
+    };
+    let was_running = !job.is_finished();
+    job.abort();
+    _ = job.await;
+    was_running
+}
+
+async fn abort_all_brokerage_jobs(
+    jobs: &mut HashMap<Brokerage, tokio::task::JoinHandle<()>>,
+) -> Vec<Brokerage> {
+    let jobs = std::mem::take(jobs);
+    let mut cancelled = Vec::new();
+    for (brokerage, job) in jobs {
+        if !job.is_finished() {
+            cancelled.push(brokerage);
+        }
+        job.abort();
+        _ = job.await;
+    }
+    cancelled
+}
+
+fn brokerage_last_synced(
+    states: &Arc<Mutex<HashMap<Brokerage, BrokerageConnectionState>>>,
+    brokerage: Brokerage,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    match states
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&brokerage)
+    {
+        Some(BrokerageConnectionState::Connected { last_synced_at })
+        | Some(BrokerageConnectionState::Refreshing { last_synced_at }) => *last_synced_at,
+        _ => None,
+    }
+}
+
+fn publish_brokerage_state(
+    states: &Arc<Mutex<HashMap<Brokerage, BrokerageConnectionState>>>,
+    events: &RuntimeEventSender,
+    brokerage: Brokerage,
+    state: BrokerageConnectionState,
+) {
+    states
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(brokerage, state.clone());
+    _ = events.try_send(RuntimeEvent::BrokerConnectionChanged { brokerage, state });
+}
+
+fn publish_brokerage_error(
+    states: &Arc<Mutex<HashMap<Brokerage, BrokerageConnectionState>>>,
+    events: &RuntimeEventSender,
+    brokerage: Brokerage,
+    error: &BrokerageError,
+) {
+    publish_brokerage_state(
+        states,
+        events,
+        brokerage,
+        BrokerageConnectionState::Error {
+            message: error.user_message().to_owned(),
+        },
+    );
+}
+
 async fn apply_desired_search(
     desired: &DesiredSearchState,
     applied: &mut AppliedSearchRevisions,
@@ -1435,6 +2015,7 @@ fn initiate_shutdown(runtime: &LiveRuntime) {
     _ = runtime.commands.try_send(RuntimeCommand::Shutdown);
     runtime.commands.close();
     runtime.controls.notify.close();
+    runtime.brokerage_commands.notify.close();
 }
 
 fn wait_for_live_shutdown(
@@ -1477,6 +2058,31 @@ fn run_network(inputs: NetworkInputs) -> ShutdownOutcome {
     runtime.block_on(run_dispatcher(inputs))
 }
 
+fn close_broker_sessions(providers: &BrokerageProviders) -> bool {
+    let providers = providers.clone();
+    let Ok(join) = thread::Builder::new()
+        .name("kabu-broker-shutdown-retry".into())
+        .spawn(move || {
+            let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                return false;
+            };
+            runtime.block_on(async {
+                let mut succeeded = true;
+                for provider in providers.values() {
+                    succeeded &= provider.close_session().await.is_ok();
+                }
+                succeeded
+            })
+        })
+    else {
+        return false;
+    };
+    join.join().unwrap_or(false)
+}
+
 async fn run_dispatcher(inputs: NetworkInputs) -> ShutdownOutcome {
     let NetworkInputs {
         commands,
@@ -1485,6 +2091,10 @@ async fn run_dispatcher(inputs: NetworkInputs) -> ShutdownOutcome {
         events,
         shutdown,
         providers,
+        brokerage_providers,
+        authorization_url_opener,
+        brokerage_commands,
+        brokerage_notifications,
         storage,
         catalog_client,
     } = inputs;
@@ -1500,6 +2110,10 @@ async fn run_dispatcher(inputs: NetworkInputs) -> ShutdownOutcome {
     let mut other_in_flight = 0usize;
     let mut visible = true;
     let mut coordinator = Coordinator::new(providers.clone(), events.clone(), Vec::new());
+    let mut brokerage = BrokerageRuntime::new(brokerage_providers, authorization_url_opener);
+    let first_portfolio_refresh = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+    let mut portfolio_refreshes =
+        tokio::time::interval_at(first_portfolio_refresh, std::time::Duration::from_secs(60));
     let (persistence_notify, persistence_notifications) = async_channel::bounded(1);
     let persistence = Arc::new(PersistenceLane {
         desired: Mutex::new(DesiredPersistence::default()),
@@ -1585,6 +2199,17 @@ async fn run_dispatcher(inputs: NetworkInputs) -> ShutdownOutcome {
                     continue;
                 }
             }
+            brokerage_ready = brokerage_notifications.recv() => {
+                if brokerage_ready.is_err() {
+                    continue;
+                }
+                for command in brokerage_commands.take() {
+                    brokerage.apply(command, &events).await;
+                }
+            }
+            _ = portfolio_refreshes.tick() => {
+                brokerage.scheduled_refresh(&events).await;
+            }
             completed = jobs.join_next(), if !jobs.is_empty() => {
                 if completed.is_some() {
                     other_in_flight = other_in_flight.saturating_sub(1);
@@ -1626,6 +2251,11 @@ async fn run_dispatcher(inputs: NetworkInputs) -> ShutdownOutcome {
                     RuntimeCommand::SetCryptoWatchlist(watchlist) => {
                         coordinator.set_crypto_watchlist(watchlist).await;
                     }
+                    RuntimeCommand::ConnectBroker(_)
+                    | RuntimeCommand::CancelBrokerConnection(_)
+                    | RuntimeCommand::RefreshPortfolio(_)
+                    | RuntimeCommand::DisconnectBroker(_)
+                    | RuntimeCommand::SetPortfolioVisible(_) => {}
                     RuntimeCommand::PersistState(state) => {
                         persistence.update_state(state);
                     }
@@ -1643,6 +2273,7 @@ async fn run_dispatcher(inputs: NetworkInputs) -> ShutdownOutcome {
     jobs.abort_all();
     while jobs.join_next().await.is_some() {}
     coordinator.shutdown().await;
+    let brokerage_shutdown_failed = !brokerage.shutdown(&events).await;
     if let Some(job) = catalog_job.take() {
         job.abort();
         _ = job.await;
@@ -1661,11 +2292,13 @@ async fn run_dispatcher(inputs: NetworkInputs) -> ShutdownOutcome {
     persistence.notify.close();
     _ = persistence_job.await;
     let Some(final_flush) = final_flush else {
-        return ShutdownOutcome::success_without_flush();
+        let mut outcome = ShutdownOutcome::success_without_flush();
+        outcome.brokerage_shutdown_failed = brokerage_shutdown_failed;
+        return outcome;
     };
     let repository_for_flush = repository.clone();
     let cache_for_flush = cache_state.clone();
-    let outcome = tokio::task::spawn_blocking(move || {
+    let mut outcome = tokio::task::spawn_blocking(move || {
         persist_final_flush(
             repository_for_flush.as_ref(),
             &cache_for_flush,
@@ -1674,6 +2307,7 @@ async fn run_dispatcher(inputs: NetworkInputs) -> ShutdownOutcome {
     })
     .await
     .unwrap_or_else(|_| ShutdownOutcome::runtime_failed());
+    outcome.brokerage_shutdown_failed = brokerage_shutdown_failed;
     publish_persistence_outcome(&events, PersistenceCategory::State, outcome.state).await;
     publish_persistence_outcome(
         &events,
@@ -1782,6 +2416,7 @@ fn persist_final_flush(
         state: Some(persistence_result(repository.save_state(&flush.state))),
         market_cache: Some(persist_final_cache(repository, cache_state, &flush.cache)),
         runtime_failed: false,
+        brokerage_shutdown_failed: false,
     }
 }
 
@@ -1807,6 +2442,7 @@ fn retry_final_flush(
         state,
         market_cache,
         runtime_failed: false,
+        brokerage_shutdown_failed: previous.brokerage_shutdown_failed,
     }
 }
 
@@ -1849,6 +2485,11 @@ fn spawn_other_job(
             | RuntimeCommand::SetVisible(_)
             | RuntimeCommand::SetWatchlist(_)
             | RuntimeCommand::SetCryptoWatchlist(_)
+            | RuntimeCommand::ConnectBroker(_)
+            | RuntimeCommand::CancelBrokerConnection(_)
+            | RuntimeCommand::RefreshPortfolio(_)
+            | RuntimeCommand::DisconnectBroker(_)
+            | RuntimeCommand::SetPortfolioVisible(_)
             | RuntimeCommand::PersistState(_)
             | RuntimeCommand::PersistMarketCache { .. }
             | RuntimeCommand::Shutdown => {}
@@ -2031,18 +2672,22 @@ async fn refresh_catalog_cache(
 #[cfg(test)]
 mod tests {
     use super::{
-        PersistenceCategory, PersistenceResult, ProductionComponents, ProviderSet, RuntimeCommand,
+        AuthorizationUrlOpener, BrokerageProviders, PersistenceCategory, PersistenceResult,
+        ProductionAuthorizationUrlOpener, ProductionComponents, ProviderSet, RuntimeCommand,
         RuntimeEvent, RuntimeHandle, StreamStatus, refresh_catalog_cache,
     };
     use crate::app_model::{AppModel, ChartAvailability};
     use async_trait::async_trait;
     use kabu_core::{
-        CachedMarketState, Candle, ChartHistory, ChartPeriod, ChartRequestKey, DataSource,
-        Generation, Instrument, InstrumentId, InstrumentSearch, MarketDataError,
-        MarketDataErrorKind, MarketState, PersistedState, PersistenceError, Quote, QuoteSnapshots,
-        QuoteStream, QuoteSubscription, SearchResult, StateRepository,
+        Brokerage, BrokerageError, BrokerageErrorKind, CachedMarketState, Candle, ChartHistory,
+        ChartPeriod, ChartRequestKey, DataSource, Generation, Instrument, InstrumentId,
+        InstrumentSearch, MarketDataError, MarketDataErrorKind, MarketState, PersistedState,
+        PersistenceError, PortfolioProvider, PortfolioSnapshot, Quote, QuoteSnapshots, QuoteStream,
+        QuoteSubscription, SearchResult, StateRepository,
     };
+    use kabu_data::BrokerageClient;
     use std::{
+        collections::VecDeque,
         sync::{
             Arc, Condvar, Mutex,
             atomic::{AtomicUsize, Ordering},
@@ -2054,6 +2699,582 @@ mod tests {
         Mock, MockServer, ResponseTemplate,
         matchers::{method, path},
     };
+
+    #[test]
+    fn newer_portfolio_event_replaces_pending_event_for_same_broker() {
+        let (sender, events) = super::runtime_event_channel();
+        sender
+            .publish(RuntimeEvent::PortfolioUpdated(portfolio_snapshot(
+                Brokerage::Robinhood,
+                1,
+            )))
+            .expect("first");
+        sender
+            .publish(RuntimeEvent::PortfolioUpdated(portfolio_snapshot(
+                Brokerage::Robinhood,
+                2,
+            )))
+            .expect("second");
+
+        let RuntimeEvent::PortfolioUpdated(actual) = events.try_recv().expect("latest") else {
+            panic!("expected portfolio event");
+        };
+        assert_eq!(actual, portfolio_snapshot(Brokerage::Robinhood, 2));
+        assert!(events.try_recv().is_err());
+    }
+
+    #[test]
+    fn repeated_refresh_keeps_one_job_per_broker() {
+        let provider = Arc::new(BlockingPortfolioProvider::new(Brokerage::Robinhood));
+        let runtime = live_runtime_with_broker(provider.clone());
+
+        runtime
+            .send(RuntimeCommand::RefreshPortfolio(Brokerage::Robinhood))
+            .expect("first");
+        wait_for_counter(&provider.refresh.started, 1);
+        runtime
+            .send(RuntimeCommand::RefreshPortfolio(Brokerage::Robinhood))
+            .expect("second");
+        wait_for_counter(&provider.refresh.started, 2);
+
+        assert_eq!(provider.refresh.maximum.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.refresh.active.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.refresh.cancelled.load(Ordering::SeqCst), 1);
+        runtime.shutdown();
+    }
+
+    #[test]
+    fn connection_refresh_and_manual_refresh_never_call_broker_concurrently() {
+        let provider = Arc::new(
+            TestBrokerageProvider::new(Brokerage::Robinhood)
+                .with_refreshes([PortfolioBehavior::Block, PortfolioBehavior::Block]),
+        );
+        let runtime = live_runtime_with_broker_client(provider.clone());
+        runtime
+            .send(RuntimeCommand::ConnectBroker(Brokerage::Robinhood))
+            .expect("connect");
+        wait_for_counter(&provider.refresh.started, 1);
+
+        runtime
+            .send(RuntimeCommand::RefreshPortfolio(Brokerage::Robinhood))
+            .expect("manual refresh");
+        thread::sleep(Duration::from_millis(20));
+
+        assert_eq!(provider.refresh.started.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.refresh.maximum.load(Ordering::SeqCst), 1);
+        provider.release_one_refresh();
+        wait_for_counter(&provider.refresh.started, 2);
+        assert_eq!(provider.refresh.maximum.load(Ordering::SeqCst), 1);
+        runtime.shutdown();
+    }
+
+    #[test]
+    fn hiding_overlapping_connection_and_refresh_finishes_disconnected() {
+        let provider = Arc::new(
+            TestBrokerageProvider::new(Brokerage::Robinhood)
+                .with_refreshes([PortfolioBehavior::Block, PortfolioBehavior::Block]),
+        );
+        let runtime = live_runtime_with_broker_client(provider.clone());
+        runtime
+            .send(RuntimeCommand::ConnectBroker(Brokerage::Robinhood))
+            .expect("connect");
+        wait_for_counter(&provider.refresh.started, 1);
+        runtime
+            .send(RuntimeCommand::RefreshPortfolio(Brokerage::Robinhood))
+            .expect("queued manual refresh");
+
+        runtime
+            .send(RuntimeCommand::SetPortfolioVisible(false))
+            .expect("hide");
+        wait_for_counter(&provider.closes, 1);
+        wait_for_broker_state(&runtime, Brokerage::Robinhood, |state| {
+            matches!(state, kabu_core::BrokerageConnectionState::Disconnected)
+        });
+        assert_eq!(provider.refresh.active.load(Ordering::SeqCst), 0);
+        runtime.shutdown();
+    }
+
+    #[test]
+    fn newer_connection_state_replaces_pending_state_for_same_broker() {
+        let (sender, events) = super::runtime_event_channel();
+        sender
+            .publish(RuntimeEvent::BrokerConnectionChanged {
+                brokerage: Brokerage::Robinhood,
+                state: kabu_core::BrokerageConnectionState::Connecting,
+            })
+            .expect("connecting");
+        sender
+            .publish(RuntimeEvent::BrokerConnectionChanged {
+                brokerage: Brokerage::Robinhood,
+                state: kabu_core::BrokerageConnectionState::Connected {
+                    last_synced_at: None,
+                },
+            })
+            .expect("connected");
+
+        assert!(matches!(
+            events.try_recv().expect("latest state"),
+            RuntimeEvent::BrokerConnectionChanged {
+                brokerage: Brokerage::Robinhood,
+                state: kabu_core::BrokerageConnectionState::Connected { .. },
+            }
+        ));
+        assert!(events.try_recv().is_err());
+    }
+
+    #[test]
+    fn brokerage_fixed_slots_do_not_consume_quote_dynamic_capacity() {
+        let (sender, _events) = super::runtime_event_channel();
+        for index in 0..super::QUOTE_EVENT_SLOT_CAPACITY {
+            sender
+                .publish(RuntimeEvent::Quotes(vec![test_quote(
+                    distinct_equity_id(index),
+                    DataSource::Yahoo,
+                )]))
+                .expect("quote");
+        }
+        for brokerage in [Brokerage::Robinhood, Brokerage::Longbridge] {
+            sender
+                .publish(RuntimeEvent::BrokerConnectionChanged {
+                    brokerage,
+                    state: kabu_core::BrokerageConnectionState::Disconnected,
+                })
+                .expect("broker state");
+            sender
+                .publish(RuntimeEvent::PortfolioUpdated(portfolio_snapshot(
+                    brokerage, 1,
+                )))
+                .expect("portfolio");
+        }
+
+        let state = sender
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(
+            state
+                .slots
+                .keys()
+                .filter(|slot| matches!(slot, super::RuntimeEventSlot::Quote(_)))
+                .count(),
+            super::QUOTE_EVENT_SLOT_CAPACITY
+        );
+        assert_eq!(
+            state
+                .slots
+                .keys()
+                .filter(|slot| matches!(slot, super::RuntimeEventSlot::BrokerConnection(_)))
+                .count(),
+            2
+        );
+        assert_eq!(
+            state
+                .slots
+                .keys()
+                .filter(|slot| matches!(slot, super::RuntimeEventSlot::Portfolio(_)))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn portfolio_hide_and_restore_are_both_reliable_controls() {
+        let runtime = RuntimeHandle::default();
+
+        runtime
+            .send(RuntimeCommand::SetPortfolioVisible(false))
+            .expect("hide");
+        runtime
+            .send(RuntimeCommand::SetPortfolioVisible(true))
+            .expect("restore");
+
+        assert_eq!(
+            runtime.recorded_commands(),
+            vec![
+                RuntimeCommand::SetPortfolioVisible(false),
+                RuntimeCommand::SetPortfolioVisible(true),
+            ]
+        );
+    }
+
+    #[test]
+    fn connecting_uses_the_injected_opener_then_publishes_portfolio_and_connected() {
+        let provider = Arc::new(
+            TestBrokerageProvider::new(Brokerage::Robinhood)
+                .opening_authorization_url()
+                .with_refreshes([PortfolioBehavior::Complete(portfolio_snapshot(
+                    Brokerage::Robinhood,
+                    10,
+                ))]),
+        );
+        let opener = Arc::new(RecordingAuthorizationUrlOpener::new());
+        let runtime = live_runtime_with_broker_and_opener(provider.clone(), opener.clone());
+
+        runtime
+            .send(RuntimeCommand::ConnectBroker(Brokerage::Robinhood))
+            .expect("connect");
+        wait_for_counter(&provider.refresh.started, 1);
+        wait_for_broker_state(&runtime, Brokerage::Robinhood, |state| {
+            matches!(state, kabu_core::BrokerageConnectionState::Connected { .. })
+        });
+
+        let urls = opener
+            .urls
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(urls.len(), 1);
+        assert_eq!(urls[0].scheme(), "https");
+        assert_eq!(urls[0].host_str(), Some("broker.example"));
+        drop(urls);
+        assert_eq!(provider.connect.started.load(Ordering::SeqCst), 1);
+        runtime.shutdown();
+    }
+
+    #[test]
+    fn cancelling_connection_awaits_authorization_and_closes_without_disconnect() {
+        let provider = Arc::new(
+            TestBrokerageProvider::new(Brokerage::Robinhood).with_connect(ConnectBehavior::Block),
+        );
+        let runtime = live_runtime_with_broker_client(provider.clone());
+        runtime
+            .send(RuntimeCommand::ConnectBroker(Brokerage::Robinhood))
+            .expect("connect");
+        wait_for_counter(&provider.connect.started, 1);
+
+        runtime
+            .send(RuntimeCommand::CancelBrokerConnection(Brokerage::Robinhood))
+            .expect("cancel");
+        wait_for_counter(&provider.closes, 1);
+
+        assert_eq!(provider.connect.active.load(Ordering::SeqCst), 0);
+        assert_eq!(provider.connect.cancelled.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.disconnects.load(Ordering::SeqCst), 0);
+        wait_for_broker_state(&runtime, Brokerage::Robinhood, |state| {
+            matches!(state, kabu_core::BrokerageConnectionState::Disconnected)
+        });
+        runtime.shutdown();
+    }
+
+    #[test]
+    fn repeated_connect_keeps_one_authorization_job_per_broker() {
+        let provider = Arc::new(
+            TestBrokerageProvider::new(Brokerage::Robinhood).with_connect(ConnectBehavior::Block),
+        );
+        let runtime = live_runtime_with_broker_client(provider.clone());
+        runtime
+            .send(RuntimeCommand::ConnectBroker(Brokerage::Robinhood))
+            .expect("first connect");
+        wait_for_counter(&provider.connect.started, 1);
+
+        runtime
+            .send(RuntimeCommand::ConnectBroker(Brokerage::Robinhood))
+            .expect("replacement connect");
+        wait_for_counter(&provider.connect.started, 2);
+
+        assert_eq!(provider.connect.maximum.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.connect.active.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.connect.cancelled.load(Ordering::SeqCst), 1);
+        runtime.shutdown();
+    }
+
+    #[test]
+    fn restore_refreshes_stale_connected_broker_and_hide_cancels_that_refresh() {
+        let provider = Arc::new(
+            TestBrokerageProvider::new(Brokerage::Robinhood).with_refreshes([
+                PortfolioBehavior::Complete(portfolio_snapshot(Brokerage::Robinhood, 10)),
+                PortfolioBehavior::Block,
+            ]),
+        );
+        let runtime = live_runtime_with_broker_client(provider.clone());
+        runtime
+            .send(RuntimeCommand::ConnectBroker(Brokerage::Robinhood))
+            .expect("connect");
+        wait_for_counter(&provider.refresh.started, 1);
+        wait_for_broker_state(&runtime, Brokerage::Robinhood, |state| {
+            matches!(state, kabu_core::BrokerageConnectionState::Connected { .. })
+        });
+
+        runtime
+            .send(RuntimeCommand::SetPortfolioVisible(false))
+            .expect("hide");
+        runtime
+            .send(RuntimeCommand::SetPortfolioVisible(true))
+            .expect("restore");
+        wait_for_counter(&provider.refresh.started, 2);
+        assert_eq!(provider.refresh.active.load(Ordering::SeqCst), 1);
+
+        runtime
+            .send(RuntimeCommand::SetPortfolioVisible(false))
+            .expect("hide during refresh");
+        wait_for_counter(&provider.refresh.cancelled, 1);
+        assert_eq!(provider.refresh.active.load(Ordering::SeqCst), 0);
+        assert_eq!(provider.disconnects.load(Ordering::SeqCst), 0);
+        runtime.shutdown();
+    }
+
+    #[test]
+    fn restore_refresh_selection_uses_snapshot_age_per_broker() {
+        let robinhood: Arc<dyn BrokerageClient> =
+            Arc::new(TestBrokerageProvider::new(Brokerage::Robinhood));
+        let longbridge: Arc<dyn BrokerageClient> =
+            Arc::new(TestBrokerageProvider::new(Brokerage::Longbridge));
+        let mut providers = BrokerageProviders::new();
+        providers.insert(Brokerage::Robinhood, robinhood);
+        providers.insert(Brokerage::Longbridge, longbridge);
+        let brokerage = super::BrokerageRuntime::new(
+            providers,
+            Arc::new(RecordingAuthorizationUrlOpener::new()),
+        );
+        let now = chrono::Utc::now();
+        {
+            let mut states = brokerage
+                .states
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            states.insert(
+                Brokerage::Robinhood,
+                kabu_core::BrokerageConnectionState::Connected {
+                    last_synced_at: Some(now - chrono::Duration::seconds(61)),
+                },
+            );
+            states.insert(
+                Brokerage::Longbridge,
+                kabu_core::BrokerageConnectionState::Connected {
+                    last_synced_at: Some(now - chrono::Duration::seconds(30)),
+                },
+            );
+        }
+        {
+            let mut snapshots = brokerage
+                .snapshots
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            snapshots.insert(Brokerage::Robinhood, now - chrono::Duration::seconds(61));
+            snapshots.insert(Brokerage::Longbridge, now - chrono::Duration::seconds(30));
+        }
+
+        let stale = brokerage.connected_brokers_needing_refresh();
+        assert_eq!(stale.len(), 1);
+        assert!(stale.contains(&Brokerage::Robinhood));
+    }
+
+    #[tokio::test]
+    async fn scheduled_tick_does_not_refresh_a_snapshot_younger_than_sixty_seconds() {
+        let provider = Arc::new(
+            TestBrokerageProvider::new(Brokerage::Robinhood)
+                .with_refreshes([PortfolioBehavior::Block]),
+        );
+        let mut providers = BrokerageProviders::new();
+        providers.insert(
+            Brokerage::Robinhood,
+            provider.clone() as Arc<dyn BrokerageClient>,
+        );
+        let mut brokerage = super::BrokerageRuntime::new(
+            providers,
+            Arc::new(RecordingAuthorizationUrlOpener::new()),
+        );
+        let now = chrono::Utc::now();
+        brokerage
+            .states
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(
+                Brokerage::Robinhood,
+                kabu_core::BrokerageConnectionState::Connected {
+                    last_synced_at: Some(now),
+                },
+            );
+        brokerage
+            .snapshots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(Brokerage::Robinhood, now);
+        let (events, _receiver) = super::runtime_event_channel();
+
+        brokerage.scheduled_refresh(&events).await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(provider.refresh.started.load(Ordering::SeqCst), 0);
+        brokerage.shutdown(&events).await;
+    }
+
+    #[test]
+    fn hide_publishes_sanitized_error_when_authorization_session_close_fails() {
+        let provider = Arc::new(
+            TestBrokerageProvider::new(Brokerage::Robinhood)
+                .with_connect(ConnectBehavior::Block)
+                .with_close_error(),
+        );
+        let runtime = live_runtime_with_broker_client(provider.clone());
+        runtime
+            .send(RuntimeCommand::ConnectBroker(Brokerage::Robinhood))
+            .expect("connect");
+        wait_for_counter(&provider.connect.started, 1);
+
+        runtime
+            .send(RuntimeCommand::SetPortfolioVisible(false))
+            .expect("hide");
+        wait_for_counter(&provider.closes, 1);
+        let state = wait_for_broker_state(&runtime, Brokerage::Robinhood, |state| {
+            matches!(state, kabu_core::BrokerageConnectionState::Error { .. })
+        });
+
+        let kabu_core::BrokerageConnectionState::Error { message } = state else {
+            panic!("expected error state");
+        };
+        assert_eq!(
+            message,
+            "This broker is temporarily unavailable. Please try again later."
+        );
+        assert!(!message.contains("private"));
+        runtime.shutdown();
+    }
+
+    #[test]
+    fn refresh_failure_publishes_only_the_fixed_safe_message() {
+        let provider = Arc::new(
+            TestBrokerageProvider::new(Brokerage::Robinhood)
+                .with_refreshes([PortfolioBehavior::Fail(BrokerageErrorKind::RateLimited)]),
+        );
+        let runtime = live_runtime_with_broker_client(provider.clone());
+
+        runtime
+            .send(RuntimeCommand::RefreshPortfolio(Brokerage::Robinhood))
+            .expect("refresh");
+        let state = wait_for_broker_state(&runtime, Brokerage::Robinhood, |state| {
+            matches!(state, kabu_core::BrokerageConnectionState::Error { .. })
+        });
+
+        let kabu_core::BrokerageConnectionState::Error { message } = state else {
+            panic!("expected error state");
+        };
+        assert_eq!(
+            message,
+            "The broker is receiving too many requests. Please try again shortly."
+        );
+        runtime.shutdown();
+    }
+
+    #[test]
+    fn explicit_disconnect_cancels_work_and_uses_credential_clearing_operation() {
+        let provider = Arc::new(
+            TestBrokerageProvider::new(Brokerage::Robinhood).with_connect(ConnectBehavior::Block),
+        );
+        let runtime = live_runtime_with_broker_client(provider.clone());
+        runtime
+            .send(RuntimeCommand::ConnectBroker(Brokerage::Robinhood))
+            .expect("connect");
+        wait_for_counter(&provider.connect.started, 1);
+
+        runtime
+            .send(RuntimeCommand::DisconnectBroker(Brokerage::Robinhood))
+            .expect("disconnect");
+        wait_for_counter(&provider.disconnects, 1);
+
+        assert_eq!(provider.connect.active.load(Ordering::SeqCst), 0);
+        assert_eq!(provider.connect.cancelled.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.closes.load(Ordering::SeqCst), 0);
+        wait_for_broker_state(&runtime, Brokerage::Robinhood, |state| {
+            matches!(state, kabu_core::BrokerageConnectionState::Disconnected)
+        });
+        runtime.shutdown();
+    }
+
+    #[test]
+    fn brokerage_work_starts_while_all_ordinary_job_slots_are_in_use() {
+        let market_probe = Arc::new(OperationProbe::default());
+        let providers = ProviderSet {
+            equities: Arc::new(ControlledProvider::new(
+                DataSource::Yahoo,
+                market_probe.clone(),
+                Duration::from_secs(30),
+            )),
+            crypto: Arc::new(FakeProvider::immediate(DataSource::Binance, Vec::new())),
+        };
+        let broker = Arc::new(
+            TestBrokerageProvider::new(Brokerage::Robinhood).with_connect(ConnectBehavior::Block),
+        );
+        let runtime = live_runtime_with_providers_and_broker(providers, broker.clone());
+        let instrument = aapl_instrument();
+        for _ in 0..super::MAX_CONCURRENT_OTHER_JOBS {
+            runtime
+                .send(RuntimeCommand::History {
+                    generation: kabu_core::Generation::default().next(),
+                    instrument: instrument.clone(),
+                    period: ChartPeriod::OneDay,
+                })
+                .expect("ordinary job");
+        }
+        wait_for_counter(&market_probe.started, super::MAX_CONCURRENT_OTHER_JOBS);
+
+        runtime
+            .send(RuntimeCommand::ConnectBroker(Brokerage::Robinhood))
+            .expect("broker control remains available");
+        wait_for_counter(&broker.connect.started, 1);
+
+        assert_eq!(market_probe.active.load(Ordering::SeqCst), 31);
+        runtime.shutdown();
+    }
+
+    #[test]
+    fn shutdown_closes_broker_session_before_final_flush_without_clearing_credentials() {
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let provider =
+            Arc::new(TestBrokerageProvider::new(Brokerage::Robinhood).with_order(order.clone()));
+        let repository = Arc::new(OrderingRepository {
+            order: order.clone(),
+        });
+        let runtime = live_runtime_with_components(
+            default_provider_set(),
+            provider.clone(),
+            Arc::new(RecordingAuthorizationUrlOpener::new()),
+            repository,
+        );
+
+        runtime.begin_shutdown_with_flush(PersistedState::starter(), CachedMarketState::default());
+        let outcome = runtime
+            .wait_for_shutdown(Duration::from_secs(1))
+            .expect("shutdown");
+
+        assert!(outcome.is_success());
+        assert_eq!(provider.closes.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.disconnects.load(Ordering::SeqCst), 0);
+        let order = order
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let close = order
+            .iter()
+            .position(|step| *step == "close")
+            .expect("close");
+        let save = order
+            .iter()
+            .position(|step| *step == "save-state")
+            .expect("save state");
+        assert!(
+            close < save,
+            "broker sessions close before final persistence"
+        );
+        assert_eq!(
+            runtime.send(RuntimeCommand::ConnectBroker(Brokerage::Robinhood)),
+            Err(super::RuntimeSendError::Closed)
+        );
+    }
+
+    #[test]
+    fn failed_broker_session_close_makes_shutdown_outcome_unsuccessful() {
+        let provider =
+            Arc::new(TestBrokerageProvider::new(Brokerage::Robinhood).with_close_error());
+        let runtime = live_runtime_with_broker_client(provider.clone());
+
+        runtime.begin_shutdown();
+        let outcome = runtime
+            .wait_for_shutdown(Duration::from_secs(1))
+            .expect("shutdown acknowledgement");
+
+        assert!(!outcome.is_success());
+        assert!(runtime.retry_shutdown_persistence().is_success());
+        assert_eq!(provider.closes.load(Ordering::SeqCst), 2);
+    }
 
     #[test]
     fn distinct_event_flood_has_fixed_cardinality_and_retains_terminal_state() {
@@ -2174,7 +3395,9 @@ mod tests {
                 RuntimeEvent::StreamStatus(next) => status = Some(next),
                 RuntimeEvent::SearchProviderCompleted { .. }
                 | RuntimeEvent::HistoryCompleted { .. }
-                | RuntimeEvent::HistoryFailed { .. } => {}
+                | RuntimeEvent::HistoryFailed { .. }
+                | RuntimeEvent::BrokerConnectionChanged { .. }
+                | RuntimeEvent::PortfolioUpdated(_) => {}
             }
         }
         assert!(saw_final_quote);
@@ -2290,7 +3513,9 @@ mod tests {
                 | RuntimeEvent::QuoteError { .. }
                 | RuntimeEvent::CatalogRefresh { .. }
                 | RuntimeEvent::PersistenceCompleted { .. }
-                | RuntimeEvent::StreamStatus(_) => {}
+                | RuntimeEvent::StreamStatus(_)
+                | RuntimeEvent::BrokerConnectionChanged { .. }
+                | RuntimeEvent::PortfolioUpdated(_) => {}
             }
         }
         assert_eq!(history_generation, Some(current));
@@ -2806,6 +4031,8 @@ mod tests {
             };
             let runtime = RuntimeHandle::start_inner(
                 providers,
+                BrokerageProviders::new(),
+                Arc::new(ProductionAuthorizationUrlOpener),
                 Arc::new(NoopRepository),
                 CachedMarketState::default(),
                 Some(client),
@@ -3925,6 +5152,388 @@ mod tests {
                     && error.kind == MarketDataErrorKind::Timeout
         )));
         runtime.shutdown();
+    }
+
+    struct RecordingAuthorizationUrlOpener {
+        urls: Mutex<Vec<url::Url>>,
+    }
+
+    impl RecordingAuthorizationUrlOpener {
+        fn new() -> Self {
+            Self {
+                urls: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum ConnectBehavior {
+        Complete,
+        Block,
+    }
+
+    enum PortfolioBehavior {
+        Complete(PortfolioSnapshot),
+        Block,
+        Fail(BrokerageErrorKind),
+    }
+
+    struct TestBrokerageProvider {
+        brokerage: Brokerage,
+        connect_behavior: ConnectBehavior,
+        opens_authorization_url: bool,
+        refresh_behaviors: Mutex<VecDeque<PortfolioBehavior>>,
+        refresh_release: async_channel::Receiver<()>,
+        release_refresh: async_channel::Sender<()>,
+        connect: Arc<OperationProbe>,
+        refresh: Arc<OperationProbe>,
+        closes: AtomicUsize,
+        disconnects: AtomicUsize,
+        close_failures: AtomicUsize,
+        order: Option<Arc<Mutex<Vec<&'static str>>>>,
+    }
+
+    impl TestBrokerageProvider {
+        fn new(brokerage: Brokerage) -> Self {
+            let (release_refresh, refresh_release) = async_channel::unbounded();
+            Self {
+                brokerage,
+                connect_behavior: ConnectBehavior::Complete,
+                opens_authorization_url: false,
+                refresh_behaviors: Mutex::new(VecDeque::new()),
+                refresh_release,
+                release_refresh,
+                connect: Arc::new(OperationProbe::default()),
+                refresh: Arc::new(OperationProbe::default()),
+                closes: AtomicUsize::new(0),
+                disconnects: AtomicUsize::new(0),
+                close_failures: AtomicUsize::new(0),
+                order: None,
+            }
+        }
+
+        fn with_connect(mut self, behavior: ConnectBehavior) -> Self {
+            self.connect_behavior = behavior;
+            self
+        }
+
+        fn opening_authorization_url(mut self) -> Self {
+            self.opens_authorization_url = true;
+            self
+        }
+
+        fn with_refreshes(self, behaviors: impl IntoIterator<Item = PortfolioBehavior>) -> Self {
+            *self
+                .refresh_behaviors
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = behaviors.into_iter().collect();
+            self
+        }
+
+        fn with_close_error(mut self) -> Self {
+            self.close_failures = AtomicUsize::new(1);
+            self
+        }
+
+        fn with_order(mut self, order: Arc<Mutex<Vec<&'static str>>>) -> Self {
+            self.order = Some(order);
+            self
+        }
+
+        fn release_one_refresh(&self) {
+            self.release_refresh.try_send(()).expect("release refresh");
+        }
+
+        fn record(&self, step: &'static str) {
+            if let Some(order) = &self.order {
+                order
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(step);
+            }
+        }
+    }
+
+    #[async_trait]
+    impl BrokerageClient for TestBrokerageProvider {
+        async fn connect(
+            &self,
+            open_authorization_url: &(
+                 dyn for<'url> Fn(&'url url::Url) -> Result<(), BrokerageError> + Send + Sync
+             ),
+        ) -> Result<(), BrokerageError> {
+            let guard = OperationGuard::begin(self.connect.clone());
+            if self.opens_authorization_url {
+                let url = url::Url::parse("https://broker.example/authorize?private=secret")
+                    .expect("authorization URL");
+                open_authorization_url(&url)?;
+            }
+            match self.connect_behavior {
+                ConnectBehavior::Complete => {
+                    guard.complete();
+                    Ok(())
+                }
+                ConnectBehavior::Block => std::future::pending().await,
+            }
+        }
+
+        async fn close_session(&self) -> Result<(), BrokerageError> {
+            self.closes.fetch_add(1, Ordering::SeqCst);
+            self.record("close");
+            if self
+                .close_failures
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+            {
+                Err(BrokerageError::new(BrokerageErrorKind::Unavailable))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[async_trait]
+    impl PortfolioProvider for TestBrokerageProvider {
+        fn brokerage(&self) -> Brokerage {
+            self.brokerage
+        }
+
+        async fn refresh_portfolio(&self) -> Result<PortfolioSnapshot, BrokerageError> {
+            let guard = OperationGuard::begin(self.refresh.clone());
+            let behavior = self
+                .refresh_behaviors
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .pop_front()
+                .unwrap_or_else(|| {
+                    PortfolioBehavior::Complete(portfolio_snapshot(
+                        self.brokerage,
+                        chrono::Utc::now().timestamp(),
+                    ))
+                });
+            match behavior {
+                PortfolioBehavior::Complete(snapshot) => {
+                    guard.complete();
+                    Ok(snapshot)
+                }
+                PortfolioBehavior::Block => {
+                    self.refresh_release
+                        .recv()
+                        .await
+                        .map_err(|_| BrokerageError::new(BrokerageErrorKind::Internal))?;
+                    guard.complete();
+                    Ok(portfolio_snapshot(
+                        self.brokerage,
+                        chrono::Utc::now().timestamp(),
+                    ))
+                }
+                PortfolioBehavior::Fail(kind) => {
+                    guard.complete();
+                    Err(BrokerageError::new(kind))
+                }
+            }
+        }
+
+        async fn disconnect(&self) -> Result<(), BrokerageError> {
+            self.disconnects.fetch_add(1, Ordering::SeqCst);
+            self.record("disconnect");
+            Ok(())
+        }
+    }
+
+    impl AuthorizationUrlOpener for RecordingAuthorizationUrlOpener {
+        fn open(&self, url: &url::Url) -> Result<(), BrokerageError> {
+            self.urls
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(url.clone());
+            Ok(())
+        }
+    }
+
+    struct BlockingPortfolioProvider {
+        brokerage: Brokerage,
+        refresh: Arc<OperationProbe>,
+        connects: AtomicUsize,
+        closes: AtomicUsize,
+        disconnects: AtomicUsize,
+    }
+
+    impl BlockingPortfolioProvider {
+        fn new(brokerage: Brokerage) -> Self {
+            Self {
+                brokerage,
+                refresh: Arc::new(OperationProbe::default()),
+                connects: AtomicUsize::new(0),
+                closes: AtomicUsize::new(0),
+                disconnects: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl BrokerageClient for BlockingPortfolioProvider {
+        async fn connect(
+            &self,
+            _open_authorization_url: &(
+                 dyn for<'url> Fn(&'url url::Url) -> Result<(), BrokerageError> + Send + Sync
+             ),
+        ) -> Result<(), BrokerageError> {
+            self.connects.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn close_session(&self) -> Result<(), BrokerageError> {
+            self.closes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl PortfolioProvider for BlockingPortfolioProvider {
+        fn brokerage(&self) -> Brokerage {
+            self.brokerage
+        }
+
+        async fn refresh_portfolio(&self) -> Result<PortfolioSnapshot, BrokerageError> {
+            let _guard = OperationGuard::begin(self.refresh.clone());
+            std::future::pending().await
+        }
+
+        async fn disconnect(&self) -> Result<(), BrokerageError> {
+            self.disconnects.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    fn live_runtime_with_broker(provider: Arc<BlockingPortfolioProvider>) -> RuntimeHandle {
+        live_runtime_with_components(
+            default_provider_set(),
+            provider,
+            Arc::new(RecordingAuthorizationUrlOpener::new()),
+            Arc::new(NoopRepository),
+        )
+    }
+
+    fn live_runtime_with_broker_client(provider: Arc<TestBrokerageProvider>) -> RuntimeHandle {
+        live_runtime_with_broker_and_opener(
+            provider,
+            Arc::new(RecordingAuthorizationUrlOpener::new()),
+        )
+    }
+
+    fn live_runtime_with_broker_and_opener(
+        provider: Arc<TestBrokerageProvider>,
+        opener: Arc<RecordingAuthorizationUrlOpener>,
+    ) -> RuntimeHandle {
+        live_runtime_with_components(
+            default_provider_set(),
+            provider,
+            opener,
+            Arc::new(NoopRepository),
+        )
+    }
+
+    fn live_runtime_with_providers_and_broker(
+        providers: ProviderSet,
+        broker: Arc<TestBrokerageProvider>,
+    ) -> RuntimeHandle {
+        live_runtime_with_components(
+            providers,
+            broker,
+            Arc::new(RecordingAuthorizationUrlOpener::new()),
+            Arc::new(NoopRepository),
+        )
+    }
+
+    fn live_runtime_with_components(
+        providers: ProviderSet,
+        provider: Arc<dyn BrokerageClient>,
+        opener: Arc<dyn AuthorizationUrlOpener>,
+        repository: Arc<dyn StateRepository>,
+    ) -> RuntimeHandle {
+        let mut brokerages = BrokerageProviders::new();
+        brokerages.insert(provider.brokerage(), provider);
+        RuntimeHandle::start_inner(
+            providers,
+            brokerages,
+            opener,
+            repository,
+            CachedMarketState::default(),
+            None,
+        )
+        .expect("runtime")
+    }
+
+    fn wait_for_broker_state(
+        runtime: &RuntimeHandle,
+        brokerage: Brokerage,
+        predicate: impl Fn(&kabu_core::BrokerageConnectionState) -> bool,
+    ) -> kabu_core::BrokerageConnectionState {
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_secs(1) {
+            while let Ok(event) = runtime.events().try_recv() {
+                if let RuntimeEvent::BrokerConnectionChanged {
+                    brokerage: candidate,
+                    state,
+                } = event
+                    && candidate == brokerage
+                    && predicate(&state)
+                {
+                    return state;
+                }
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        panic!("timed out waiting for broker state");
+    }
+
+    fn default_provider_set() -> ProviderSet {
+        ProviderSet {
+            equities: Arc::new(FakeProvider::immediate(DataSource::Yahoo, Vec::new())),
+            crypto: Arc::new(FakeProvider::immediate(DataSource::Binance, Vec::new())),
+        }
+    }
+
+    fn portfolio_snapshot(brokerage: Brokerage, second: i64) -> PortfolioSnapshot {
+        PortfolioSnapshot {
+            brokerage,
+            accounts: Vec::new(),
+            positions: Vec::new(),
+            received_at: chrono::DateTime::from_timestamp(second, 0).expect("timestamp"),
+        }
+    }
+
+    struct OrderingRepository {
+        order: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl StateRepository for OrderingRepository {
+        fn load_state(&self) -> Result<PersistedState, PersistenceError> {
+            Ok(PersistedState::starter())
+        }
+
+        fn save_state(&self, _: &PersistedState) -> Result<(), PersistenceError> {
+            self.order
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push("save-state");
+            Ok(())
+        }
+
+        fn load_cache(&self) -> Result<CachedMarketState, PersistenceError> {
+            Ok(CachedMarketState::default())
+        }
+
+        fn save_cache(&self, _: &CachedMarketState) -> Result<(), PersistenceError> {
+            self.order
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push("save-cache");
+            Ok(())
+        }
     }
 
     #[derive(Clone)]

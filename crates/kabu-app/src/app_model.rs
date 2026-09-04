@@ -714,6 +714,7 @@ impl AppModel {
                 self.apply_persistence_result(category, result);
             }
             RuntimeEvent::StreamStatus(status) => self.stream_status = status,
+            RuntimeEvent::BrokerConnectionChanged { .. } | RuntimeEvent::PortfolioUpdated(_) => {}
         }
     }
 
@@ -1192,6 +1193,11 @@ fn runtime_dispatch_kind(command: &RuntimeCommand) -> RuntimeDispatchKind {
         RuntimeCommand::SetVisible(_)
         | RuntimeCommand::SetWatchlist(_)
         | RuntimeCommand::SetCryptoWatchlist(_)
+        | RuntimeCommand::ConnectBroker(_)
+        | RuntimeCommand::CancelBrokerConnection(_)
+        | RuntimeCommand::RefreshPortfolio(_)
+        | RuntimeCommand::DisconnectBroker(_)
+        | RuntimeCommand::SetPortfolioVisible(_)
         | RuntimeCommand::Shutdown => RuntimeDispatchKind::Control,
         RuntimeCommand::PersistState(_) => RuntimeDispatchKind::StatePersistence,
         RuntimeCommand::PersistMarketCache { .. } => RuntimeDispatchKind::MarketCachePersistence,

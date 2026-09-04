@@ -33,6 +33,9 @@ pub trait BrokerageClient: PortfolioProvider {
              dyn for<'url> Fn(&'url Url) -> Result<(), BrokerageError> + Send + Sync
          ),
     ) -> Result<(), BrokerageError>;
+
+    /// Close only the live MCP session, preserving stored OAuth credentials.
+    async fn close_session(&self) -> Result<(), BrokerageError>;
 }
 
 fn malformed_response() -> BrokerageError {

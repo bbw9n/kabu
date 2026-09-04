@@ -254,6 +254,13 @@ impl BrokerageClient for LongbridgePortfolioProvider {
         *session = Some(self.start_session().await?);
         Ok(())
     }
+
+    async fn close_session(&self) -> Result<(), BrokerageError> {
+        match self.session.lock().await.take() {
+            Some(session) => session.close().await,
+            None => Ok(()),
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -283,12 +290,7 @@ impl PortfolioProvider for LongbridgePortfolioProvider {
     }
 
     async fn disconnect(&self) -> Result<(), BrokerageError> {
-        let session = self.session.lock().await.take();
-        let close_result = match session {
-            Some(session) => session.close().await,
-            None => Ok(()),
-        };
-        disconnect_after_close(close_result, self.oauth.disconnect()).await
+        disconnect_after_close(self.close_session().await, self.oauth.disconnect()).await
     }
 }
 
