@@ -17,6 +17,7 @@ kabu-data = { path = "../kabu-data" }
 rand.workspace = true
 reqwest.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
 url.workspace = true

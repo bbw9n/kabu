@@ -9,19 +9,21 @@ use kabu_core::{
 };
 use kabu_data::{BinanceClient, BrokerageClient, JsonRepository, Recovery, YahooClient};
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     fmt, io,
     path::Path,
-    process::Command,
+    process::{Command, Stdio},
     sync::{
         Arc, Condvar, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread::{self, JoinHandle},
 };
+use tokio_util::sync::CancellationToken;
 
 const COMMAND_CAPACITY: usize = 64;
 const MAX_CONCURRENT_OTHER_JOBS: usize = 31;
+const PORTFOLIO_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum RuntimeCommand {
@@ -624,12 +626,23 @@ struct ProductionAuthorizationUrlOpener;
 
 impl AuthorizationUrlOpener for ProductionAuthorizationUrlOpener {
     fn open(&self, url: &url::Url) -> Result<(), BrokerageError> {
-        Command::new("/usr/bin/open")
-            .arg(url.as_str())
-            .spawn()
-            .map(|_| ())
-            .map_err(|_| BrokerageError::new(BrokerageErrorKind::Internal))
+        let mut command = Command::new("/usr/bin/open");
+        command.arg(url.as_str());
+        run_authorization_browser_command(command)
     }
+}
+
+fn run_authorization_browser_command(mut command: Command) -> Result<(), BrokerageError> {
+    let status = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|_| BrokerageError::new(BrokerageErrorKind::Internal))?;
+    status
+        .success()
+        .then_some(())
+        .ok_or_else(|| BrokerageError::new(BrokerageErrorKind::Internal))
 }
 
 pub struct ProductionComponents {
@@ -860,12 +873,20 @@ struct PersistenceLane {
 struct BrokerageRuntime {
     providers: BrokerageProviders,
     authorization_url_opener: Arc<dyn AuthorizationUrlOpener>,
-    authorization_jobs: HashMap<Brokerage, tokio::task::JoinHandle<()>>,
+    authorization_jobs: HashMap<Brokerage, AuthorizationJob>,
     refresh_jobs: HashMap<Brokerage, tokio::task::JoinHandle<()>>,
     refresh_locks: HashMap<Brokerage, Arc<tokio::sync::Mutex<()>>>,
     states: Arc<Mutex<HashMap<Brokerage, BrokerageConnectionState>>>,
     snapshots: Arc<Mutex<HashMap<Brokerage, chrono::DateTime<chrono::Utc>>>>,
+    live_sessions: Arc<Mutex<HashSet<Brokerage>>>,
+    refresh_deadlines: Arc<Mutex<HashMap<Brokerage, tokio::time::Instant>>>,
+    refresh_schedule_changed: Arc<tokio::sync::Notify>,
     visible: bool,
+}
+
+struct AuthorizationJob {
+    cancellation: CancellationToken,
+    task: tokio::task::JoinHandle<()>,
 }
 
 impl Default for RuntimeHandle {
@@ -1588,6 +1609,9 @@ impl BrokerageRuntime {
             refresh_locks,
             states: Arc::new(Mutex::new(states)),
             snapshots: Arc::new(Mutex::new(HashMap::new())),
+            live_sessions: Arc::new(Mutex::new(HashSet::new())),
+            refresh_deadlines: Arc::new(Mutex::new(HashMap::new())),
+            refresh_schedule_changed: Arc::new(tokio::sync::Notify::new()),
             visible: true,
         }
     }
@@ -1614,7 +1638,7 @@ impl BrokerageRuntime {
     }
 
     async fn connect(&mut self, brokerage: Brokerage, events: &RuntimeEventSender) {
-        abort_brokerage_job(&mut self.authorization_jobs, brokerage).await;
+        cancel_authorization_job(&mut self.authorization_jobs, brokerage).await;
         abort_brokerage_job(&mut self.refresh_jobs, brokerage).await;
         let Some(provider) = self.providers.get(&brokerage).cloned() else {
             publish_brokerage_error(
@@ -1639,58 +1663,116 @@ impl BrokerageRuntime {
         let opener = self.authorization_url_opener.clone();
         let states = self.states.clone();
         let snapshots = self.snapshots.clone();
+        let live_sessions = self.live_sessions.clone();
+        let refresh_deadlines = self.refresh_deadlines.clone();
+        let refresh_schedule_changed = self.refresh_schedule_changed.clone();
         let events = events.clone();
+        let cancellation = CancellationToken::new();
+        let task_cancellation = cancellation.clone();
         self.authorization_jobs.insert(
             brokerage,
-            tokio::spawn(async move {
-                let open_authorization_url = |url: &url::Url| {
-                    publish_brokerage_state(
-                        &states,
-                        &events,
-                        brokerage,
-                        BrokerageConnectionState::Authorizing,
-                    );
-                    opener.open(url)
-                };
-                let result = async {
-                    provider.connect(&open_authorization_url).await?;
-                    let _refresh_guard = refresh_lock.lock().await;
-                    provider.refresh_portfolio().await
-                }
-                .await;
-                match result {
-                    Ok(snapshot) if snapshot.brokerage == brokerage => {
-                        snapshots
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner())
-                            .insert(brokerage, snapshot.received_at);
-                        let last_synced_at = snapshot.received_at;
-                        _ = events.try_send(RuntimeEvent::PortfolioUpdated(snapshot));
+            AuthorizationJob {
+                cancellation,
+                task: tokio::spawn(async move {
+                    let open_authorization_url = |url: &url::Url| {
                         publish_brokerage_state(
                             &states,
                             &events,
                             brokerage,
-                            BrokerageConnectionState::Connected {
-                                last_synced_at: Some(last_synced_at),
-                            },
+                            BrokerageConnectionState::Authorizing,
                         );
+                        opener.open(url)
+                    };
+                    let result = async {
+                        provider
+                            .connect(&open_authorization_url, task_cancellation.clone())
+                            .await?;
+                        live_sessions
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .insert(brokerage);
+                        tokio::select! {
+                            refresh = async {
+                                let _refresh_guard = refresh_lock.lock().await;
+                                provider.refresh_portfolio().await
+                            } => refresh,
+                            _ = task_cancellation.cancelled() => {
+                                Err(BrokerageError::new(BrokerageErrorKind::AuthorizationDenied))
+                            }
+                        }
                     }
-                    Ok(_) => publish_brokerage_error(
-                        &states,
-                        &events,
-                        brokerage,
-                        &BrokerageError::new(BrokerageErrorKind::MalformedResponse),
-                    ),
-                    Err(error) => {
-                        publish_brokerage_error(&states, &events, brokerage, &error);
+                    .await;
+                    match result {
+                        Ok(snapshot) if snapshot.brokerage == brokerage => {
+                            snapshots
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .insert(brokerage, snapshot.received_at);
+                            refresh_deadlines
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .insert(
+                                    brokerage,
+                                    tokio::time::Instant::now() + PORTFOLIO_REFRESH_INTERVAL,
+                                );
+                            refresh_schedule_changed.notify_one();
+                            let last_synced_at = snapshot.received_at;
+                            _ = events.try_send(RuntimeEvent::PortfolioUpdated(snapshot));
+                            publish_brokerage_state(
+                                &states,
+                                &events,
+                                brokerage,
+                                BrokerageConnectionState::Connected {
+                                    last_synced_at: Some(last_synced_at),
+                                },
+                            );
+                        }
+                        Ok(_) => {
+                            refresh_deadlines
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .insert(
+                                    brokerage,
+                                    tokio::time::Instant::now() + PORTFOLIO_REFRESH_INTERVAL,
+                                );
+                            refresh_schedule_changed.notify_one();
+                            publish_brokerage_error(
+                                &states,
+                                &events,
+                                brokerage,
+                                &BrokerageError::new(BrokerageErrorKind::MalformedResponse),
+                            );
+                        }
+                        Err(error) => {
+                            if error.kind == BrokerageErrorKind::Disconnected {
+                                live_sessions
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                    .remove(&brokerage);
+                            } else {
+                                refresh_deadlines
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                    .insert(
+                                        brokerage,
+                                        tokio::time::Instant::now() + PORTFOLIO_REFRESH_INTERVAL,
+                                    );
+                                refresh_schedule_changed.notify_one();
+                            }
+                            publish_brokerage_error(&states, &events, brokerage, &error);
+                        }
                     }
-                }
-            }),
+                }),
+            },
         );
     }
 
     async fn refresh(&mut self, brokerage: Brokerage, events: &RuntimeEventSender) {
         abort_brokerage_job(&mut self.refresh_jobs, brokerage).await;
+        self.refresh_deadlines
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&brokerage);
         let Some(provider) = self.providers.get(&brokerage).cloned() else {
             publish_brokerage_error(
                 &self.states,
@@ -1714,6 +1796,9 @@ impl BrokerageRuntime {
         );
         let states = self.states.clone();
         let snapshots = self.snapshots.clone();
+        let live_sessions = self.live_sessions.clone();
+        let refresh_deadlines = self.refresh_deadlines.clone();
+        let refresh_schedule_changed = self.refresh_schedule_changed.clone();
         let events = events.clone();
         self.refresh_jobs.insert(
             brokerage,
@@ -1725,6 +1810,14 @@ impl BrokerageRuntime {
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner())
                             .insert(brokerage, snapshot.received_at);
+                        refresh_deadlines
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .insert(
+                                brokerage,
+                                tokio::time::Instant::now() + PORTFOLIO_REFRESH_INTERVAL,
+                            );
+                        refresh_schedule_changed.notify_one();
                         let last_synced_at = snapshot.received_at;
                         _ = events.try_send(RuntimeEvent::PortfolioUpdated(snapshot));
                         publish_brokerage_state(
@@ -1736,13 +1829,38 @@ impl BrokerageRuntime {
                             },
                         );
                     }
-                    Ok(_) => publish_brokerage_error(
-                        &states,
-                        &events,
-                        brokerage,
-                        &BrokerageError::new(BrokerageErrorKind::MalformedResponse),
-                    ),
+                    Ok(_) => {
+                        refresh_deadlines
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .insert(
+                                brokerage,
+                                tokio::time::Instant::now() + PORTFOLIO_REFRESH_INTERVAL,
+                            );
+                        refresh_schedule_changed.notify_one();
+                        publish_brokerage_error(
+                            &states,
+                            &events,
+                            brokerage,
+                            &BrokerageError::new(BrokerageErrorKind::MalformedResponse),
+                        );
+                    }
                     Err(error) => {
+                        if error.kind == BrokerageErrorKind::Disconnected {
+                            live_sessions
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .remove(&brokerage);
+                        } else {
+                            refresh_deadlines
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .insert(
+                                    brokerage,
+                                    tokio::time::Instant::now() + PORTFOLIO_REFRESH_INTERVAL,
+                                );
+                            refresh_schedule_changed.notify_one();
+                        }
                         publish_brokerage_error(&states, &events, brokerage, &error);
                     }
                 }
@@ -1751,12 +1869,13 @@ impl BrokerageRuntime {
     }
 
     async fn cancel_connection(&mut self, brokerage: Brokerage, events: &RuntimeEventSender) {
-        abort_brokerage_job(&mut self.authorization_jobs, brokerage).await;
+        cancel_authorization_job(&mut self.authorization_jobs, brokerage).await;
         abort_brokerage_job(&mut self.refresh_jobs, brokerage).await;
         let result = match self.providers.get(&brokerage) {
             Some(provider) => provider.close_session().await,
             None => Err(BrokerageError::new(BrokerageErrorKind::Unavailable)),
         };
+        self.mark_session_closed(brokerage);
         events.clear_brokerage(brokerage);
         match result {
             Ok(()) => publish_brokerage_state(
@@ -1770,12 +1889,13 @@ impl BrokerageRuntime {
     }
 
     async fn disconnect(&mut self, brokerage: Brokerage, events: &RuntimeEventSender) {
-        abort_brokerage_job(&mut self.authorization_jobs, brokerage).await;
+        cancel_authorization_job(&mut self.authorization_jobs, brokerage).await;
         abort_brokerage_job(&mut self.refresh_jobs, brokerage).await;
         let result = match self.providers.get(&brokerage) {
             Some(provider) => provider.disconnect().await,
             None => Err(BrokerageError::new(BrokerageErrorKind::Unavailable)),
         };
+        self.mark_session_closed(brokerage);
         events.clear_brokerage(brokerage);
         self.snapshots
             .lock()
@@ -1795,13 +1915,14 @@ impl BrokerageRuntime {
     async fn set_visible(&mut self, visible: bool, events: &RuntimeEventSender) {
         self.visible = visible;
         if !visible {
-            let authorizing = abort_all_brokerage_jobs(&mut self.authorization_jobs).await;
+            let authorizing = cancel_all_authorization_jobs(&mut self.authorization_jobs).await;
             let refreshing = abort_all_brokerage_jobs(&mut self.refresh_jobs).await;
             for brokerage in &authorizing {
                 let result = match self.providers.get(brokerage) {
                     Some(provider) => provider.close_session().await,
                     None => Err(BrokerageError::new(BrokerageErrorKind::Unavailable)),
                 };
+                self.mark_session_closed(*brokerage);
                 match result {
                     Ok(()) => publish_brokerage_state(
                         &self.states,
@@ -1826,6 +1947,7 @@ impl BrokerageRuntime {
                         last_synced_at: brokerage_last_synced(&self.states, brokerage),
                     },
                 );
+                self.reschedule_from_snapshot(brokerage);
             }
             return;
         }
@@ -1837,8 +1959,8 @@ impl BrokerageRuntime {
     }
 
     fn connected_brokers_needing_refresh(&self) -> Vec<Brokerage> {
-        let states = self
-            .states
+        let live_sessions = self
+            .live_sessions
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let snapshots = self
@@ -1846,11 +1968,9 @@ impl BrokerageRuntime {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let now = chrono::Utc::now();
-        states
+        live_sessions
             .iter()
-            .filter_map(|(brokerage, state)| {
-                matches!(state, BrokerageConnectionState::Connected { .. }).then_some(*brokerage)
-            })
+            .copied()
             .filter(|brokerage| {
                 snapshots.get(brokerage).is_none_or(|received_at| {
                     now.signed_duration_since(*received_at) >= chrono::Duration::seconds(60)
@@ -1859,18 +1979,111 @@ impl BrokerageRuntime {
             .collect()
     }
 
+    #[cfg(test)]
+    fn mark_live_session(&self, brokerage: Brokerage) {
+        self.live_sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(brokerage);
+    }
+
+    fn mark_session_closed(&self, brokerage: Brokerage) {
+        self.live_sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&brokerage);
+        self.refresh_deadlines
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&brokerage);
+        self.refresh_schedule_changed.notify_one();
+    }
+
+    #[cfg(test)]
+    fn record_snapshot_completion(&self, brokerage: Brokerage, completed_at: tokio::time::Instant) {
+        self.refresh_deadlines
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(brokerage, completed_at + PORTFOLIO_REFRESH_INTERVAL);
+        self.refresh_schedule_changed.notify_one();
+    }
+
+    fn record_retry_deadline(&self, brokerage: Brokerage, deadline: tokio::time::Instant) {
+        self.refresh_deadlines
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(brokerage, deadline);
+        self.refresh_schedule_changed.notify_one();
+    }
+
+    fn reschedule_from_snapshot(&self, brokerage: Brokerage) {
+        let now = chrono::Utc::now();
+        let remaining = self
+            .snapshots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&brokerage)
+            .map(|received_at| {
+                PORTFOLIO_REFRESH_INTERVAL.saturating_sub(
+                    now.signed_duration_since(*received_at)
+                        .to_std()
+                        .unwrap_or_default(),
+                )
+            })
+            .unwrap_or_default();
+        self.record_retry_deadline(brokerage, tokio::time::Instant::now() + remaining);
+    }
+
+    fn brokers_due_for_refresh(&self, now: tokio::time::Instant) -> Vec<Brokerage> {
+        let live_sessions = self
+            .live_sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let deadlines = self
+            .refresh_deadlines
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        live_sessions
+            .iter()
+            .filter_map(|brokerage| {
+                deadlines
+                    .get(brokerage)
+                    .is_some_and(|deadline| *deadline <= now)
+                    .then_some(*brokerage)
+            })
+            .collect()
+    }
+
+    fn next_refresh_deadline(&self) -> Option<tokio::time::Instant> {
+        if !self.visible {
+            return None;
+        }
+        let live_sessions = self
+            .live_sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let deadlines = self
+            .refresh_deadlines
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        live_sessions
+            .iter()
+            .filter_map(|brokerage| deadlines.get(brokerage).copied())
+            .min()
+    }
+
     async fn scheduled_refresh(&mut self, events: &RuntimeEventSender) {
         if !self.visible {
             return;
         }
-        let stale = self.connected_brokers_needing_refresh();
-        for brokerage in stale {
+        let due = self.brokers_due_for_refresh(tokio::time::Instant::now());
+        for brokerage in due {
             self.refresh(brokerage, events).await;
         }
     }
 
     async fn shutdown(&mut self, events: &RuntimeEventSender) -> bool {
-        abort_all_brokerage_jobs(&mut self.authorization_jobs).await;
+        cancel_all_authorization_jobs(&mut self.authorization_jobs).await;
         abort_all_brokerage_jobs(&mut self.refresh_jobs).await;
         let mut succeeded = true;
         for (brokerage, provider) in &self.providers {
@@ -1881,6 +2094,34 @@ impl BrokerageRuntime {
         }
         succeeded
     }
+}
+
+async fn cancel_authorization_job(
+    jobs: &mut HashMap<Brokerage, AuthorizationJob>,
+    brokerage: Brokerage,
+) -> bool {
+    let Some(job) = jobs.remove(&brokerage) else {
+        return false;
+    };
+    let was_running = !job.task.is_finished();
+    job.cancellation.cancel();
+    _ = job.task.await;
+    was_running
+}
+
+async fn cancel_all_authorization_jobs(
+    jobs: &mut HashMap<Brokerage, AuthorizationJob>,
+) -> Vec<Brokerage> {
+    let jobs = std::mem::take(jobs);
+    let mut cancelled = Vec::new();
+    for (brokerage, job) in jobs {
+        if !job.task.is_finished() {
+            cancelled.push(brokerage);
+        }
+        job.cancellation.cancel();
+        _ = job.task.await;
+    }
+    cancelled
 }
 
 async fn abort_brokerage_job(
@@ -2111,9 +2352,6 @@ async fn run_dispatcher(inputs: NetworkInputs) -> ShutdownOutcome {
     let mut visible = true;
     let mut coordinator = Coordinator::new(providers.clone(), events.clone(), Vec::new());
     let mut brokerage = BrokerageRuntime::new(brokerage_providers, authorization_url_opener);
-    let first_portfolio_refresh = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
-    let mut portfolio_refreshes =
-        tokio::time::interval_at(first_portfolio_refresh, std::time::Duration::from_secs(60));
     let (persistence_notify, persistence_notifications) = async_channel::bounded(1);
     let persistence = Arc::new(PersistenceLane {
         desired: Mutex::new(DesiredPersistence::default()),
@@ -2190,6 +2428,8 @@ async fn run_dispatcher(inputs: NetworkInputs) -> ShutdownOutcome {
             spawn_other_job(command, &mut jobs, &events, &providers);
             other_in_flight += 1;
         }
+        let refresh_deadline = brokerage.next_refresh_deadline();
+        let refresh_schedule_changed = brokerage.refresh_schedule_changed.clone();
 
         tokio::select! {
             biased;
@@ -2207,9 +2447,15 @@ async fn run_dispatcher(inputs: NetworkInputs) -> ShutdownOutcome {
                     brokerage.apply(command, &events).await;
                 }
             }
-            _ = portfolio_refreshes.tick() => {
+            _ = async {
+                match refresh_deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
                 brokerage.scheduled_refresh(&events).await;
             }
+            _ = refresh_schedule_changed.notified() => {}
             completed = jobs.join_next(), if !jobs.is_empty() => {
                 if completed.is_some() {
                     other_in_flight = other_in_flight.saturating_sub(1);
@@ -2688,6 +2934,7 @@ mod tests {
     use kabu_data::BrokerageClient;
     use std::{
         collections::VecDeque,
+        process::Command,
         sync::{
             Arc, Condvar, Mutex,
             atomic::{AtomicUsize, Ordering},
@@ -2695,10 +2942,23 @@ mod tests {
         thread,
         time::{Duration, Instant},
     };
+    use tokio_util::sync::CancellationToken;
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
         matchers::{method, path},
     };
+
+    #[test]
+    fn failed_authorization_browser_command_is_a_sanitized_typed_error() {
+        let error = super::run_authorization_browser_command(Command::new("/usr/bin/false"))
+            .expect_err("a failed browser command is not authorization success");
+
+        assert_eq!(error.kind, BrokerageErrorKind::Internal);
+        assert_eq!(
+            error.user_message(),
+            "Unable to load this broker portfolio. Please try again."
+        );
+    }
 
     #[test]
     fn newer_portfolio_event_replaces_pending_event_for_same_broker() {
@@ -2956,6 +3216,30 @@ mod tests {
     }
 
     #[test]
+    fn cancelling_connection_signals_the_authorization_before_awaiting_it() {
+        let provider = Arc::new(
+            TestBrokerageProvider::new(Brokerage::Robinhood).with_connect(ConnectBehavior::Block),
+        );
+        let runtime = live_runtime_with_broker_client(provider.clone());
+        runtime
+            .send(RuntimeCommand::ConnectBroker(Brokerage::Robinhood))
+            .expect("connect");
+        wait_for_counter(&provider.connect.started, 1);
+
+        runtime
+            .send(RuntimeCommand::CancelBrokerConnection(Brokerage::Robinhood))
+            .expect("cancel");
+        wait_for_counter(&provider.closes, 1);
+
+        assert_eq!(
+            provider.connect.cancellation_signals.load(Ordering::SeqCst),
+            1,
+            "the provider must observe cancellation rather than relying on task drop"
+        );
+        runtime.shutdown();
+    }
+
+    #[test]
     fn repeated_connect_keeps_one_authorization_job_per_broker() {
         let provider = Arc::new(
             TestBrokerageProvider::new(Brokerage::Robinhood).with_connect(ConnectBehavior::Block),
@@ -3052,10 +3336,60 @@ mod tests {
             snapshots.insert(Brokerage::Robinhood, now - chrono::Duration::seconds(61));
             snapshots.insert(Brokerage::Longbridge, now - chrono::Duration::seconds(30));
         }
+        brokerage.mark_live_session(Brokerage::Robinhood);
+        brokerage.mark_live_session(Brokerage::Longbridge);
 
         let stale = brokerage.connected_brokers_needing_refresh();
         assert_eq!(stale.len(), 1);
         assert!(stale.contains(&Brokerage::Robinhood));
+    }
+
+    #[test]
+    fn broker_refresh_deadline_is_measured_from_its_snapshot_completion() {
+        let brokerage = super::BrokerageRuntime::new(
+            BrokerageProviders::new(),
+            Arc::new(RecordingAuthorizationUrlOpener::new()),
+        );
+        let completed_at = tokio::time::Instant::now();
+
+        brokerage.mark_live_session(Brokerage::Robinhood);
+        brokerage.record_snapshot_completion(Brokerage::Robinhood, completed_at);
+
+        assert_eq!(
+            brokerage.next_refresh_deadline(),
+            Some(completed_at + Duration::from_secs(60))
+        );
+    }
+
+    #[test]
+    fn transient_refresh_error_keeps_a_live_session_eligible_for_periodic_refresh() {
+        let provider: Arc<dyn BrokerageClient> =
+            Arc::new(TestBrokerageProvider::new(Brokerage::Robinhood));
+        let mut providers = BrokerageProviders::new();
+        providers.insert(Brokerage::Robinhood, provider);
+        let brokerage = super::BrokerageRuntime::new(
+            providers,
+            Arc::new(RecordingAuthorizationUrlOpener::new()),
+        );
+        let due_at = tokio::time::Instant::now() - Duration::from_secs(1);
+
+        brokerage.mark_live_session(Brokerage::Robinhood);
+        brokerage
+            .states
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(
+                Brokerage::Robinhood,
+                kabu_core::BrokerageConnectionState::Error {
+                    message: "Unable to load this broker portfolio. Please try again.".into(),
+                },
+            );
+        brokerage.record_retry_deadline(Brokerage::Robinhood, due_at);
+
+        assert_eq!(
+            brokerage.brokers_due_for_refresh(tokio::time::Instant::now()),
+            vec![Brokerage::Robinhood]
+        );
     }
 
     #[tokio::test]
@@ -5261,6 +5595,7 @@ mod tests {
             open_authorization_url: &(
                  dyn for<'url> Fn(&'url url::Url) -> Result<(), BrokerageError> + Send + Sync
              ),
+            cancellation: CancellationToken,
         ) -> Result<(), BrokerageError> {
             let guard = OperationGuard::begin(self.connect.clone());
             if self.opens_authorization_url {
@@ -5273,7 +5608,13 @@ mod tests {
                     guard.complete();
                     Ok(())
                 }
-                ConnectBehavior::Block => std::future::pending().await,
+                ConnectBehavior::Block => {
+                    cancellation.cancelled().await;
+                    self.connect
+                        .cancellation_signals
+                        .fetch_add(1, Ordering::SeqCst);
+                    Err(BrokerageError::new(BrokerageErrorKind::AuthorizationDenied))
+                }
             }
         }
 
@@ -5380,6 +5721,7 @@ mod tests {
             _open_authorization_url: &(
                  dyn for<'url> Fn(&'url url::Url) -> Result<(), BrokerageError> + Send + Sync
              ),
+            _cancellation: CancellationToken,
         ) -> Result<(), BrokerageError> {
             self.connects.fetch_add(1, Ordering::SeqCst);
             Ok(())
@@ -5770,6 +6112,7 @@ mod tests {
         maximum: AtomicUsize,
         started: AtomicUsize,
         cancelled: AtomicUsize,
+        cancellation_signals: AtomicUsize,
     }
 
     struct OperationGuard {

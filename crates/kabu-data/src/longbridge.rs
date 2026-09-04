@@ -8,6 +8,7 @@ use kabu_core::{
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use crate::{
@@ -192,6 +193,26 @@ pub struct LongbridgePortfolioProvider {
     endpoint: Url,
     oauth: BrokerOAuth,
     session: Mutex<Option<BrokerMcpSession>>,
+    session_close_state: Mutex<SessionCloseState>,
+}
+
+#[derive(Default)]
+struct SessionCloseState {
+    terminal_error: Option<BrokerageError>,
+}
+
+impl SessionCloseState {
+    fn reset(&mut self) {
+        self.terminal_error = None;
+    }
+
+    fn record_failure(&mut self, error: BrokerageError) {
+        self.terminal_error = Some(error);
+    }
+
+    fn no_session_result(&self) -> Result<(), BrokerageError> {
+        self.terminal_error.clone().map_or(Ok(()), Err)
+    }
 }
 
 impl LongbridgePortfolioProvider {
@@ -202,6 +223,7 @@ impl LongbridgePortfolioProvider {
             oauth: broker_oauth(Brokerage::Longbridge, endpoint.clone(), secrets),
             endpoint,
             session: Mutex::new(None),
+            session_close_state: Mutex::new(SessionCloseState::default()),
         })
     }
 
@@ -214,6 +236,11 @@ impl LongbridgePortfolioProvider {
         ))
         .await
     }
+
+    async fn store_session(&self, session: BrokerMcpSession) {
+        *self.session.lock().await = Some(session);
+        self.session_close_state.lock().await.reset();
+    }
 }
 
 #[async_trait::async_trait]
@@ -223,42 +250,88 @@ impl BrokerageClient for LongbridgePortfolioProvider {
         open_authorization_url: &(
              dyn for<'url> Fn(&'url Url) -> Result<(), BrokerageError> + Send + Sync
          ),
+        cancellation: CancellationToken,
     ) -> Result<(), BrokerageError> {
-        let mut session = self.session.lock().await;
-        if session.is_some() {
+        if self.session.lock().await.is_some() {
             return Ok(());
         }
-        match self.start_session().await {
+        let initial_session = tokio::select! {
+            result = self.start_session() => result,
+            _ = cancellation.cancelled() => {
+                return Err(BrokerageError::new(BrokerageErrorKind::AuthorizationDenied));
+            }
+        };
+        match initial_session {
             Ok(connected) => {
-                *session = Some(connected);
+                if cancellation.is_cancelled() {
+                    let _ = connected.close().await;
+                    return Err(BrokerageError::new(BrokerageErrorKind::AuthorizationDenied));
+                }
+                self.store_session(connected).await;
                 return Ok(());
             }
             Err(error) if error.kind == BrokerageErrorKind::AuthorizationRequired => {}
             Err(error) => return Err(error),
         }
         let mut pending = self.oauth.begin_authorization().await?;
+        if cancellation.is_cancelled() {
+            let _ = pending.cancel().await;
+            return Err(BrokerageError::new(BrokerageErrorKind::AuthorizationDenied));
+        }
         if let Err(error) = open_authorization_url(&pending.authorization_url) {
             let _ = pending.cancel().await;
             return Err(error);
         }
-        let callback = match pending.wait_for_callback().await {
-            Ok(callback) => callback,
-            Err(error) => {
+        let callback = tokio::select! {
+            callback = pending.wait_for_callback() => match callback {
+                Ok(callback) => callback,
+                Err(error) => {
+                    let _ = pending.cancel().await;
+                    return Err(error);
+                }
+            },
+            _ = cancellation.cancelled() => {
                 let _ = pending.cancel().await;
-                return Err(error);
+                return Err(BrokerageError::new(BrokerageErrorKind::AuthorizationDenied));
             }
         };
+        if cancellation.is_cancelled() {
+            let _ = pending.cancel().await;
+            return Err(BrokerageError::new(BrokerageErrorKind::AuthorizationDenied));
+        }
         self.oauth
             .complete_authorization(pending, &callback)
             .await?;
-        *session = Some(self.start_session().await?);
+        let connected = tokio::select! {
+            result = self.start_session() => result?,
+            _ = cancellation.cancelled() => {
+                return Err(BrokerageError::new(BrokerageErrorKind::AuthorizationDenied));
+            }
+        };
+        if cancellation.is_cancelled() {
+            let _ = connected.close().await;
+            return Err(BrokerageError::new(BrokerageErrorKind::AuthorizationDenied));
+        }
+        self.store_session(connected).await;
         Ok(())
     }
 
     async fn close_session(&self) -> Result<(), BrokerageError> {
-        match self.session.lock().await.take() {
-            Some(session) => session.close().await,
-            None => Ok(()),
+        let Some(session) = self.session.lock().await.take() else {
+            return self.session_close_state.lock().await.no_session_result();
+        };
+        match session.close().await {
+            Ok(()) => {
+                self.session_close_state.lock().await.reset();
+                Ok(())
+            }
+            Err(error) => {
+                self.session_close_state
+                    .lock()
+                    .await
+                    .record_failure(error.clone());
+                Err(error)
+            }
         }
     }
 }

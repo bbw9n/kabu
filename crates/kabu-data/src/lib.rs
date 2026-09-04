@@ -14,6 +14,7 @@ use std::sync::Arc;
 
 use kabu_core::{BrokerageError, BrokerageErrorKind, PortfolioProvider};
 use rust_decimal::Decimal;
+use tokio_util::sync::CancellationToken;
 use url::Url;
 
 pub use binance::BinanceClient;
@@ -32,6 +33,7 @@ pub trait BrokerageClient: PortfolioProvider {
         open_authorization_url: &(
              dyn for<'url> Fn(&'url Url) -> Result<(), BrokerageError> + Send + Sync
          ),
+        cancellation: CancellationToken,
     ) -> Result<(), BrokerageError>;
 
     /// Close only the live MCP session, preserving stored OAuth credentials.
