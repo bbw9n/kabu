@@ -1015,9 +1015,9 @@ impl BrokerMcpSession {
         BoundedToolResult::from_call_result(result)
     }
 
-    /// Cancel the rmcp service and await transport cleanup before returning.
-    pub async fn close(self) -> Result<(), BrokerageError> {
-        self.service.cancel().await.map_err(|_| unavailable())?;
+    /// Close the rmcp service and await transport cleanup without consuming retry ownership.
+    pub async fn close(&mut self) -> Result<(), BrokerageError> {
+        self.service.close().await.map_err(|_| unavailable())?;
         Ok(())
     }
 }

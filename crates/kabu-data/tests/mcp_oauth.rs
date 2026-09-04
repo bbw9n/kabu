@@ -19,6 +19,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
 };
+use tokio_util::sync::CancellationToken;
 use tracing::{Level, instrument::WithSubscriber};
 use tracing_subscriber::fmt::MakeWriter;
 use url::Url;
@@ -300,10 +301,172 @@ async fn oauth_fixture() -> (BrokerOAuth, Arc<AtomicUsize>, Arc<MemorySecretStor
     (oauth, exchange_counter, secrets)
 }
 
+async fn delayed_oauth_fixture(
+    metadata_delay: Duration,
+    token_delay: Duration,
+) -> (
+    BrokerOAuth,
+    Arc<AtomicUsize>,
+    Arc<AtomicUsize>,
+    Arc<MemorySecretStore>,
+    MockServer,
+) {
+    let server = MockServer::start().await;
+    let endpoint = Url::parse(&server.uri())
+        .expect("server URL")
+        .join("resource")
+        .expect("resource URL");
+    let issuer = server.uri();
+    let metadata_started = Arc::new(AtomicUsize::new(0));
+    let metadata_probe = metadata_started.clone();
+    let metadata_endpoint = endpoint.clone();
+
+    Mock::given(method("GET"))
+        .and(path("/resource"))
+        .respond_with(move |_request: &Request| {
+            metadata_probe.fetch_add(1, Ordering::SeqCst);
+            ResponseTemplate::new(200)
+                .set_delay(metadata_delay)
+                .set_body_json(json!({
+                    "resource": metadata_endpoint.as_str(),
+                    "authorization_servers": [issuer]
+                }))
+        })
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/.well-known/oauth-authorization-server"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "issuer": server.uri(),
+            "authorization_endpoint": server.uri() + "/authorize",
+            "token_endpoint": server.uri() + "/token",
+            "registration_endpoint": server.uri() + "/register",
+            "scopes_supported": ["portfolio.read"],
+            "response_types_supported": ["code"],
+            "code_challenge_methods_supported": ["S256"]
+        })))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/register"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "client_id": "fixture-client",
+            "redirect_uris": []
+        })))
+        .mount(&server)
+        .await;
+
+    let token_started = Arc::new(AtomicUsize::new(0));
+    let token_probe = token_started.clone();
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(move |_request: &Request| {
+            token_probe.fetch_add(1, Ordering::SeqCst);
+            ResponseTemplate::new(200)
+                .set_delay(token_delay)
+                .set_body_json(json!({
+                    "access_token": PRIVATE_ACCESS_TOKEN,
+                    "token_type": "bearer",
+                    "refresh_token": PRIVATE_REFRESH_TOKEN,
+                    "expires_in": 3600
+                }))
+        })
+        .mount(&server)
+        .await;
+
+    let secrets = Arc::new(MemorySecretStore::default());
+    let credentials = Arc::new(BrokerCredentialStore::new(
+        Brokerage::Robinhood,
+        secrets.clone(),
+    ));
+    let oauth = BrokerOAuth::new(Brokerage::Robinhood, endpoint, credentials);
+    (oauth, metadata_started, token_started, secrets, server)
+}
+
+async fn wait_for_atomic(counter: &AtomicUsize, expected: usize) {
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while counter.load(Ordering::SeqCst) < expected {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("request started");
+}
+
 fn authorization_state(url: &Url) -> String {
     url.query_pairs()
         .find_map(|(key, value)| (key == "state").then(|| value.into_owned()))
         .expect("authorization state")
+}
+
+#[tokio::test]
+async fn cancellation_stops_stalled_metadata_inside_begin_authorization() {
+    let (oauth, metadata_started, _token_started, _secrets, _server) =
+        delayed_oauth_fixture(Duration::from_secs(60), Duration::ZERO).await;
+    let oauth = Arc::new(oauth);
+    let cancellation = CancellationToken::new();
+    let task = tokio::spawn({
+        let oauth = oauth.clone();
+        let cancellation = cancellation.clone();
+        async move { oauth.begin_authorization_cancellable(cancellation).await }
+    });
+
+    wait_for_atomic(&metadata_started, 1).await;
+    cancellation.cancel();
+    let result = tokio::time::timeout(Duration::from_secs(1), task)
+        .await
+        .expect("metadata cancellation finishes")
+        .expect("metadata task joins");
+    let Err(error) = result else {
+        panic!("cancelled metadata cannot authorize");
+    };
+
+    assert_eq!(error.kind, BrokerageErrorKind::AuthorizationDenied);
+    assert_eq!(oauth.pending_authorization_count().await, 0);
+}
+
+#[tokio::test]
+async fn cancellation_discards_pending_state_during_stalled_token_exchange() {
+    let (oauth, _metadata_started, token_started, secrets, _server) =
+        delayed_oauth_fixture(Duration::ZERO, Duration::from_secs(60)).await;
+    let oauth = Arc::new(oauth);
+    let pending = oauth
+        .begin_authorization()
+        .await
+        .expect("begin authorization");
+    let state = authorization_state(&pending.authorization_url);
+    let callback = format!("code=abc&state={state}");
+    let cancellation = CancellationToken::new();
+    let task = tokio::spawn({
+        let oauth = oauth.clone();
+        let cancellation = cancellation.clone();
+        async move {
+            oauth
+                .complete_authorization_cancellable(pending, &callback, cancellation)
+                .await
+        }
+    });
+
+    wait_for_atomic(&token_started, 1).await;
+    cancellation.cancel();
+    let error = tokio::time::timeout(Duration::from_secs(1), task)
+        .await
+        .expect("token cancellation finishes")
+        .expect("token task joins")
+        .expect_err("cancelled token exchange cannot authorize");
+
+    assert_eq!(error.kind, BrokerageErrorKind::AuthorizationDenied);
+    assert_eq!(oauth.pending_authorization_count().await, 0);
+    assert!(
+        BrokerCredentialStore::new(Brokerage::Robinhood, secrets)
+            .load()
+            .await
+            .expect("load credentials after cancellation")
+            .is_none(),
+        "a cancelled exchange must not retain credentials"
+    );
 }
 
 #[tokio::test]

@@ -1230,10 +1230,8 @@ impl RuntimeHandle {
             return previous;
         }
         if previous.brokerage_shutdown_failed {
-            if !close_broker_sessions(&runtime.brokerage_providers) {
-                return previous;
-            }
-            previous.brokerage_shutdown_failed = false;
+            previous.brokerage_shutdown_failed =
+                !close_broker_sessions(&runtime.brokerage_providers);
         }
         let Some(flush) = runtime
             .final_flush
@@ -2112,13 +2110,15 @@ async fn cancel_authorization_job(
 async fn cancel_all_authorization_jobs(
     jobs: &mut HashMap<Brokerage, AuthorizationJob>,
 ) -> Vec<Brokerage> {
-    let jobs = std::mem::take(jobs);
-    let mut cancelled = Vec::new();
-    for (brokerage, job) in jobs {
-        if !job.task.is_finished() {
-            cancelled.push(brokerage);
-        }
+    let jobs = std::mem::take(jobs).into_iter().collect::<Vec<_>>();
+    let cancelled = jobs
+        .iter()
+        .filter_map(|(brokerage, job)| (!job.task.is_finished()).then_some(*brokerage))
+        .collect::<Vec<_>>();
+    for (_, job) in &jobs {
         job.cancellation.cancel();
+    }
+    for (_, job) in jobs {
         _ = job.task.await;
     }
     cancelled
@@ -2140,13 +2140,15 @@ async fn abort_brokerage_job(
 async fn abort_all_brokerage_jobs(
     jobs: &mut HashMap<Brokerage, tokio::task::JoinHandle<()>>,
 ) -> Vec<Brokerage> {
-    let jobs = std::mem::take(jobs);
-    let mut cancelled = Vec::new();
-    for (brokerage, job) in jobs {
-        if !job.is_finished() {
-            cancelled.push(brokerage);
-        }
+    let jobs = std::mem::take(jobs).into_iter().collect::<Vec<_>>();
+    let cancelled = jobs
+        .iter()
+        .filter_map(|(brokerage, job)| (!job.is_finished()).then_some(*brokerage))
+        .collect::<Vec<_>>();
+    for (_, job) in &jobs {
         job.abort();
+    }
+    for (_, job) in jobs {
         _ = job.await;
     }
     cancelled
@@ -3240,6 +3242,72 @@ mod tests {
     }
 
     #[test]
+    fn hiding_signals_all_authorizations_before_waiting_and_closes_each_broker() {
+        let slow = Arc::new(CoordinatedAuthorizationProvider::new(
+            Brokerage::Robinhood,
+            false,
+        ));
+        let completing = Arc::new(CoordinatedAuthorizationProvider::new(
+            Brokerage::Longbridge,
+            true,
+        ));
+        let runtime = live_runtime_with_brokerages([
+            slow.clone() as Arc<dyn BrokerageClient>,
+            completing.clone() as Arc<dyn BrokerageClient>,
+        ]);
+
+        runtime
+            .send(RuntimeCommand::ConnectBroker(Brokerage::Robinhood))
+            .expect("start slow authorization");
+        runtime
+            .send(RuntimeCommand::ConnectBroker(Brokerage::Longbridge))
+            .expect("start completing authorization");
+        wait_for_counter(&slow.connect_started, 1);
+        wait_for_counter(&completing.connect_started, 1);
+
+        runtime
+            .send(RuntimeCommand::SetPortfolioVisible(false))
+            .expect("hide");
+
+        let cleanup_slow = slow.clone();
+        let cleanup_completing = completing.clone();
+        let cleanup = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(300));
+            cleanup_slow.ensure_connect_released();
+            cleanup_completing.ensure_connect_released();
+        });
+        let deadline = Instant::now() + Duration::from_millis(100);
+        while (slow.cancellation_signals.load(Ordering::SeqCst) != 1
+            || completing.cancellation_signals.load(Ordering::SeqCst) != 1)
+            && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(1));
+        }
+        let all_authorizations_signalled = slow.cancellation_signals.load(Ordering::SeqCst) == 1
+            && completing.cancellation_signals.load(Ordering::SeqCst) == 1;
+
+        if all_authorizations_signalled {
+            completing.release_connect();
+            wait_for_counter(&completing.connect_completed, 1);
+            assert_eq!(
+                completing.closes.load(Ordering::SeqCst),
+                0,
+                "hide waits for the slow job before closing the completed broker"
+            );
+            slow.release_connect();
+        }
+        cleanup.join().expect("cleanup authorization releases");
+
+        wait_for_counter(&slow.closes, 1);
+        wait_for_counter(&completing.closes, 1);
+        runtime.shutdown();
+        assert!(
+            all_authorizations_signalled,
+            "hide must signal every authorization before awaiting any one of them"
+        );
+    }
+
+    #[test]
     fn repeated_connect_keeps_one_authorization_job_per_broker() {
         let provider = Arc::new(
             TestBrokerageProvider::new(Brokerage::Robinhood).with_connect(ConnectBehavior::Block),
@@ -3608,6 +3676,41 @@ mod tests {
         assert!(!outcome.is_success());
         assert!(runtime.retry_shutdown_persistence().is_success());
         assert_eq!(provider.closes.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn broker_close_retry_does_not_skip_failed_state_and_cache_retries() {
+        let provider =
+            Arc::new(TestBrokerageProvider::new(Brokerage::Robinhood).with_close_failures(2));
+        let repository = Arc::new(FlakyRepository::failing());
+        let runtime = live_runtime_with_components(
+            default_provider_set(),
+            provider.clone(),
+            Arc::new(RecordingAuthorizationUrlOpener::new()),
+            repository.clone(),
+        );
+
+        runtime.begin_shutdown_with_flush(PersistedState::starter(), CachedMarketState::default());
+        let failed = runtime
+            .wait_for_shutdown(Duration::from_secs(1))
+            .expect("initial shutdown acknowledgement");
+        assert!(!failed.is_success());
+        assert_eq!(failed.state, Some(PersistenceResult::Failed));
+        assert_eq!(failed.market_cache, Some(PersistenceResult::Failed));
+
+        repository.recover_state();
+        repository.recover_cache();
+        let retried = runtime.retry_shutdown_persistence();
+
+        assert!(
+            !retried.is_success(),
+            "a still-failing broker close remains a shutdown failure"
+        );
+        assert_eq!(retried.state, Some(PersistenceResult::Saved));
+        assert_eq!(retried.market_cache, Some(PersistenceResult::Saved));
+        assert_eq!(provider.closes.load(Ordering::SeqCst), 2);
+        assert_eq!(repository.state_saves.load(Ordering::SeqCst), 2);
+        assert_eq!(repository.cache_saves.load(Ordering::SeqCst), 2);
     }
 
     #[test]
@@ -5569,6 +5672,11 @@ mod tests {
             self
         }
 
+        fn with_close_failures(mut self, failures: usize) -> Self {
+            self.close_failures = AtomicUsize::new(failures);
+            self
+        }
+
         fn with_order(mut self, order: Arc<Mutex<Vec<&'static str>>>) -> Self {
             self.order = Some(order);
             self
@@ -5680,6 +5788,91 @@ mod tests {
         async fn disconnect(&self) -> Result<(), BrokerageError> {
             self.disconnects.fetch_add(1, Ordering::SeqCst);
             self.record("disconnect");
+            Ok(())
+        }
+    }
+
+    struct CoordinatedAuthorizationProvider {
+        brokerage: Brokerage,
+        completes_after_cancellation: bool,
+        connect_started: AtomicUsize,
+        cancellation_signals: AtomicUsize,
+        connect_completed: AtomicUsize,
+        closes: AtomicUsize,
+        release_connect: async_channel::Sender<()>,
+        wait_for_release: async_channel::Receiver<()>,
+    }
+
+    impl CoordinatedAuthorizationProvider {
+        fn new(brokerage: Brokerage, completes_after_cancellation: bool) -> Self {
+            let (release_connect, wait_for_release) = async_channel::bounded(1);
+            Self {
+                brokerage,
+                completes_after_cancellation,
+                connect_started: AtomicUsize::new(0),
+                cancellation_signals: AtomicUsize::new(0),
+                connect_completed: AtomicUsize::new(0),
+                closes: AtomicUsize::new(0),
+                release_connect,
+                wait_for_release,
+            }
+        }
+
+        fn release_connect(&self) {
+            self.release_connect
+                .try_send(())
+                .expect("release authorization");
+        }
+
+        fn ensure_connect_released(&self) {
+            _ = self.release_connect.try_send(());
+        }
+    }
+
+    #[async_trait]
+    impl BrokerageClient for CoordinatedAuthorizationProvider {
+        async fn connect(
+            &self,
+            _open_authorization_url: &(
+                 dyn for<'url> Fn(&'url url::Url) -> Result<(), BrokerageError> + Send + Sync
+             ),
+            cancellation: CancellationToken,
+        ) -> Result<(), BrokerageError> {
+            self.connect_started.fetch_add(1, Ordering::SeqCst);
+            cancellation.cancelled().await;
+            self.cancellation_signals.fetch_add(1, Ordering::SeqCst);
+            self.wait_for_release
+                .recv()
+                .await
+                .expect("release authorization connection");
+            self.connect_completed.fetch_add(1, Ordering::SeqCst);
+            if self.completes_after_cancellation {
+                Ok(())
+            } else {
+                Err(BrokerageError::new(BrokerageErrorKind::AuthorizationDenied))
+            }
+        }
+
+        async fn close_session(&self) -> Result<(), BrokerageError> {
+            self.closes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl PortfolioProvider for CoordinatedAuthorizationProvider {
+        fn brokerage(&self) -> Brokerage {
+            self.brokerage
+        }
+
+        async fn refresh_portfolio(&self) -> Result<PortfolioSnapshot, BrokerageError> {
+            Ok(portfolio_snapshot(
+                self.brokerage,
+                chrono::Utc::now().timestamp(),
+            ))
+        }
+
+        async fn disconnect(&self) -> Result<(), BrokerageError> {
             Ok(())
         }
     }
@@ -5803,6 +5996,24 @@ mod tests {
             brokerages,
             opener,
             repository,
+            CachedMarketState::default(),
+            None,
+        )
+        .expect("runtime")
+    }
+
+    fn live_runtime_with_brokerages(
+        brokerages: impl IntoIterator<Item = Arc<dyn BrokerageClient>>,
+    ) -> RuntimeHandle {
+        let mut providers = BrokerageProviders::new();
+        for provider in brokerages {
+            providers.insert(provider.brokerage(), provider);
+        }
+        RuntimeHandle::start_inner(
+            default_provider_set(),
+            providers,
+            Arc::new(RecordingAuthorizationUrlOpener::new()),
+            Arc::new(NoopRepository),
             CachedMarketState::default(),
             None,
         )

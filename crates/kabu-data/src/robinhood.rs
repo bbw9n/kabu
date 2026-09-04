@@ -185,26 +185,6 @@ pub struct RobinhoodPortfolioProvider {
     endpoint: Url,
     oauth: BrokerOAuth,
     session: Mutex<Option<BrokerMcpSession>>,
-    session_close_state: Mutex<SessionCloseState>,
-}
-
-#[derive(Default)]
-struct SessionCloseState {
-    terminal_error: Option<BrokerageError>,
-}
-
-impl SessionCloseState {
-    fn reset(&mut self) {
-        self.terminal_error = None;
-    }
-
-    fn record_failure(&mut self, error: BrokerageError) {
-        self.terminal_error = Some(error);
-    }
-
-    fn no_session_result(&self) -> Result<(), BrokerageError> {
-        self.terminal_error.clone().map_or(Ok(()), Err)
-    }
 }
 
 impl RobinhoodPortfolioProvider {
@@ -215,7 +195,6 @@ impl RobinhoodPortfolioProvider {
             oauth: broker_oauth(Brokerage::Robinhood, endpoint.clone(), secrets),
             endpoint,
             session: Mutex::new(None),
-            session_close_state: Mutex::new(SessionCloseState::default()),
         })
     }
 
@@ -231,7 +210,6 @@ impl RobinhoodPortfolioProvider {
 
     async fn store_session(&self, session: BrokerMcpSession) {
         *self.session.lock().await = Some(session);
-        self.session_close_state.lock().await.reset();
     }
 }
 
@@ -254,7 +232,7 @@ impl BrokerageClient for RobinhoodPortfolioProvider {
             }
         };
         match initial_session {
-            Ok(connected) => {
+            Ok(mut connected) => {
                 if cancellation.is_cancelled() {
                     let _ = connected.close().await;
                     return Err(BrokerageError::new(BrokerageErrorKind::AuthorizationDenied));
@@ -265,7 +243,10 @@ impl BrokerageClient for RobinhoodPortfolioProvider {
             Err(error) if error.kind == BrokerageErrorKind::AuthorizationRequired => {}
             Err(error) => return Err(error),
         }
-        let mut pending = self.oauth.begin_authorization().await?;
+        let mut pending = self
+            .oauth
+            .begin_authorization_cancellable(cancellation.clone())
+            .await?;
         if cancellation.is_cancelled() {
             let _ = pending.cancel().await;
             return Err(BrokerageError::new(BrokerageErrorKind::AuthorizationDenied));
@@ -292,9 +273,9 @@ impl BrokerageClient for RobinhoodPortfolioProvider {
             return Err(BrokerageError::new(BrokerageErrorKind::AuthorizationDenied));
         }
         self.oauth
-            .complete_authorization(pending, &callback)
+            .complete_authorization_cancellable(pending, &callback, cancellation.clone())
             .await?;
-        let connected = tokio::select! {
+        let mut connected = tokio::select! {
             result = self.start_session() => result?,
             _ = cancellation.cancelled() => {
                 return Err(BrokerageError::new(BrokerageErrorKind::AuthorizationDenied));
@@ -309,21 +290,16 @@ impl BrokerageClient for RobinhoodPortfolioProvider {
     }
 
     async fn close_session(&self) -> Result<(), BrokerageError> {
-        let Some(session) = self.session.lock().await.take() else {
-            return self.session_close_state.lock().await.no_session_result();
+        let mut session = self.session.lock().await;
+        let Some(active_session) = session.as_mut() else {
+            return Ok(());
         };
-        match session.close().await {
+        match active_session.close().await {
             Ok(()) => {
-                self.session_close_state.lock().await.reset();
+                session.take();
                 Ok(())
             }
-            Err(error) => {
-                self.session_close_state
-                    .lock()
-                    .await
-                    .record_failure(error.clone());
-                Err(error)
-            }
+            Err(error) => Err(error),
         }
     }
 }
@@ -388,21 +364,10 @@ pub fn robinhood_provider(
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use kabu_core::{BrokerageError, BrokerageErrorKind, PortfolioProvider};
+    use kabu_core::PortfolioProvider;
 
     use super::RobinhoodPortfolioProvider;
     use crate::{BrokerageClient, SecretStore, SecretStoreError};
-
-    #[test]
-    fn terminal_session_close_failure_is_not_reported_as_a_later_success() {
-        let mut close_state = super::SessionCloseState::default();
-        close_state.record_failure(BrokerageError::new(BrokerageErrorKind::Unavailable));
-
-        let error = close_state
-            .no_session_result()
-            .expect_err("a consumed session with failed cleanup remains unsuccessful");
-        assert_eq!(error.kind, BrokerageErrorKind::Unavailable);
-    }
 
     #[derive(Default)]
     struct MemorySecretStore {

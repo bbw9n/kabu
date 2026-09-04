@@ -235,7 +235,7 @@ async fn typed_capability_input_serializes_only_descriptor_arguments() {
         Duration::ZERO,
     )
     .await;
-    let session = BrokerMcpSession::connect(fake_config(Brokerage::Longbridge, &server).await)
+    let mut session = BrokerMcpSession::connect(fake_config(Brokerage::Longbridge, &server).await)
         .await
         .expect("connect");
 
@@ -273,7 +273,7 @@ async fn descriptor_rejects_typed_arguments_before_tool_invocation() {
         Duration::ZERO,
     )
     .await;
-    let session = BrokerMcpSession::connect(fake_config(Brokerage::Robinhood, &server).await)
+    let mut session = BrokerMcpSession::connect(fake_config(Brokerage::Robinhood, &server).await)
         .await
         .expect("connect");
 
@@ -296,7 +296,7 @@ async fn connected_session_lists_tools_only_once_across_reads() {
         Duration::ZERO,
     )
     .await;
-    let session = BrokerMcpSession::connect(fake_config(Brokerage::Longbridge, &server).await)
+    let mut session = BrokerMcpSession::connect(fake_config(Brokerage::Longbridge, &server).await)
         .await
         .expect("connect");
 
@@ -321,7 +321,7 @@ async fn schema_failure_awaits_remote_session_cleanup() {
 
     let error =
         match BrokerMcpSession::connect(fake_config(Brokerage::Longbridge, &server).await).await {
-            Ok(session) => {
+            Ok(mut session) => {
                 session.close().await.expect("close unexpected session");
                 panic!("schema failure unexpectedly connected");
             }
@@ -338,7 +338,7 @@ async fn explicit_close_awaits_remote_session_cleanup() {
     let close_delay = Duration::from_millis(100);
     let (server, state) =
         fake_mcp(FakeCatalog::Compatible(Brokerage::Longbridge), close_delay).await;
-    let session = BrokerMcpSession::connect(fake_config(Brokerage::Longbridge, &server).await)
+    let mut session = BrokerMcpSession::connect(fake_config(Brokerage::Longbridge, &server).await)
         .await
         .expect("connect");
     let started = Instant::now();
@@ -355,7 +355,7 @@ async fn oversized_direct_json_tools_list_is_rejected_before_catalog_deserializa
 
     let error =
         match BrokerMcpSession::connect(fake_config(Brokerage::Longbridge, &server).await).await {
-            Ok(session) => {
+            Ok(mut session) => {
                 session.close().await.expect("close unexpected session");
                 panic!("oversized tools/list unexpectedly connected");
             }
@@ -369,7 +369,7 @@ async fn oversized_direct_json_tools_list_is_rejected_before_catalog_deserializa
 #[tokio::test]
 async fn oversized_direct_json_tool_result_is_rejected_before_result_deserialization() {
     let (server, state) = fake_mcp(FakeCatalog::OversizedToolResult, Duration::ZERO).await;
-    let session = BrokerMcpSession::connect(fake_config(Brokerage::Longbridge, &server).await)
+    let mut session = BrokerMcpSession::connect(fake_config(Brokerage::Longbridge, &server).await)
         .await
         .expect("connect");
 

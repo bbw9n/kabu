@@ -14,6 +14,7 @@ use tokio::{
     task::spawn_blocking,
     time::{Instant, sleep_until},
 };
+use tokio_util::sync::CancellationToken;
 use tracing::{instrument::WithSubscriber, subscriber::NoSubscriber};
 use url::{Url, form_urlencoded};
 use zeroize::Zeroizing;
@@ -33,6 +34,24 @@ where
     F: Future,
 {
     future.with_subscriber(NoSubscriber::default()).await
+}
+
+fn authorization_cancelled() -> BrokerageError {
+    brokerage_error(BrokerageErrorKind::AuthorizationDenied)
+}
+
+async fn await_authorization_phase<T>(
+    cancellation: &CancellationToken,
+    operation: impl Future<Output = Result<T, BrokerageError>>,
+) -> Result<T, BrokerageError> {
+    if cancellation.is_cancelled() {
+        return Err(authorization_cancelled());
+    }
+    tokio::select! {
+        biased;
+        result = operation => result,
+        _ = cancellation.cancelled() => Err(authorization_cancelled()),
+    }
 }
 
 /// OAuth credentials scoped to one brokerage account in secure storage.
@@ -379,23 +398,39 @@ impl BrokerOAuth {
     }
 
     pub async fn begin_authorization(&self) -> Result<PendingAuthorization, BrokerageError> {
-        let (callback, redirect_uri) = OneShotCallback::bind().await?;
-        let started_at = Instant::now();
-        let mut manager = self.authorization_manager().await?;
-        let resolution = suppress_oauth_tracing(manager.resolve_metadata())
+        self.begin_authorization_cancellable(CancellationToken::new())
             .await
-            .map_err(map_auth_error)?;
+    }
+
+    /// Begin authorization while allowing the owning runtime to stop metadata discovery safely.
+    pub async fn begin_authorization_cancellable(
+        &self,
+        cancellation: CancellationToken,
+    ) -> Result<PendingAuthorization, BrokerageError> {
+        let (callback, redirect_uri) =
+            await_authorization_phase(&cancellation, OneShotCallback::bind()).await?;
+        let started_at = Instant::now();
+        let mut manager =
+            await_authorization_phase(&cancellation, self.authorization_manager()).await?;
+        let resolution = await_authorization_phase(&cancellation, async {
+            suppress_oauth_tracing(manager.resolve_metadata())
+                .await
+                .map_err(map_auth_error)
+        })
+        .await?;
         manager.set_metadata(resolution.metadata);
         let request = AuthorizationRequest::new(redirect_uri.as_str()).with_client_name("Kabu");
-        let session = suppress_oauth_tracing(AuthorizationSession::new(manager, request))
-            .await
-            .map_err(|(_, _)| brokerage_error(BrokerageErrorKind::AuthorizationDenied))?;
+        let session = await_authorization_phase(&cancellation, async {
+            suppress_oauth_tracing(AuthorizationSession::new(manager, request))
+                .await
+                .map_err(|(_, _)| brokerage_error(BrokerageErrorKind::AuthorizationDenied))
+        })
+        .await?;
         let authorization_url = Url::parse(session.get_authorization_url())
             .map_err(|_| brokerage_error(BrokerageErrorKind::MalformedResponse))?;
         let csrf_token = callback_parameter(&authorization_url, "state")
             .ok_or_else(|| brokerage_error(BrokerageErrorKind::MalformedResponse))?;
-
-        Ok(PendingAuthorization {
+        let pending = PendingAuthorization {
             authorization_url,
             redirect_uri,
             started_at,
@@ -404,7 +439,12 @@ impl BrokerOAuth {
             brokerage: self.brokerage,
             session,
             states: self.states.clone(),
-        })
+        };
+        if cancellation.is_cancelled() {
+            let _ = pending.cancel().await;
+            return Err(authorization_cancelled());
+        }
+        Ok(pending)
     }
 
     pub async fn complete_authorization(
@@ -412,10 +452,23 @@ impl BrokerOAuth {
         pending: PendingAuthorization,
         callback_query: &str,
     ) -> Result<(), BrokerageError> {
-        let result = self
-            .complete_authorization_inner(&pending, callback_query)
-            .await;
-        pending.states.discard(&pending.csrf_token).await;
+        self.complete_authorization_cancellable(pending, callback_query, CancellationToken::new())
+            .await
+    }
+
+    /// Complete authorization while retaining pending state until cancellation cleanup is awaited.
+    pub async fn complete_authorization_cancellable(
+        &self,
+        pending: PendingAuthorization,
+        callback_query: &str,
+        cancellation: CancellationToken,
+    ) -> Result<(), BrokerageError> {
+        let result = await_authorization_phase(
+            &cancellation,
+            self.complete_authorization_inner(&pending, callback_query),
+        )
+        .await;
+        _ = pending.cancel().await;
         result
     }
 
