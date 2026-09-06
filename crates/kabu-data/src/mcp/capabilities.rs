@@ -955,6 +955,36 @@ pub struct BrokerMcpSession {
     capabilities: ResolvedCapabilities,
 }
 
+/// The terminal result of a consumed rmcp close operation.
+///
+/// `RunningService::close` takes its join handle before awaiting it. A `JoinError` therefore
+/// means that the service task is terminal and a later rmcp `close` would only return its
+/// already-closed success value. Retain the typed failure instead of reporting that no-op as a
+/// successful shutdown retry.
+#[derive(Default)]
+pub(crate) enum SessionCloseOutcome {
+    #[default]
+    Open,
+    TerminalFailure(BrokerageError),
+}
+
+impl SessionCloseOutcome {
+    pub(crate) fn reset(&mut self) {
+        *self = Self::Open;
+    }
+
+    pub(crate) fn record_terminal_failure(&mut self, error: BrokerageError) {
+        *self = Self::TerminalFailure(error);
+    }
+
+    pub(crate) fn prior_result(&self) -> Option<Result<(), BrokerageError>> {
+        match self {
+            Self::Open => None,
+            Self::TerminalFailure(error) => Some(Err(error.clone())),
+        }
+    }
+}
+
 impl BrokerMcpSession {
     pub async fn connect(config: BrokerMcpConfig) -> Result<Self, BrokerageError> {
         let transport_config =
@@ -1015,9 +1045,9 @@ impl BrokerMcpSession {
         BoundedToolResult::from_call_result(result)
     }
 
-    /// Close the rmcp service and await transport cleanup without consuming retry ownership.
-    pub async fn close(&mut self) -> Result<(), BrokerageError> {
-        self.service.close().await.map_err(|_| unavailable())?;
+    /// Cancel the rmcp service and await terminal transport cleanup before consuming this session.
+    pub async fn close(self) -> Result<(), BrokerageError> {
+        self.service.cancel().await.map_err(|_| unavailable())?;
         Ok(())
     }
 }
@@ -1066,7 +1096,7 @@ mod tests {
     use rmcp::model::{CallToolResult, ContentBlock};
     use serde_json::json;
 
-    use super::{BoundedToolResult, BrokerageErrorKind};
+    use super::{BoundedToolResult, BrokerageError, BrokerageErrorKind, SessionCloseOutcome};
 
     #[test]
     fn tool_error_content_becomes_a_sanitized_provider_failure() {
@@ -1091,5 +1121,18 @@ mod tests {
             bounded.value(),
             &json!({ "positions": [{ "quantity": "12.345678" }] })
         );
+    }
+
+    #[test]
+    fn terminal_service_close_failure_stays_unsuccessful_on_later_attempts() {
+        let mut outcome = SessionCloseOutcome::Open;
+        outcome.record_terminal_failure(BrokerageError::new(BrokerageErrorKind::Unavailable));
+
+        let error = outcome
+            .prior_result()
+            .expect("terminal close result is retained")
+            .expect_err("a consumed rmcp close handle cannot become a successful retry");
+
+        assert_eq!(error.kind, BrokerageErrorKind::Unavailable);
     }
 }

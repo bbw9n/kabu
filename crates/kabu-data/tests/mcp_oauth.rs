@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     io::{self, Write},
     sync::{
-        Arc, Mutex,
+        Arc, Condvar, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
@@ -139,6 +139,57 @@ impl SecretStore for MemorySecretStore {
     }
 }
 
+#[derive(Default)]
+struct SlowSecretStore {
+    values: Mutex<HashMap<(String, String), Vec<u8>>>,
+    set_started: AtomicUsize,
+    set_finished: AtomicUsize,
+    set_release: (Mutex<bool>, Condvar),
+}
+
+impl SlowSecretStore {
+    fn release_set(&self) {
+        let (released, wake) = &self.set_release;
+        *released.lock().expect("slow secret release lock") = true;
+        wake.notify_all();
+    }
+}
+
+impl SecretStore for SlowSecretStore {
+    fn get(&self, service: &str, account: &str) -> Result<Option<Vec<u8>>, SecretStoreError> {
+        Ok(self
+            .values
+            .lock()
+            .expect("slow secret values lock")
+            .get(&(service.to_string(), account.to_string()))
+            .cloned())
+    }
+
+    fn set(&self, service: &str, account: &str, value: &[u8]) -> Result<(), SecretStoreError> {
+        self.set_started.fetch_add(1, Ordering::SeqCst);
+        let (released, wake) = &self.set_release;
+        let mut released = released.lock().expect("slow secret release lock");
+        while !*released {
+            released = wake.wait(released).expect("slow secret release wait");
+        }
+        drop(released);
+        self.values
+            .lock()
+            .expect("slow secret values lock")
+            .insert((service.to_string(), account.to_string()), value.to_vec());
+        self.set_finished.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn delete(&self, service: &str, account: &str) -> Result<(), SecretStoreError> {
+        self.values
+            .lock()
+            .expect("slow secret values lock")
+            .remove(&(service.to_string(), account.to_string()));
+        Ok(())
+    }
+}
+
 struct UnavailableSecretStore;
 
 impl SecretStore for UnavailableSecretStore {
@@ -236,7 +287,20 @@ async fn secret_store_failures_do_not_expose_accounts_or_credentials() {
     assert!(!display.contains(SERVICE));
 }
 
-async fn oauth_fixture() -> (BrokerOAuth, Arc<AtomicUsize>, Arc<MemorySecretStore>) {
+async fn oauth_fixture() -> (
+    BrokerOAuth,
+    Arc<AtomicUsize>,
+    Arc<MemorySecretStore>,
+    MockServer,
+) {
+    let secrets = Arc::new(MemorySecretStore::default());
+    let (oauth, exchange_counter, server) = oauth_fixture_with_secret_store(secrets.clone()).await;
+    (oauth, exchange_counter, secrets, server)
+}
+
+async fn oauth_fixture_with_secret_store(
+    secrets: Arc<dyn SecretStore>,
+) -> (BrokerOAuth, Arc<AtomicUsize>, MockServer) {
     let server = MockServer::start().await;
     let endpoint = Url::parse(&server.uri())
         .expect("server URL")
@@ -292,13 +356,9 @@ async fn oauth_fixture() -> (BrokerOAuth, Arc<AtomicUsize>, Arc<MemorySecretStor
         .mount(&server)
         .await;
 
-    let secrets = Arc::new(MemorySecretStore::default());
-    let credentials = Arc::new(BrokerCredentialStore::new(
-        Brokerage::Robinhood,
-        secrets.clone(),
-    ));
+    let credentials = Arc::new(BrokerCredentialStore::new(Brokerage::Robinhood, secrets));
     let oauth = BrokerOAuth::new(Brokerage::Robinhood, endpoint, credentials);
-    (oauth, exchange_counter, secrets)
+    (oauth, exchange_counter, server)
 }
 
 async fn delayed_oauth_fixture(
@@ -470,8 +530,69 @@ async fn cancellation_discards_pending_state_during_stalled_token_exchange() {
 }
 
 #[tokio::test]
+async fn cancelled_authorization_waits_for_its_credential_write_before_disconnect_clears() {
+    let secrets = Arc::new(SlowSecretStore::default());
+    let (oauth, _exchange_counter, _server) =
+        oauth_fixture_with_secret_store(secrets.clone()).await;
+    let oauth = Arc::new(oauth);
+    let pending = oauth
+        .begin_authorization()
+        .await
+        .expect("begin authorization");
+    let state = authorization_state(&pending.authorization_url);
+    let callback = format!("code=abc&state={state}");
+    let cancellation = CancellationToken::new();
+    let completion = tokio::spawn({
+        let oauth = oauth.clone();
+        let cancellation = cancellation.clone();
+        async move {
+            oauth
+                .complete_authorization_cancellable(pending, &callback, cancellation)
+                .await
+        }
+    });
+
+    wait_for_atomic(&secrets.set_started, 1).await;
+    cancellation.cancel();
+    let completion_finished_before_write =
+        tokio::time::timeout(Duration::from_millis(100), async {
+            while !completion.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .is_ok();
+
+    secrets.release_set();
+    let error = completion
+        .await
+        .expect("authorization task joins")
+        .expect_err("cancelled authorization cannot succeed");
+    wait_for_atomic(&secrets.set_finished, 1).await;
+    assert_eq!(error.kind, BrokerageErrorKind::AuthorizationDenied);
+
+    oauth
+        .disconnect()
+        .await
+        .expect("disconnect clears credentials");
+
+    assert!(
+        !completion_finished_before_write,
+        "the cancelled authorization returned before its credential write completed"
+    );
+    assert!(
+        BrokerCredentialStore::new(Brokerage::Robinhood, secrets)
+            .load()
+            .await
+            .expect("load credentials after disconnect")
+            .is_none(),
+        "disconnect must not be undone by a cancelled credential write"
+    );
+}
+
+#[tokio::test]
 async fn oauth_callback_rejects_wrong_state_before_exchanging_code() {
-    let (oauth, exchange_counter, _secrets) = oauth_fixture().await;
+    let (oauth, exchange_counter, _secrets, _server) = oauth_fixture().await;
     let pending = oauth.begin_authorization().await.expect("begin");
     let error = oauth
         .complete_authorization(pending, "code=abc&state=wrong")
@@ -485,7 +606,7 @@ async fn oauth_callback_rejects_wrong_state_before_exchanging_code() {
 
 #[tokio::test]
 async fn oauth_callback_expires_after_ten_minutes_before_exchanging_code() {
-    let (oauth, exchange_counter, _secrets) = oauth_fixture().await;
+    let (oauth, exchange_counter, _secrets, _server) = oauth_fixture().await;
     let pending = oauth.begin_authorization().await.expect("begin");
     let state = authorization_state(&pending.authorization_url);
     tokio::time::pause();
@@ -504,7 +625,7 @@ async fn oauth_callback_expires_after_ten_minutes_before_exchanging_code() {
 
 #[tokio::test]
 async fn cancelling_pending_authorization_deletes_state() {
-    let (oauth, exchange_counter, _secrets) = oauth_fixture().await;
+    let (oauth, exchange_counter, _secrets, _server) = oauth_fixture().await;
     let pending = oauth.begin_authorization().await.expect("begin");
     assert_eq!(oauth.pending_authorization_count().await, 1);
 
@@ -516,7 +637,7 @@ async fn cancelling_pending_authorization_deletes_state() {
 
 #[tokio::test]
 async fn callback_missing_state_deletes_pending_authorization() {
-    let (oauth, exchange_counter, _secrets) = oauth_fixture().await;
+    let (oauth, exchange_counter, _secrets, _server) = oauth_fixture().await;
     let pending = oauth.begin_authorization().await.expect("begin");
     assert_eq!(oauth.pending_authorization_count().await, 1);
 
@@ -532,7 +653,7 @@ async fn callback_missing_state_deletes_pending_authorization() {
 
 #[tokio::test]
 async fn expired_authorization_state_becomes_unavailable_without_a_callback() {
-    let (oauth, exchange_counter, _secrets) = oauth_fixture().await;
+    let (oauth, exchange_counter, _secrets, _server) = oauth_fixture().await;
     let pending = oauth.begin_authorization().await.expect("begin");
     assert_eq!(oauth.pending_authorization_count().await, 1);
     tokio::time::pause();
@@ -550,7 +671,7 @@ async fn expired_authorization_state_becomes_unavailable_without_a_callback() {
 
 #[tokio::test]
 async fn oauth_callback_exchanges_code_and_saves_credentials() {
-    let (oauth, exchange_counter, secrets) = oauth_fixture().await;
+    let (oauth, exchange_counter, secrets, _server) = oauth_fixture().await;
     let pending = oauth.begin_authorization().await.expect("begin");
     let state = authorization_state(&pending.authorization_url);
     let callback = format!("code=abc&state={state}");
@@ -571,7 +692,7 @@ async fn oauth_callback_exchanges_code_and_saves_credentials() {
 
 #[tokio::test]
 async fn successful_oauth_exchange_keeps_secrets_out_of_debug_tracing() {
-    let (oauth, exchange_counter, _secrets) = oauth_fixture().await;
+    let (oauth, exchange_counter, _secrets, _server) = oauth_fixture().await;
     let pending = oauth.begin_authorization().await.expect("begin");
     let state = authorization_state(&pending.authorization_url);
     let callback = format!("code={PRIVATE_AUTHORIZATION_CODE}&state={state}");
@@ -606,7 +727,7 @@ async fn successful_oauth_exchange_keeps_secrets_out_of_debug_tracing() {
 
 #[tokio::test]
 async fn one_shot_callback_yields_only_the_query_and_returns_a_fixed_page() {
-    let (oauth, _exchange_counter, _secrets) = oauth_fixture().await;
+    let (oauth, _exchange_counter, _secrets, _server) = oauth_fixture().await;
     let mut pending = oauth.begin_authorization().await.expect("begin");
     let redirect = pending.redirect_uri.clone();
     let state = authorization_state(&pending.authorization_url);
@@ -641,7 +762,7 @@ async fn one_shot_callback_yields_only_the_query_and_returns_a_fixed_page() {
 
 #[tokio::test]
 async fn one_shot_callback_rejects_request_lines_over_eight_kib() {
-    let (oauth, _exchange_counter, _secrets) = oauth_fixture().await;
+    let (oauth, _exchange_counter, _secrets, _server) = oauth_fixture().await;
     let mut pending = oauth.begin_authorization().await.expect("begin");
     let redirect = pending.redirect_uri.clone();
     let client = tokio::spawn(async move {

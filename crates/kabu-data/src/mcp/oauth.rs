@@ -60,6 +60,7 @@ pub struct BrokerCredentialStore {
     brokerage: Brokerage,
     secrets: Arc<dyn SecretStore>,
     refresh_lock: Arc<Mutex<()>>,
+    mutation_lock: Arc<Mutex<()>>,
 }
 
 impl BrokerCredentialStore {
@@ -68,6 +69,7 @@ impl BrokerCredentialStore {
             brokerage,
             secrets,
             refresh_lock: Arc::new(Mutex::new(())),
+            mutation_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -90,7 +92,12 @@ impl BrokerCredentialStore {
     async fn write_secret(&self, value: Vec<u8>) -> Result<(), AuthError> {
         let secrets = self.secrets.clone();
         let account = self.account_name();
+        // Move the owned lock into the blocking operation. If OAuth cancellation drops the
+        // awaiting future, the in-flight write still owns its ordering slot until it completes,
+        // so a later explicit credential clear cannot be undone by that delayed write.
+        let mutation_guard = self.mutation_lock.clone().lock_owned().await;
         spawn_blocking(move || {
+            let _mutation_guard = mutation_guard;
             let value = Zeroizing::new(value);
             secrets.set(KEYCHAIN_SERVICE, account, value.as_slice())
         })
@@ -102,10 +109,21 @@ impl BrokerCredentialStore {
     async fn delete_secret(&self) -> Result<(), AuthError> {
         let secrets = self.secrets.clone();
         let account = self.account_name();
-        spawn_blocking(move || secrets.delete(KEYCHAIN_SERVICE, account))
-            .await
-            .map_err(|_| credential_task_error())?
-            .map_err(credential_store_error)
+        let mutation_guard = self.mutation_lock.clone().lock_owned().await;
+        spawn_blocking(move || {
+            let _mutation_guard = mutation_guard;
+            secrets.delete(KEYCHAIN_SERVICE, account)
+        })
+        .await
+        .map_err(|_| credential_task_error())?
+        .map_err(credential_store_error)
+    }
+
+    async fn wait_for_mutation(&self) {
+        // A save that was cancelled while waiting on its blocking Keychain task carries this
+        // guard into that task. Waiting for and releasing the guard therefore joins the owned
+        // credential side effect before its authorization job can complete.
+        let _mutation_guard = self.mutation_lock.clone().lock_owned().await;
     }
 }
 
@@ -468,6 +486,9 @@ impl BrokerOAuth {
             self.complete_authorization_inner(&pending, callback_query),
         )
         .await;
+        if cancellation.is_cancelled() {
+            self.credentials.wait_for_mutation().await;
+        }
         _ = pending.cancel().await;
         result
     }

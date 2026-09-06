@@ -14,7 +14,7 @@ use url::Url;
 use crate::{
     BrokerOAuth, BrokerageClient, SecretStore, broker_oauth, disconnect_after_close,
     malformed_response,
-    mcp::{BrokerMcpConfig, BrokerMcpSession, ReadCapabilityInput},
+    mcp::{BrokerMcpConfig, BrokerMcpSession, ReadCapabilityInput, SessionCloseOutcome},
     parse_bounded_decimal, parse_optional_decimal, safe_account_label,
 };
 
@@ -185,6 +185,7 @@ pub struct RobinhoodPortfolioProvider {
     endpoint: Url,
     oauth: BrokerOAuth,
     session: Mutex<Option<BrokerMcpSession>>,
+    session_close_outcome: Mutex<SessionCloseOutcome>,
 }
 
 impl RobinhoodPortfolioProvider {
@@ -195,6 +196,7 @@ impl RobinhoodPortfolioProvider {
             oauth: broker_oauth(Brokerage::Robinhood, endpoint.clone(), secrets),
             endpoint,
             session: Mutex::new(None),
+            session_close_outcome: Mutex::new(SessionCloseOutcome::default()),
         })
     }
 
@@ -210,6 +212,7 @@ impl RobinhoodPortfolioProvider {
 
     async fn store_session(&self, session: BrokerMcpSession) {
         *self.session.lock().await = Some(session);
+        self.session_close_outcome.lock().await.reset();
     }
 }
 
@@ -232,7 +235,7 @@ impl BrokerageClient for RobinhoodPortfolioProvider {
             }
         };
         match initial_session {
-            Ok(mut connected) => {
+            Ok(connected) => {
                 if cancellation.is_cancelled() {
                     let _ = connected.close().await;
                     return Err(BrokerageError::new(BrokerageErrorKind::AuthorizationDenied));
@@ -275,7 +278,7 @@ impl BrokerageClient for RobinhoodPortfolioProvider {
         self.oauth
             .complete_authorization_cancellable(pending, &callback, cancellation.clone())
             .await?;
-        let mut connected = tokio::select! {
+        let connected = tokio::select! {
             result = self.start_session() => result?,
             _ = cancellation.cancelled() => {
                 return Err(BrokerageError::new(BrokerageErrorKind::AuthorizationDenied));
@@ -291,15 +294,27 @@ impl BrokerageClient for RobinhoodPortfolioProvider {
 
     async fn close_session(&self) -> Result<(), BrokerageError> {
         let mut session = self.session.lock().await;
-        let Some(active_session) = session.as_mut() else {
-            return Ok(());
+        let Some(active_session) = session.take() else {
+            drop(session);
+            return self
+                .session_close_outcome
+                .lock()
+                .await
+                .prior_result()
+                .unwrap_or(Ok(()));
         };
         match active_session.close().await {
             Ok(()) => {
-                session.take();
+                self.session_close_outcome.lock().await.reset();
                 Ok(())
             }
-            Err(error) => Err(error),
+            Err(error) => {
+                self.session_close_outcome
+                    .lock()
+                    .await
+                    .record_terminal_failure(error.clone());
+                Err(error)
+            }
         }
     }
 }
