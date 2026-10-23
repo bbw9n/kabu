@@ -6,9 +6,11 @@ use kabu_app::{
     },
 };
 use kabu_core::{
+    Brokerage, BrokerageAccountId, BrokerageAssetKind, BrokerageConnectionState, BrokeragePosition,
     CachedMarketState, Candle, ChartPeriod, ChartRequestKey, DataSource, Freshness, Instrument,
     InstrumentId, MarketDataError, MarketDataErrorKind, MarketState, PersistedState,
-    PersistenceError, Quote, SearchResult, StateRepository, ThemePreference, Watchlist,
+    PersistenceError, PortfolioSnapshot, Quote, SearchResult, StateRepository, ThemePreference,
+    Watchlist,
 };
 use kabu_data::Recovery;
 use std::{
@@ -30,6 +32,190 @@ fn first_launch_uses_the_starter_watchlist() {
         model.selected().expect("selection").id.canonical_symbol(),
         "AAPL"
     );
+}
+
+#[test]
+fn portfolio_events_replace_only_the_matching_broker() {
+    let mut model = model_with_recording_runtime();
+    model.apply_runtime_event(RuntimeEvent::PortfolioUpdated(snapshot(
+        Brokerage::Robinhood,
+        1,
+    )));
+    model.apply_runtime_event(RuntimeEvent::PortfolioUpdated(snapshot(
+        Brokerage::Longbridge,
+        2,
+    )));
+
+    assert_eq!(
+        model
+            .portfolio(Brokerage::Robinhood)
+            .expect("Robinhood portfolio")
+            .positions
+            .len(),
+        1
+    );
+    assert_eq!(
+        model
+            .portfolio(Brokerage::Longbridge)
+            .expect("Longbridge portfolio")
+            .positions
+            .len(),
+        2
+    );
+}
+
+#[test]
+fn disconnect_intent_clears_only_after_runtime_confirmation() {
+    let mut model = connected_model(Brokerage::Robinhood);
+
+    model.disconnect_broker(Brokerage::Robinhood);
+
+    assert!(matches!(
+        model.connection_state(Brokerage::Robinhood),
+        BrokerageConnectionState::Connected { .. }
+    ));
+    assert_eq!(
+        model.runtime().recorded_commands().last(),
+        Some(&RuntimeCommand::DisconnectBroker(Brokerage::Robinhood))
+    );
+}
+
+#[test]
+fn broker_state_starts_disconnected_and_intents_are_runtime_owned() {
+    let mut model = model_with_recording_runtime();
+
+    assert_eq!(
+        model.connection_state(Brokerage::Robinhood),
+        &BrokerageConnectionState::Disconnected
+    );
+    assert_eq!(
+        model.connection_state(Brokerage::Longbridge),
+        &BrokerageConnectionState::Disconnected
+    );
+    assert!(model.portfolios().is_empty());
+
+    model.connect_broker(Brokerage::Robinhood);
+    model.cancel_broker_connection(Brokerage::Robinhood);
+    model.refresh_portfolio(Brokerage::Longbridge);
+    model.disconnect_broker(Brokerage::Longbridge);
+
+    assert_eq!(
+        model.runtime().recorded_commands(),
+        [
+            RuntimeCommand::ConnectBroker(Brokerage::Robinhood),
+            RuntimeCommand::CancelBrokerConnection(Brokerage::Robinhood),
+            RuntimeCommand::RefreshPortfolio(Brokerage::Longbridge),
+            RuntimeCommand::DisconnectBroker(Brokerage::Longbridge),
+        ]
+    );
+    assert_eq!(
+        model.connection_state(Brokerage::Robinhood),
+        &BrokerageConnectionState::Disconnected
+    );
+    assert_eq!(
+        model.connection_state(Brokerage::Longbridge),
+        &BrokerageConnectionState::Disconnected
+    );
+}
+
+#[test]
+fn refresh_error_retains_snapshots_and_confirmed_disconnect_clears_only_its_broker() {
+    let mut model = connected_model(Brokerage::Robinhood);
+    model.apply_runtime_event(RuntimeEvent::BrokerConnectionChanged {
+        brokerage: Brokerage::Longbridge,
+        state: BrokerageConnectionState::Connected {
+            last_synced_at: Some(ts(1_800_000_002)),
+        },
+    });
+    model.apply_runtime_event(RuntimeEvent::PortfolioUpdated(snapshot(
+        Brokerage::Longbridge,
+        2,
+    )));
+
+    model.apply_runtime_event(RuntimeEvent::BrokerConnectionChanged {
+        brokerage: Brokerage::Robinhood,
+        state: BrokerageConnectionState::Error {
+            message: "Broker refresh is temporarily unavailable.".into(),
+        },
+    });
+
+    assert!(model.portfolio(Brokerage::Robinhood).is_some());
+    assert_eq!(
+        model
+            .portfolio(Brokerage::Longbridge)
+            .expect("Longbridge portfolio")
+            .positions
+            .len(),
+        2
+    );
+
+    model.apply_runtime_event(RuntimeEvent::BrokerConnectionChanged {
+        brokerage: Brokerage::Robinhood,
+        state: BrokerageConnectionState::Disconnected,
+    });
+
+    assert!(model.portfolio(Brokerage::Robinhood).is_none());
+    assert!(model.portfolio(Brokerage::Longbridge).is_some());
+    assert!(matches!(
+        model.connection_state(Brokerage::Longbridge),
+        BrokerageConnectionState::Connected { .. }
+    ));
+}
+
+#[test]
+fn initial_portfolio_visibility_is_dispatched_to_synchronize_the_runtime() {
+    let mut model = model_with_recording_runtime();
+
+    model.set_portfolio_visible(false);
+    model.set_portfolio_visible(true);
+
+    assert_eq!(
+        model.runtime().recorded_commands(),
+        [
+            RuntimeCommand::SetPortfolioVisible(false),
+            RuntimeCommand::SetPortfolioVisible(true),
+        ]
+    );
+}
+
+#[test]
+fn portfolios_are_session_only_and_never_enter_persisted_settings() {
+    let repository = RecordingRepository::starter();
+    let mut model = AppModel::with_repository(repository.clone(), fake_runtime());
+    model.apply_runtime_event(RuntimeEvent::PortfolioUpdated(snapshot(
+        Brokerage::Robinhood,
+        1,
+    )));
+
+    assert!(repository.saved_states().is_empty());
+    model
+        .set_theme(ThemePreference::Signal)
+        .expect("persist unrelated settings");
+    assert!(!format!("{:?}", repository.saved_states()).contains("private-account-id"));
+
+    let restarted = AppModel::with_repository(repository, fake_runtime());
+    assert!(restarted.portfolios().is_empty());
+}
+
+#[test]
+fn failed_broker_intents_emit_one_sanitized_warning_without_payloads() {
+    let runtime = RuntimeHandle::default();
+    runtime.shutdown();
+    let mut model = AppModel::new(
+        PersistedState::starter(),
+        CachedMarketState::default(),
+        runtime,
+    );
+
+    for _ in 0..100 {
+        model.connect_broker(Brokerage::Robinhood);
+        model.refresh_portfolio(Brokerage::Robinhood);
+    }
+
+    assert_eq!(model.warnings().len(), 1);
+    let rendered = format!("{:?}", model.warnings());
+    assert!(!rendered.contains("private-account-id"));
+    assert!(!rendered.contains("PRIVATE-"));
 }
 
 #[test]
@@ -1955,6 +2141,51 @@ fn history_command_count(runtime: &RuntimeHandle) -> usize {
 
 fn fake_runtime() -> RuntimeHandle {
     RuntimeHandle::default()
+}
+
+fn model_with_recording_runtime() -> AppModel {
+    AppModel::new(
+        PersistedState::starter(),
+        CachedMarketState::default(),
+        RuntimeHandle::default(),
+    )
+}
+
+fn connected_model(brokerage: Brokerage) -> AppModel {
+    let mut model = model_with_recording_runtime();
+    model.apply_runtime_event(RuntimeEvent::BrokerConnectionChanged {
+        brokerage,
+        state: BrokerageConnectionState::Connected {
+            last_synced_at: Some(ts(1_800_000_000)),
+        },
+    });
+    model.apply_runtime_event(RuntimeEvent::PortfolioUpdated(snapshot(brokerage, 1)));
+    model
+}
+
+fn snapshot(brokerage: Brokerage, position_count: usize) -> PortfolioSnapshot {
+    let account_id = BrokerageAccountId::new("private-account-id");
+    let positions = (0..position_count)
+        .map(|index| BrokeragePosition {
+            brokerage,
+            account_id: account_id.clone(),
+            native_symbol: format!("PRIVATE-{index}"),
+            display_name: format!("Private holding {index}"),
+            asset_kind: BrokerageAssetKind::Equity,
+            instrument: None,
+            quantity: Default::default(),
+            average_cost: None,
+            market_value: None,
+            unrealized_pnl: None,
+            currency: "USD".into(),
+        })
+        .collect();
+    PortfolioSnapshot {
+        brokerage,
+        accounts: Vec::new(),
+        positions,
+        received_at: ts(1_800_000_001),
+    }
 }
 
 fn cached_quote(instrument_id: InstrumentId, last: f64, previous_close: f64) -> Quote {

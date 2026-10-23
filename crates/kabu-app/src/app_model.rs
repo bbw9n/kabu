@@ -3,11 +3,11 @@ use crate::runtime::{
     RuntimeHandle, RuntimeSendError, ShutdownOutcome, StreamStatus,
 };
 use kabu_core::{
-    AddOutcome, CachedChart, CachedMarketState, ChartPeriod, ChartRequestKey, DataSource,
-    Freshness, Generation, GenerationId, Instrument, InstrumentId, MarketDataErrorKind,
-    MergeOutcome, PersistedState, PersistenceError, Quote, QuoteState, SearchResult,
-    StateRepository, ThemePreference, Watchlist, WatchlistError, classify_freshness,
-    rank_search_results,
+    AddOutcome, Brokerage, BrokerageConnectionState, CachedChart, CachedMarketState, ChartPeriod,
+    ChartRequestKey, DataSource, Freshness, Generation, GenerationId, Instrument, InstrumentId,
+    MarketDataErrorKind, MergeOutcome, PersistedState, PersistenceError, PortfolioSnapshot, Quote,
+    QuoteState, SearchResult, StateRepository, ThemePreference, Watchlist, WatchlistError,
+    classify_freshness, rank_search_results,
 };
 use kabu_data::Recovery;
 use std::{
@@ -70,6 +70,7 @@ enum RuntimeDispatchKind {
     Snapshot,
     History,
     Control,
+    Brokerage,
     StatePersistence,
     MarketCachePersistence,
 }
@@ -159,6 +160,10 @@ pub struct AppModel {
     control_sync_pending: bool,
     recheck_history_on_restore: bool,
     stream_status: StreamStatus,
+    broker_connections: HashMap<Brokerage, BrokerageConnectionState>,
+    portfolios: HashMap<Brokerage, PortfolioSnapshot>,
+    portfolio_visible: bool,
+    last_portfolio_visibility_dispatch: Option<bool>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -274,6 +279,13 @@ impl AppModel {
             control_sync_pending: false,
             recheck_history_on_restore: false,
             stream_status: StreamStatus::Paused,
+            broker_connections: [Brokerage::Robinhood, Brokerage::Longbridge]
+                .into_iter()
+                .map(|brokerage| (brokerage, BrokerageConnectionState::Disconnected))
+                .collect(),
+            portfolios: HashMap::new(),
+            portfolio_visible: false,
+            last_portfolio_visibility_dispatch: None,
         }
     }
 
@@ -429,6 +441,49 @@ impl AppModel {
 
     pub fn warnings(&self) -> &[AppWarning] {
         &self.warnings
+    }
+
+    pub fn connection_state(&self, brokerage: Brokerage) -> &BrokerageConnectionState {
+        self.broker_connections
+            .get(&brokerage)
+            .expect("every supported brokerage has connection state")
+    }
+
+    pub fn portfolio(&self, brokerage: Brokerage) -> Option<&PortfolioSnapshot> {
+        self.portfolios.get(&brokerage)
+    }
+
+    pub fn portfolios(&self) -> &HashMap<Brokerage, PortfolioSnapshot> {
+        &self.portfolios
+    }
+
+    pub fn connect_broker(&mut self, brokerage: Brokerage) {
+        _ = self.send_runtime(RuntimeCommand::ConnectBroker(brokerage));
+    }
+
+    pub fn cancel_broker_connection(&mut self, brokerage: Brokerage) {
+        _ = self.send_runtime(RuntimeCommand::CancelBrokerConnection(brokerage));
+    }
+
+    pub fn refresh_portfolio(&mut self, brokerage: Brokerage) {
+        _ = self.send_runtime(RuntimeCommand::RefreshPortfolio(brokerage));
+    }
+
+    pub fn disconnect_broker(&mut self, brokerage: Brokerage) {
+        _ = self.send_runtime(RuntimeCommand::DisconnectBroker(brokerage));
+    }
+
+    pub fn set_portfolio_visible(&mut self, visible: bool) {
+        self.portfolio_visible = visible;
+        if self.last_portfolio_visibility_dispatch == Some(visible) {
+            return;
+        }
+        if self
+            .send_runtime(RuntimeCommand::SetPortfolioVisible(visible))
+            .is_ok()
+        {
+            self.last_portfolio_visibility_dispatch = Some(visible);
+        }
     }
 
     pub fn set_search_query(&mut self, query: impl AsRef<str>) -> GenerationId {
@@ -714,7 +769,15 @@ impl AppModel {
                 self.apply_persistence_result(category, result);
             }
             RuntimeEvent::StreamStatus(status) => self.stream_status = status,
-            RuntimeEvent::BrokerConnectionChanged { .. } | RuntimeEvent::PortfolioUpdated(_) => {}
+            RuntimeEvent::BrokerConnectionChanged { brokerage, state } => {
+                if state == BrokerageConnectionState::Disconnected {
+                    self.portfolios.remove(&brokerage);
+                }
+                self.broker_connections.insert(brokerage, state);
+            }
+            RuntimeEvent::PortfolioUpdated(snapshot) => {
+                self.portfolios.insert(snapshot.brokerage, snapshot);
+            }
         }
     }
 
@@ -1193,12 +1256,12 @@ fn runtime_dispatch_kind(command: &RuntimeCommand) -> RuntimeDispatchKind {
         RuntimeCommand::SetVisible(_)
         | RuntimeCommand::SetWatchlist(_)
         | RuntimeCommand::SetCryptoWatchlist(_)
-        | RuntimeCommand::ConnectBroker(_)
+        | RuntimeCommand::Shutdown => RuntimeDispatchKind::Control,
+        RuntimeCommand::ConnectBroker(_)
         | RuntimeCommand::CancelBrokerConnection(_)
         | RuntimeCommand::RefreshPortfolio(_)
         | RuntimeCommand::DisconnectBroker(_)
-        | RuntimeCommand::SetPortfolioVisible(_)
-        | RuntimeCommand::Shutdown => RuntimeDispatchKind::Control,
+        | RuntimeCommand::SetPortfolioVisible(_) => RuntimeDispatchKind::Brokerage,
         RuntimeCommand::PersistState(_) => RuntimeDispatchKind::StatePersistence,
         RuntimeCommand::PersistMarketCache { .. } => RuntimeDispatchKind::MarketCachePersistence,
     }
@@ -1216,6 +1279,7 @@ fn runtime_dispatch_failure_message(kind: RuntimeDispatchKind) -> &'static str {
         | RuntimeDispatchKind::Snapshot
         | RuntimeDispatchKind::History
         | RuntimeDispatchKind::Control => "Background market-data work is temporarily unavailable.",
+        RuntimeDispatchKind::Brokerage => "Brokerage work is temporarily unavailable.",
     }
 }
 
