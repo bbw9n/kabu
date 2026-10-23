@@ -1,0 +1,33 @@
+{
+  "results": [
+    {
+      "account_number": "RH-ABC-1234567890",
+      "symbol": "BTC-USD",
+      "name": "Bitcoin",
+      "asset_type": "crypto",
+      "base_currency_code": "BTC",
+      "quote_currency_code": "USD",
+      "quantity": "0.12345678",
+      "average_buy_price": "65432.10987654",
+      "market_value": "0",
+      "unrealized_pl": null,
+      "currency": "USD",
+      "updated_at": "2026-09-01T12:00:00Z"
+    },
+    {
+      "account_number": "RH-ABC-1234567890",
+      "symbol": "DOGE",
+      "name": "Dogecoin",
+      "asset_type": "crypto",
+      "base_currency_code": "DOGE",
+      "quantity": "0",
+      "average_buy_price": null,
+      "market_value": null,
+      "unrealized_pl": "0",
+      "currency": "USD",
+      "updated_at": "2026-09-01T12:00:00Z"
+    }
+  ],
+  "next": null,
+  "previous": null
+}

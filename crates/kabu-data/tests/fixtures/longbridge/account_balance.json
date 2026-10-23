@@ -1,0 +1,29 @@
+[
+  {
+    "total_cash": "0",
+    "max_finance_amount": "10000.000000",
+    "remaining_finance_amount": "9999.500000",
+    "risk_level": 0,
+    "margin_call": "0",
+    "currency": "USD",
+    "cash_infos": [
+      {
+        "withdraw_cash": "0",
+        "available_cash": "0",
+        "frozen_cash": "0",
+        "settling_cash": "0",
+        "currency": "USD"
+      }
+    ],
+    "net_assets": "25000.123456789",
+    "init_margin": "0",
+    "maintenance_margin": "0",
+    "buy_power": "9999.500000",
+    "frozen_transaction_fees": [
+      {
+        "currency": "USD",
+        "frozen_transaction_fee": "0"
+      }
+    ]
+  }
+]

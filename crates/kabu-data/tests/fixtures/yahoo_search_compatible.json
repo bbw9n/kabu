@@ -1,0 +1,23 @@
+{
+  "quotes": [
+    {
+      "symbol": "MSFT",
+      "shortname": "Microsoft short name",
+      "longname": "Microsoft long name",
+      "quoteType": "EQUITY",
+      "exchange": "NMS",
+      "currency": null
+    },
+    {
+      "symbol": "MSFT-UNSUPPORTED",
+      "quoteType": "ETF",
+      "exchange": "NMS"
+    },
+    {
+      "symbol": "ACME",
+      "longname": "Acme Corporation",
+      "quoteType": "EQUITY",
+      "exchange": "NYQ"
+    }
+  ]
+}

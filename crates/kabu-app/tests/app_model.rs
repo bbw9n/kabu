@@ -1,0 +1,2378 @@
+use kabu_app::{
+    app_model::{AppModel, AppModelError, ChartAvailability, clamp_window_size_to_display},
+    runtime::{
+        PersistenceCategory, PersistenceResult, ProviderWarning, RuntimeCommand, RuntimeEvent,
+        RuntimeHandle,
+    },
+};
+use kabu_core::{
+    Brokerage, BrokerageAccountId, BrokerageAssetKind, BrokerageConnectionState, BrokeragePosition,
+    CachedMarketState, Candle, ChartPeriod, ChartRequestKey, DataSource, Freshness, Instrument,
+    InstrumentId, MarketDataError, MarketDataErrorKind, MarketState, PersistedState,
+    PersistenceError, PortfolioSnapshot, Quote, SearchResult, StateRepository, ThemePreference,
+    Watchlist,
+};
+use kabu_data::Recovery;
+use std::{
+    io,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+
+#[test]
+fn first_launch_uses_the_starter_watchlist() {
+    let model = AppModel::new(
+        PersistedState::starter(),
+        CachedMarketState::default(),
+        fake_runtime(),
+    );
+
+    assert_eq!(model.watchlist().len(), 4);
+    assert_eq!(
+        model.selected().expect("selection").id.canonical_symbol(),
+        "AAPL"
+    );
+}
+
+#[test]
+fn portfolio_events_replace_only_the_matching_broker() {
+    let mut model = model_with_recording_runtime();
+    model.apply_runtime_event(RuntimeEvent::PortfolioUpdated(snapshot(
+        Brokerage::Robinhood,
+        1,
+    )));
+    model.apply_runtime_event(RuntimeEvent::PortfolioUpdated(snapshot(
+        Brokerage::Longbridge,
+        2,
+    )));
+
+    assert_eq!(
+        model
+            .portfolio(Brokerage::Robinhood)
+            .expect("Robinhood portfolio")
+            .positions
+            .len(),
+        1
+    );
+    assert_eq!(
+        model
+            .portfolio(Brokerage::Longbridge)
+            .expect("Longbridge portfolio")
+            .positions
+            .len(),
+        2
+    );
+}
+
+#[test]
+fn disconnect_intent_clears_only_after_runtime_confirmation() {
+    let mut model = connected_model(Brokerage::Robinhood);
+
+    model.disconnect_broker(Brokerage::Robinhood);
+
+    assert!(matches!(
+        model.connection_state(Brokerage::Robinhood),
+        BrokerageConnectionState::Connected { .. }
+    ));
+    assert_eq!(
+        model.runtime().recorded_commands().last(),
+        Some(&RuntimeCommand::DisconnectBroker(Brokerage::Robinhood))
+    );
+}
+
+#[test]
+fn broker_state_starts_disconnected_and_intents_are_runtime_owned() {
+    let mut model = model_with_recording_runtime();
+
+    assert_eq!(
+        model.connection_state(Brokerage::Robinhood),
+        &BrokerageConnectionState::Disconnected
+    );
+    assert_eq!(
+        model.connection_state(Brokerage::Longbridge),
+        &BrokerageConnectionState::Disconnected
+    );
+    assert!(model.portfolios().is_empty());
+
+    model.connect_broker(Brokerage::Robinhood);
+    model.cancel_broker_connection(Brokerage::Robinhood);
+    model.refresh_portfolio(Brokerage::Longbridge);
+    model.disconnect_broker(Brokerage::Longbridge);
+
+    assert_eq!(
+        model.runtime().recorded_commands(),
+        [
+            RuntimeCommand::ConnectBroker(Brokerage::Robinhood),
+            RuntimeCommand::CancelBrokerConnection(Brokerage::Robinhood),
+            RuntimeCommand::RefreshPortfolio(Brokerage::Longbridge),
+            RuntimeCommand::DisconnectBroker(Brokerage::Longbridge),
+        ]
+    );
+    assert_eq!(
+        model.connection_state(Brokerage::Robinhood),
+        &BrokerageConnectionState::Disconnected
+    );
+    assert_eq!(
+        model.connection_state(Brokerage::Longbridge),
+        &BrokerageConnectionState::Disconnected
+    );
+}
+
+#[test]
+fn refresh_error_retains_snapshots_and_confirmed_disconnect_clears_only_its_broker() {
+    let mut model = connected_model(Brokerage::Robinhood);
+    model.apply_runtime_event(RuntimeEvent::BrokerConnectionChanged {
+        brokerage: Brokerage::Longbridge,
+        state: BrokerageConnectionState::Connected {
+            last_synced_at: Some(ts(1_800_000_002)),
+        },
+    });
+    model.apply_runtime_event(RuntimeEvent::PortfolioUpdated(snapshot(
+        Brokerage::Longbridge,
+        2,
+    )));
+
+    model.apply_runtime_event(RuntimeEvent::BrokerConnectionChanged {
+        brokerage: Brokerage::Robinhood,
+        state: BrokerageConnectionState::Error {
+            message: "Broker refresh is temporarily unavailable.".into(),
+        },
+    });
+
+    assert!(model.portfolio(Brokerage::Robinhood).is_some());
+    assert_eq!(
+        model
+            .portfolio(Brokerage::Longbridge)
+            .expect("Longbridge portfolio")
+            .positions
+            .len(),
+        2
+    );
+
+    model.apply_runtime_event(RuntimeEvent::BrokerConnectionChanged {
+        brokerage: Brokerage::Robinhood,
+        state: BrokerageConnectionState::Disconnected,
+    });
+
+    assert!(model.portfolio(Brokerage::Robinhood).is_none());
+    assert!(model.portfolio(Brokerage::Longbridge).is_some());
+    assert!(matches!(
+        model.connection_state(Brokerage::Longbridge),
+        BrokerageConnectionState::Connected { .. }
+    ));
+}
+
+#[test]
+fn initial_portfolio_visibility_is_dispatched_to_synchronize_the_runtime() {
+    let mut model = model_with_recording_runtime();
+
+    model.set_portfolio_visible(false);
+    model.set_portfolio_visible(true);
+
+    assert_eq!(
+        model.runtime().recorded_commands(),
+        [
+            RuntimeCommand::SetPortfolioVisible(false),
+            RuntimeCommand::SetPortfolioVisible(true),
+        ]
+    );
+}
+
+#[test]
+fn portfolios_are_session_only_and_never_enter_persisted_settings() {
+    let repository = RecordingRepository::starter();
+    let mut model = AppModel::with_repository(repository.clone(), fake_runtime());
+    model.apply_runtime_event(RuntimeEvent::PortfolioUpdated(snapshot(
+        Brokerage::Robinhood,
+        1,
+    )));
+
+    assert!(repository.saved_states().is_empty());
+    model
+        .set_theme(ThemePreference::Signal)
+        .expect("persist unrelated settings");
+    assert!(!format!("{:?}", repository.saved_states()).contains("private-account-id"));
+
+    let restarted = AppModel::with_repository(repository, fake_runtime());
+    assert!(restarted.portfolios().is_empty());
+}
+
+#[test]
+fn failed_broker_intents_emit_one_sanitized_warning_without_payloads() {
+    let runtime = RuntimeHandle::default();
+    runtime.shutdown();
+    let mut model = AppModel::new(
+        PersistedState::starter(),
+        CachedMarketState::default(),
+        runtime,
+    );
+
+    for _ in 0..100 {
+        model.connect_broker(Brokerage::Robinhood);
+        model.refresh_portfolio(Brokerage::Robinhood);
+    }
+
+    assert_eq!(model.warnings().len(), 1);
+    let rendered = format!("{:?}", model.warnings());
+    assert!(!rendered.contains("private-account-id"));
+    assert!(!rendered.contains("PRIVATE-"));
+}
+
+#[test]
+fn launch_geometry_is_clamped_to_the_active_display() {
+    assert_eq!(
+        clamp_window_size_to_display(2_000.0, 1_200.0, 1_440.0, 900.0),
+        (1_440.0, 900.0)
+    );
+    assert_eq!(
+        clamp_window_size_to_display(200.0, 100.0, 1_440.0, 900.0),
+        (760.0, 500.0)
+    );
+}
+
+#[test]
+fn deleting_selection_persists_and_selects_neighbor() {
+    let repo = RecordingRepository::starter();
+    let mut model = AppModel::with_repository(repo.clone(), fake_runtime());
+
+    model.select_index(1).expect("select NVDA");
+    model.remove_selected().expect("remove");
+
+    assert_eq!(
+        model.selected().expect("selection").id.canonical_symbol(),
+        "BTC/USDT"
+    );
+    assert_eq!(
+        repo.saved_states().last().expect("saved").watchlist.len(),
+        3
+    );
+}
+
+#[test]
+fn theme_and_geometry_changes_are_clamped_and_persisted() {
+    let repo = RecordingRepository::starter();
+    let mut model = AppModel::with_repository(repo.clone(), fake_runtime());
+
+    model.set_theme(ThemePreference::Signal).expect("theme");
+    model.set_sidebar_width(999.0).expect("sidebar");
+    model.set_window_geometry(900.0, 580.0).expect("geometry");
+
+    let saved_states = repo.saved_states();
+    let saved = saved_states.last().expect("saved");
+    assert_eq!(saved.theme, ThemePreference::Signal);
+    assert_eq!(saved.sidebar_width, 360.0);
+    assert_eq!((saved.window_width, saved.window_height), (900.0, 580.0));
+}
+
+#[test]
+fn restored_dimensions_are_clamped_before_the_model_is_observed() {
+    let mut state = PersistedState::starter();
+    state.window_width = 200.0;
+    state.window_height = 100.0;
+    state.sidebar_width = 9.0;
+
+    let model = AppModel::new(state, CachedMarketState::default(), fake_runtime());
+
+    assert_eq!(model.window_geometry(), (760.0, 500.0));
+    assert_eq!(model.sidebar_width(), 220.0);
+}
+
+#[test]
+fn sidebar_drag_previews_live_and_persists_only_when_committed() {
+    let repo = RecordingRepository::starter();
+    let mut model = AppModel::with_repository(repo.clone(), fake_runtime());
+
+    model.preview_sidebar_width(999.0);
+    assert_eq!(model.sidebar_width(), 360.0);
+    assert!(repo.saved_states().is_empty());
+
+    model.persist_sidebar_width().expect("mouse-up commit");
+    assert_eq!(repo.saved_states().len(), 1);
+    assert_eq!(repo.saved_states()[0].sidebar_width, 360.0);
+}
+
+#[test]
+fn selection_during_geometry_debounce_serializes_committed_geometry() {
+    let repo = RecordingRepository::starter();
+    let mut model = AppModel::with_repository(repo.clone(), fake_runtime());
+
+    model.preview_window_geometry(900.0, 580.0);
+    model.select_index(1).expect("select during resize");
+
+    let saved_states = repo.saved_states();
+    let selection_save = saved_states.last().expect("selection save");
+    assert_eq!(
+        (selection_save.window_width, selection_save.window_height),
+        (980.0, 640.0)
+    );
+    assert_eq!(model.window_geometry(), (900.0, 580.0));
+
+    model
+        .persist_window_geometry()
+        .expect("debounced geometry commit");
+    let saved_states = repo.saved_states();
+    let geometry_save = saved_states.last().expect("geometry save");
+    assert_eq!(
+        (geometry_save.window_width, geometry_save.window_height),
+        (900.0, 580.0)
+    );
+}
+
+#[test]
+fn theme_during_sidebar_drag_serializes_committed_sidebar_width() {
+    let repo = RecordingRepository::starter();
+    let mut model = AppModel::with_repository(repo.clone(), fake_runtime());
+
+    model.preview_sidebar_width(350.0);
+    model
+        .set_theme(ThemePreference::Signal)
+        .expect("theme during drag");
+
+    let saved_states = repo.saved_states();
+    let theme_save = saved_states.last().expect("theme save");
+    assert_eq!(theme_save.theme, ThemePreference::Signal);
+    assert_eq!(theme_save.sidebar_width, 280.0);
+    assert_eq!(model.sidebar_width(), 350.0);
+
+    model
+        .persist_sidebar_width()
+        .expect("mouse-up sidebar commit");
+    let saved_states = repo.saved_states();
+    assert_eq!(
+        saved_states.last().expect("sidebar save").sidebar_width,
+        350.0
+    );
+}
+
+#[test]
+fn repository_load_preserves_custom_order_and_non_first_selection() {
+    let starter = Watchlist::starter();
+    let mut custom = Watchlist::default();
+    for index in [2, 0, 3, 1] {
+        custom.add(starter.instruments()[index].clone());
+    }
+    custom.select(2).expect("select ETH");
+    let mut state = PersistedState::starter();
+    state.watchlist = custom;
+    let repo = RecordingRepository::with_state(state);
+
+    let model = AppModel::with_repository(repo, fake_runtime());
+
+    assert_eq!(
+        model
+            .watchlist()
+            .instruments()
+            .iter()
+            .map(|instrument| instrument.id.canonical_symbol())
+            .collect::<Vec<_>>(),
+        ["BTC/USDT", "AAPL", "ETH/USDT", "NVDA"]
+    );
+    assert_eq!(model.watchlist().selected_index(), Some(2));
+    assert_eq!(
+        model
+            .selected_identity()
+            .expect("selected identity")
+            .canonical_symbol(),
+        "ETH/USDT"
+    );
+}
+
+#[test]
+fn cached_quote_is_available_on_launch() {
+    let aapl = InstrumentId::equity("AAPL", Some("NASDAQ")).expect("id");
+    let quote = cached_quote(aapl.clone(), 201.25, 199.0);
+    let mut cache = CachedMarketState::default();
+    cache.quotes.insert(aapl.clone(), quote);
+
+    let model = AppModel::new(PersistedState::starter(), cache, fake_runtime());
+
+    assert_eq!(model.quote(&aapl).expect("cached quote").last, 201.25);
+}
+
+#[test]
+fn persistence_failure_keeps_the_action_and_enqueues_a_warning() {
+    let repo = RecordingRepository::failing();
+    let mut model = AppModel::with_repository(repo, fake_runtime());
+
+    let error = model.select_index(1).expect_err("save must fail");
+
+    assert!(matches!(
+        error,
+        AppModelError::Persistence(PersistenceError::Io(_))
+    ));
+    assert_eq!(
+        model
+            .selected()
+            .expect("selection remains")
+            .id
+            .canonical_symbol(),
+        "NVDA"
+    );
+    assert_eq!(model.warnings().len(), 1);
+    assert!(model.warnings()[0].message.contains("could not save"));
+}
+
+#[test]
+fn live_persistence_failures_are_category_safe_bounded_and_clear_on_matching_success() {
+    let mut model = AppModel::new(
+        PersistedState::starter(),
+        CachedMarketState::default(),
+        fake_runtime(),
+    );
+
+    for _ in 0..300 {
+        model.apply_runtime_event(RuntimeEvent::PersistenceCompleted {
+            category: PersistenceCategory::State,
+            result: PersistenceResult::Failed,
+        });
+        model.apply_runtime_event(RuntimeEvent::PersistenceCompleted {
+            category: PersistenceCategory::MarketCache,
+            result: PersistenceResult::Failed,
+        });
+    }
+
+    assert_eq!(model.warnings().len(), 2);
+    assert!(model.warnings()[0].message.contains("settings"));
+    assert!(model.warnings()[1].message.contains("cached market data"));
+    let rendered = format!("{:?}", model.warnings());
+    assert!(!rendered.contains("/private/"));
+    assert!(!rendered.contains("raw IO"));
+    assert!(!rendered.contains("market-data work"));
+
+    model.apply_runtime_event(RuntimeEvent::PersistenceCompleted {
+        category: PersistenceCategory::State,
+        result: PersistenceResult::Saved,
+    });
+    assert_eq!(model.warnings().len(), 1);
+    assert!(model.warnings()[0].message.contains("cached market data"));
+
+    model.apply_runtime_event(RuntimeEvent::PersistenceCompleted {
+        category: PersistenceCategory::MarketCache,
+        result: PersistenceResult::Saved,
+    });
+    assert!(model.warnings().is_empty());
+}
+
+#[test]
+fn search_waits_exactly_250_milliseconds() {
+    let runtime = RuntimeHandle::default();
+    let mut model = AppModel::new(
+        PersistedState::starter(),
+        CachedMarketState::default(),
+        runtime.clone(),
+    );
+
+    model.set_search_query("nv");
+    model.advance_search_clock(Duration::from_millis(249));
+    assert!(matches!(
+        runtime.recorded_commands().as_slice(),
+        [RuntimeCommand::CancelSearch]
+    ));
+
+    model.advance_search_clock(Duration::from_millis(1));
+    assert!(matches!(
+        runtime.recorded_commands().last(),
+        Some(RuntimeCommand::Search { query, .. }) if query == "nv"
+    ));
+}
+
+#[test]
+fn empty_search_cancels_a_pending_provider_call_and_clears_results() {
+    let runtime = RuntimeHandle::default();
+    let mut model = AppModel::new(
+        PersistedState::starter(),
+        CachedMarketState::default(),
+        runtime.clone(),
+    );
+    let generation = model.begin_search("nv");
+    model.apply_search_results(generation, vec![nvda_result()], Vec::new());
+
+    model.set_search_query("new query");
+    model.set_search_query("   ");
+    model.advance_search_clock(Duration::from_secs(1));
+
+    assert!(matches!(
+        runtime.recorded_commands().as_slice(),
+        [RuntimeCommand::CancelSearch]
+    ));
+    assert!(model.search().results().is_empty());
+    assert!(!model.search().is_loading());
+}
+
+#[test]
+fn old_search_generation_cannot_replace_new_results() {
+    let mut model = AppModel::new(
+        PersistedState::starter(),
+        CachedMarketState::default(),
+        fake_runtime(),
+    );
+
+    let old = model.begin_search("nv");
+    let current = model.begin_search("btc");
+    model.apply_search_results(old, vec![nvda_result()], Vec::new());
+    assert!(model.search().results().is_empty());
+
+    model.apply_search_results(current, vec![btc_result()], Vec::new());
+    assert_eq!(
+        model.search().results()[0].instrument.id.canonical_symbol(),
+        "BTC/USDT"
+    );
+}
+
+#[test]
+fn current_search_completion_replaces_results_and_provider_warning() {
+    let mut model = AppModel::new(
+        PersistedState::starter(),
+        CachedMarketState::default(),
+        fake_runtime(),
+    );
+    let generation = model.begin_search("nv");
+    let warning = ProviderWarning {
+        source: DataSource::Binance,
+        kind: MarketDataErrorKind::Unavailable,
+        message: "Binance search is temporarily unavailable.".into(),
+    };
+
+    model.apply_search_results(generation, vec![nvda_result()], vec![warning.clone()]);
+
+    assert_eq!(model.search().results(), &[nvda_result()]);
+    assert_eq!(model.search().provider_warnings(), &[warning]);
+    assert!(!model.search().is_loading());
+}
+
+#[test]
+fn failed_provider_retry_retains_good_results_then_merges_recovery_and_clears_warning() {
+    let runtime = RuntimeHandle::default();
+    let mut model = AppModel::new(
+        PersistedState::starter(),
+        CachedMarketState::default(),
+        runtime.clone(),
+    );
+    let generation = model.begin_search("btc");
+    model.apply_search_results(
+        generation,
+        vec![nvda_result()],
+        vec![ProviderWarning {
+            source: DataSource::Binance,
+            kind: MarketDataErrorKind::Unavailable,
+            message: "Binance search is temporarily unavailable.".into(),
+        }],
+    );
+
+    model.retry_search_provider(DataSource::Binance);
+
+    assert_eq!(model.search().results(), &[nvda_result()]);
+    assert!(matches!(
+        runtime.recorded_commands().last(),
+        Some(RuntimeCommand::RetrySearchProvider {
+            generation: retry_generation,
+            query,
+            source: DataSource::Binance,
+        }) if *retry_generation == generation && query == "btc"
+    ));
+
+    model.apply_runtime_event(RuntimeEvent::SearchProviderCompleted {
+        generation,
+        source: DataSource::Binance,
+        results: vec![btc_result()],
+        warning: None,
+    });
+    assert_eq!(model.search().results().len(), 2);
+    assert!(
+        model
+            .search()
+            .results()
+            .iter()
+            .any(|result| result == &nvda_result())
+    );
+    assert!(
+        model
+            .search()
+            .results()
+            .iter()
+            .any(|result| result == &btc_result())
+    );
+    assert!(model.search().provider_warnings().is_empty());
+}
+
+#[test]
+fn stale_provider_retry_cannot_overwrite_a_new_query_and_dual_failure_is_an_outage() {
+    let mut model = AppModel::new(
+        PersistedState::starter(),
+        CachedMarketState::default(),
+        fake_runtime(),
+    );
+    let old = model.begin_search("btc-private-query");
+    model.apply_search_results(
+        old,
+        Vec::new(),
+        vec![
+            ProviderWarning {
+                source: DataSource::Yahoo,
+                kind: MarketDataErrorKind::Unavailable,
+                message: "Yahoo search is temporarily unavailable.".into(),
+            },
+            ProviderWarning {
+                source: DataSource::Binance,
+                kind: MarketDataErrorKind::Timeout,
+                message: "Binance search is temporarily unavailable.".into(),
+            },
+        ],
+    );
+    assert_eq!(
+        model.search().terminal_error(),
+        Some("Both market-data providers are temporarily unavailable.")
+    );
+    let visible_errors = format!(
+        "{:?} {:?}",
+        model.search().provider_warnings(),
+        model.search().terminal_error()
+    );
+    assert!(!visible_errors.contains("btc-private-query"));
+
+    let current = model.begin_search("nvda");
+    assert!(!model.search().provider_retryable(DataSource::Yahoo));
+    assert!(!model.search().provider_retryable(DataSource::Binance));
+    model.apply_search_results(current, vec![nvda_result()], Vec::new());
+    model.apply_runtime_event(RuntimeEvent::SearchProviderCompleted {
+        generation: old,
+        source: DataSource::Binance,
+        results: vec![btc_result()],
+        warning: None,
+    });
+
+    assert_eq!(model.search().query(), "nvda");
+    assert_eq!(model.search().results(), &[nvda_result()]);
+}
+
+#[test]
+fn closing_search_rejects_a_late_provider_retry_completion() {
+    let mut model = AppModel::new(
+        PersistedState::starter(),
+        CachedMarketState::default(),
+        fake_runtime(),
+    );
+    let generation = model.begin_search("btc");
+    model.apply_search_results(
+        generation,
+        vec![nvda_result()],
+        vec![ProviderWarning {
+            source: DataSource::Binance,
+            kind: MarketDataErrorKind::Timeout,
+            message: "Crypto search is temporarily unavailable.".into(),
+        }],
+    );
+    model.retry_search_provider(DataSource::Binance);
+
+    model.cancel_pending_search();
+    assert!(matches!(
+        model.runtime().recorded_commands().last(),
+        Some(RuntimeCommand::CancelSearch)
+    ));
+    model.apply_runtime_event(RuntimeEvent::SearchProviderCompleted {
+        generation,
+        source: DataSource::Binance,
+        results: vec![btc_result()],
+        warning: None,
+    });
+
+    assert!(model.search().query().is_empty());
+    assert!(model.search().results().is_empty());
+    assert!(!model.search().provider_retryable(DataSource::Binance));
+}
+
+#[test]
+fn hide_advances_retry_generation_and_restored_provider_retries_merge_independently() {
+    let runtime = RuntimeHandle::default();
+    let mut model = AppModel::new(
+        PersistedState::starter(),
+        CachedMarketState::default(),
+        runtime.clone(),
+    );
+    model.set_visible_at(true, ts(1_999));
+    let stale = model.begin_search("private-hidden-query");
+    model.apply_search_results(
+        stale,
+        vec![nvda_result()],
+        vec![
+            ProviderWarning {
+                source: DataSource::Yahoo,
+                kind: MarketDataErrorKind::Unavailable,
+                message: "Yahoo search is temporarily unavailable.".into(),
+            },
+            ProviderWarning {
+                source: DataSource::Binance,
+                kind: MarketDataErrorKind::Timeout,
+                message: "Binance search is temporarily unavailable.".into(),
+            },
+        ],
+    );
+
+    model.set_visible_at(false, ts(2_000));
+    model.apply_runtime_event(RuntimeEvent::SearchProviderCompleted {
+        generation: stale,
+        source: DataSource::Binance,
+        results: vec![btc_result()],
+        warning: None,
+    });
+    assert_eq!(model.search().results(), &[nvda_result()]);
+    model.set_visible_at(true, ts(2_001));
+    model.retry_search_provider(DataSource::Yahoo);
+    model.retry_search_provider(DataSource::Binance);
+
+    let retries: Vec<_> = runtime
+        .recorded_commands()
+        .into_iter()
+        .filter_map(|command| match command {
+            RuntimeCommand::RetrySearchProvider {
+                generation, source, ..
+            } => Some((generation, source)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(retries.len(), 2);
+    assert_ne!(retries[0].0, stale);
+    assert_eq!(retries[0].0, retries[1].0);
+    assert_eq!(retries[0].1, DataSource::Yahoo);
+    assert_eq!(retries[1].1, DataSource::Binance);
+    let current = retries[0].0;
+
+    model.apply_runtime_event(RuntimeEvent::SearchProviderCompleted {
+        generation: current,
+        source: DataSource::Yahoo,
+        results: vec![nvda_result()],
+        warning: None,
+    });
+    model.apply_runtime_event(RuntimeEvent::SearchProviderCompleted {
+        generation: current,
+        source: DataSource::Binance,
+        results: vec![btc_result()],
+        warning: None,
+    });
+
+    assert!(model.search().provider_warnings().is_empty());
+    assert_eq!(model.search().results().len(), 2);
+    assert!(!format!("{:?}", model.search()).contains("private-hidden-query-provider-body"));
+}
+
+#[test]
+fn adding_search_result_appends_selects_persists_and_requests_market_data() {
+    let repository = RecordingRepository::starter();
+    let runtime = RuntimeHandle::default();
+    let mut model = AppModel::with_repository(repository.clone(), runtime.clone());
+    let generation = model.begin_search("msft");
+    let result = msft_result();
+    model.apply_search_results(generation, vec![result.clone()], Vec::new());
+
+    model.add_search_result(0).expect("add MSFT");
+
+    assert_eq!(model.watchlist().len(), 5);
+    assert_eq!(
+        model.selected().expect("selected MSFT").id,
+        result.instrument.id
+    );
+    assert_eq!(
+        repository
+            .saved_states()
+            .last()
+            .expect("persisted add")
+            .watchlist
+            .selected_index(),
+        Some(4)
+    );
+    let commands = runtime.recorded_commands();
+    assert!(matches!(
+        &commands[0],
+        RuntimeCommand::SetWatchlist(instruments) if instruments.len() == 5
+    ));
+    assert!(matches!(
+        &commands[1],
+        RuntimeCommand::History {
+            instrument,
+            period: ChartPeriod::OneDay,
+            ..
+        } if instrument.id == result.instrument.id
+    ));
+}
+
+#[test]
+fn search_selection_uses_fresh_one_day_cache_without_history_request() {
+    let result = msft_result();
+    let now = ts(1_800_000_000);
+    let mut cache = CachedMarketState::default();
+    cache.charts.insert(
+        ChartRequestKey {
+            instrument_id: result.instrument.id.clone(),
+            period: ChartPeriod::OneDay,
+        },
+        kabu_core::CachedChart {
+            candles: vec![history_candle(301.0)],
+            fetched_at: now - chrono::Duration::seconds(59),
+        },
+    );
+    let runtime = RuntimeHandle::default();
+    let mut model = AppModel::new(PersistedState::starter(), cache, runtime.clone());
+    let generation = model.begin_search("msft");
+    model.apply_search_results(generation, vec![result.clone()], Vec::new());
+
+    model.add_search_result_at(0, now).expect("add cached MSFT");
+
+    assert_eq!(
+        model.selected().expect("selected MSFT").id,
+        result.instrument.id
+    );
+    assert_eq!(model.selected_chart_period(), ChartPeriod::OneDay);
+    assert_eq!(
+        model.selected_chart_availability(),
+        ChartAvailability::Ready
+    );
+    assert!(matches!(
+        runtime.recorded_commands().as_slice(),
+        [RuntimeCommand::SetWatchlist(_)]
+    ));
+}
+
+#[test]
+fn adding_duplicate_selects_existing_without_reordering_or_refreshing_watchlists() {
+    let mut state = PersistedState::starter();
+    state.watchlist.select(2).expect("select BTC first");
+    let repository = RecordingRepository::with_state(state);
+    let runtime = RuntimeHandle::default();
+    let mut model = AppModel::with_repository(repository.clone(), runtime.clone());
+    let generation = model.begin_search("nvda");
+    model.apply_search_results(generation, vec![nvda_result()], Vec::new());
+
+    model.add_search_result(0).expect("select existing NVDA");
+
+    assert_eq!(model.watchlist().len(), 4);
+    assert_eq!(
+        model
+            .watchlist()
+            .instruments()
+            .iter()
+            .map(|instrument| instrument.id.canonical_symbol())
+            .collect::<Vec<_>>(),
+        ["AAPL", "NVDA", "BTC/USDT", "ETH/USDT"]
+    );
+    assert_eq!(model.watchlist().selected_index(), Some(1));
+    assert_eq!(
+        repository
+            .saved_states()
+            .last()
+            .expect("persisted duplicate selection")
+            .watchlist
+            .selected_index(),
+        Some(1)
+    );
+    let commands = runtime.recorded_commands();
+    assert_eq!(commands.len(), 1);
+    assert!(matches!(
+        &commands[0],
+        RuntimeCommand::History { instrument, .. }
+            if instrument.id.canonical_symbol() == "NVDA"
+    ));
+}
+
+#[test]
+fn add_persistence_failure_keeps_selection_and_still_requests_live_data() {
+    let repository = RecordingRepository::failing();
+    let runtime = RuntimeHandle::default();
+    let mut model = AppModel::with_repository(repository, runtime.clone());
+    let generation = model.begin_search("msft");
+    model.apply_search_results(generation, vec![msft_result()], Vec::new());
+
+    let error = model.add_search_result(0).expect_err("save failure");
+
+    assert!(matches!(error, AppModelError::Persistence(_)));
+    assert_eq!(
+        model
+            .selected()
+            .expect("session selection retained")
+            .id
+            .canonical_symbol(),
+        "MSFT"
+    );
+    assert!(matches!(
+        runtime.recorded_commands().as_slice(),
+        [
+            RuntimeCommand::SetWatchlist(_),
+            RuntimeCommand::History { .. }
+        ]
+    ));
+}
+
+#[test]
+fn full_runtime_queue_admits_search_on_the_reliable_control_lane() {
+    let runtime = RuntimeHandle::default();
+    for _ in 0..64 {
+        runtime
+            .send(RuntimeCommand::Snapshot {
+                instruments: Vec::new(),
+            })
+            .expect("fill recording queue");
+    }
+    let mut model = AppModel::new(
+        PersistedState::starter(),
+        CachedMarketState::default(),
+        runtime.clone(),
+    );
+
+    model.set_search_query("private-full-query");
+    model.advance_search_clock(Duration::from_millis(250));
+
+    assert!(model.search().is_loading());
+    assert_eq!(model.search().terminal_error(), None);
+    assert_eq!(
+        runtime
+            .recorded_commands()
+            .iter()
+            .filter(|command| matches!(command, RuntimeCommand::Snapshot { .. }))
+            .count(),
+        64
+    );
+    assert!(matches!(
+        runtime.recorded_commands().last(),
+        Some(RuntimeCommand::Search { query, .. }) if query == "private-full-query"
+    ));
+    assert!(
+        model
+            .warnings()
+            .iter()
+            .all(|warning| !warning.message.contains("private-full-query"))
+    );
+}
+
+#[test]
+fn closed_runtime_finishes_search_with_a_sanitized_terminal_error() {
+    let runtime = RuntimeHandle::default();
+    runtime.shutdown();
+    let mut model = AppModel::new(
+        PersistedState::starter(),
+        CachedMarketState::default(),
+        runtime,
+    );
+
+    model.set_search_query("private-closed-query");
+    model.advance_search_clock(Duration::from_millis(250));
+
+    assert!(!model.search().is_loading());
+    assert_eq!(
+        model.search().terminal_error(),
+        Some("Search is temporarily unavailable.")
+    );
+    assert!(
+        !model
+            .warnings()
+            .last()
+            .expect("runtime warning")
+            .message
+            .contains("private-closed-query")
+    );
+}
+
+#[test]
+fn current_history_completion_populates_the_matching_chart_cache() {
+    let mut model = AppModel::new(
+        PersistedState::starter(),
+        CachedMarketState::default(),
+        fake_runtime(),
+    );
+    let instrument = model.selected().expect("selected instrument").clone();
+    let generation = model.request_history(instrument.clone(), ChartPeriod::OneMonth);
+    let key = ChartRequestKey {
+        instrument_id: instrument.id,
+        period: ChartPeriod::OneMonth,
+    };
+    let candles = vec![history_candle(101.0)];
+
+    model.apply_runtime_event(RuntimeEvent::HistoryCompleted {
+        generation,
+        key: key.clone(),
+        candles: candles.clone(),
+    });
+
+    assert_eq!(
+        model.charts().get(&key).expect("cached chart").candles,
+        candles
+    );
+}
+
+#[test]
+fn chart_defaults_to_one_day() {
+    let model = AppModel::new(
+        PersistedState::starter(),
+        CachedMarketState::default(),
+        fake_runtime(),
+    );
+
+    assert_eq!(model.selected_chart_period(), ChartPeriod::OneDay);
+}
+
+#[test]
+fn fresh_period_cache_avoids_duplicate_request_at_the_ttl_boundary() {
+    for age_seconds in [299, 300] {
+        let (mut model, runtime, now) =
+            model_with_cached_chart(ChartPeriod::OneMonth, Duration::from_secs(age_seconds));
+
+        model.select_period_at(ChartPeriod::OneMonth, now);
+
+        assert!(runtime.recorded_commands().is_empty());
+        assert_eq!(model.selected_chart_period(), ChartPeriod::OneMonth);
+        assert_eq!(
+            model.selected_chart_availability(),
+            ChartAvailability::Ready
+        );
+    }
+}
+
+#[test]
+fn expired_period_cache_requests_history_and_marks_the_chart_loading() {
+    let (mut model, runtime, now) =
+        model_with_cached_chart(ChartPeriod::OneMonth, Duration::from_secs(301));
+
+    model.select_period_at(ChartPeriod::OneMonth, now);
+
+    assert!(matches!(
+        runtime.recorded_commands().last(),
+        Some(RuntimeCommand::History {
+            period: ChartPeriod::OneMonth,
+            ..
+        })
+    ));
+    assert_eq!(
+        model.selected_chart_availability(),
+        ChartAvailability::Loading
+    );
+}
+
+#[test]
+fn future_dated_cache_is_not_fresh_and_requests_history() {
+    let state = PersistedState::starter();
+    let instrument = state
+        .watchlist
+        .selected()
+        .expect("starter selection")
+        .clone();
+    let now = ts(1_800_000_000);
+    let mut cache = CachedMarketState::default();
+    cache.charts.insert(
+        ChartRequestKey {
+            instrument_id: instrument.id,
+            period: ChartPeriod::OneMonth,
+        },
+        kabu_core::CachedChart {
+            candles: vec![history_candle(101.0)],
+            fetched_at: now + chrono::Duration::seconds(1),
+        },
+    );
+    let runtime = RuntimeHandle::default();
+    let mut model = AppModel::new(state, cache, runtime.clone());
+
+    model.select_period_at(ChartPeriod::OneMonth, now);
+
+    assert!(matches!(
+        runtime.recorded_commands().as_slice(),
+        [RuntimeCommand::History {
+            period: ChartPeriod::OneMonth,
+            ..
+        }]
+    ));
+    assert_eq!(
+        model.selected_chart_availability(),
+        ChartAvailability::Loading
+    );
+}
+
+#[test]
+fn every_period_action_targets_the_selected_instrument_and_period() {
+    let runtime = RuntimeHandle::default();
+    let mut model = AppModel::new(
+        PersistedState::starter(),
+        CachedMarketState::default(),
+        runtime.clone(),
+    );
+    let selected = model.selected().expect("selected instrument").id.clone();
+
+    for period in [
+        ChartPeriod::OneDay,
+        ChartPeriod::FiveDays,
+        ChartPeriod::OneMonth,
+        ChartPeriod::SixMonths,
+        ChartPeriod::OneYear,
+    ] {
+        model.select_period_at(period, ts(1_800_000_000));
+        assert!(matches!(
+            runtime.recorded_commands().last(),
+            Some(RuntimeCommand::History {
+                instrument,
+                period: sent_period,
+                ..
+            }) if instrument.id == selected && *sent_period == period
+        ));
+        assert_eq!(model.selected_chart_period(), period);
+    }
+}
+
+#[test]
+fn selecting_an_instrument_resets_to_one_day_and_requests_missing_history() {
+    let runtime = RuntimeHandle::default();
+    let mut model = AppModel::new(
+        PersistedState::starter(),
+        CachedMarketState::default(),
+        runtime.clone(),
+    );
+    model.select_period_at(ChartPeriod::SixMonths, ts(1_800_000_000));
+    let command_count = runtime.recorded_commands().len();
+
+    model
+        .select_index_at(1, ts(1_800_000_001))
+        .expect("select NVDA");
+
+    assert_eq!(model.selected_chart_period(), ChartPeriod::OneDay);
+    assert!(matches!(
+        runtime.recorded_commands().get(command_count),
+        Some(RuntimeCommand::History {
+            instrument,
+            period: ChartPeriod::OneDay,
+            ..
+        }) if instrument.id.canonical_symbol() == "NVDA"
+    ));
+}
+
+#[test]
+fn selecting_an_instrument_uses_its_fresh_one_day_cache_without_a_request() {
+    let mut state = PersistedState::starter();
+    state.watchlist.select(0).expect("select AAPL");
+    let nvda = state.watchlist.instruments()[1].clone();
+    let now = ts(1_800_000_000);
+    let mut cache = CachedMarketState::default();
+    cache.charts.insert(
+        ChartRequestKey {
+            instrument_id: nvda.id,
+            period: ChartPeriod::OneDay,
+        },
+        kabu_core::CachedChart {
+            candles: vec![history_candle(201.0)],
+            fetched_at: now - chrono::Duration::seconds(59),
+        },
+    );
+    let runtime = RuntimeHandle::default();
+    let mut model = AppModel::new(state, cache, runtime.clone());
+
+    model.select_index_at(1, now).expect("select cached NVDA");
+
+    assert!(runtime.recorded_commands().is_empty());
+    assert_eq!(model.selected_chart_period(), ChartPeriod::OneDay);
+    assert_eq!(
+        model.selected_chart_availability(),
+        ChartAvailability::Ready
+    );
+}
+
+#[test]
+fn same_row_reselection_resets_to_fresh_one_day_cache_and_supersedes_history() {
+    let state = PersistedState::starter();
+    let instrument = state
+        .watchlist
+        .selected()
+        .expect("starter selection")
+        .clone();
+    let now = ts(1_800_000_000);
+    let mut cache = CachedMarketState::default();
+    cache.charts.insert(
+        ChartRequestKey {
+            instrument_id: instrument.id.clone(),
+            period: ChartPeriod::OneDay,
+        },
+        kabu_core::CachedChart {
+            candles: vec![history_candle(201.0)],
+            fetched_at: now - chrono::Duration::seconds(59),
+        },
+    );
+    let runtime = RuntimeHandle::default();
+    let mut model = AppModel::new(state, cache, runtime.clone());
+    let stale_generation = model
+        .select_period_at(ChartPeriod::SixMonths, now)
+        .expect("missing six-month chart requests history");
+    let stale_key = ChartRequestKey {
+        instrument_id: instrument.id,
+        period: ChartPeriod::SixMonths,
+    };
+
+    model.select_index_at(0, now).expect("reselect current row");
+
+    assert_eq!(runtime.recorded_commands().len(), 1);
+    assert_eq!(model.selected_chart_period(), ChartPeriod::OneDay);
+    assert_eq!(
+        model.selected_chart_availability(),
+        ChartAvailability::Ready
+    );
+
+    model.apply_runtime_event_at(
+        RuntimeEvent::HistoryCompleted {
+            generation: stale_generation,
+            key: stale_key.clone(),
+            candles: vec![history_candle(999.0)],
+        },
+        now,
+    );
+    model.apply_runtime_event(RuntimeEvent::HistoryFailed {
+        generation: stale_generation,
+        key: stale_key.clone(),
+        error: market_error(MarketDataErrorKind::Timeout),
+    });
+
+    assert!(!model.charts().contains_key(&stale_key));
+    assert!(model.warnings().is_empty());
+}
+
+#[test]
+fn failed_history_send_after_same_row_reselection_is_terminal_and_not_loading() {
+    let runtime = RuntimeHandle::default();
+    runtime.shutdown();
+    let mut model = AppModel::new(
+        PersistedState::starter(),
+        CachedMarketState::default(),
+        runtime,
+    );
+    let now = ts(1_800_000_000);
+    model.select_period_at(ChartPeriod::SixMonths, now);
+
+    model.select_index_at(0, now).expect("reselect current row");
+
+    assert_eq!(model.selected_chart_period(), ChartPeriod::OneDay);
+    assert_eq!(
+        model.selected_chart_availability(),
+        ChartAvailability::Unavailable
+    );
+    assert_eq!(model.warnings().len(), 1);
+}
+
+#[test]
+fn history_completion_requires_the_complete_current_key() {
+    let mut model = AppModel::new(
+        PersistedState::starter(),
+        CachedMarketState::default(),
+        fake_runtime(),
+    );
+    let instrument = model.selected().expect("selected instrument").clone();
+    let generation = model.request_history(instrument.clone(), ChartPeriod::SixMonths);
+    let wrong_key = ChartRequestKey {
+        instrument_id: instrument.id.clone(),
+        period: ChartPeriod::OneMonth,
+    };
+    let current_key = ChartRequestKey {
+        instrument_id: instrument.id,
+        period: ChartPeriod::SixMonths,
+    };
+
+    model.apply_runtime_event(RuntimeEvent::HistoryCompleted {
+        generation,
+        key: wrong_key.clone(),
+        candles: vec![history_candle(90.0)],
+    });
+    assert!(!model.charts().contains_key(&wrong_key));
+
+    model.apply_runtime_event(RuntimeEvent::HistoryCompleted {
+        generation,
+        key: current_key.clone(),
+        candles: vec![history_candle(110.0)],
+    });
+    assert_eq!(
+        model
+            .charts()
+            .get(&current_key)
+            .expect("matching chart")
+            .candles,
+        vec![history_candle(110.0)]
+    );
+}
+
+#[test]
+fn history_failure_requires_the_complete_current_key() {
+    let mut model = AppModel::new(
+        PersistedState::starter(),
+        CachedMarketState::default(),
+        fake_runtime(),
+    );
+    let instrument = model.selected().expect("selected instrument").clone();
+    let generation = model.request_history(instrument.clone(), ChartPeriod::SixMonths);
+    let wrong_key = ChartRequestKey {
+        instrument_id: instrument.id,
+        period: ChartPeriod::OneMonth,
+    };
+
+    model.apply_runtime_event(RuntimeEvent::HistoryFailed {
+        generation,
+        key: wrong_key,
+        error: market_error(MarketDataErrorKind::Timeout),
+    });
+
+    assert_eq!(
+        model.selected_chart_availability(),
+        ChartAvailability::Loading
+    );
+    assert!(model.warnings().is_empty());
+}
+
+#[test]
+fn superseded_history_completion_and_failure_are_ignored() {
+    let mut model = AppModel::new(
+        PersistedState::starter(),
+        CachedMarketState::default(),
+        fake_runtime(),
+    );
+    let instrument = model.selected().expect("selected instrument").clone();
+    let old = model.request_history(instrument.clone(), ChartPeriod::OneDay);
+    let old_key = ChartRequestKey {
+        instrument_id: instrument.id.clone(),
+        period: ChartPeriod::OneDay,
+    };
+    let _current = model.request_history(instrument, ChartPeriod::FiveDays);
+
+    model.apply_runtime_event(RuntimeEvent::HistoryCompleted {
+        generation: old,
+        key: old_key.clone(),
+        candles: vec![history_candle(99.0)],
+    });
+    model.apply_runtime_event(RuntimeEvent::HistoryFailed {
+        generation: old,
+        key: old_key.clone(),
+        error: market_error(MarketDataErrorKind::Timeout),
+    });
+
+    assert!(!model.charts().contains_key(&old_key));
+    assert!(model.warnings().is_empty());
+}
+
+#[test]
+fn removing_final_instrument_supersedes_stale_history_completion() {
+    let runtime = RuntimeHandle::default();
+    let mut model = AppModel::new(
+        state_with_one_instrument(),
+        CachedMarketState::default(),
+        runtime,
+    );
+    let instrument = model.selected().expect("selected instrument").clone();
+    let generation = model.request_history(instrument.clone(), ChartPeriod::OneDay);
+    let key = ChartRequestKey {
+        instrument_id: instrument.id,
+        period: ChartPeriod::OneDay,
+    };
+
+    model.remove_selected().expect("remove final instrument");
+    assert!(model.selected().is_none());
+    assert_eq!(
+        model.selected_chart_availability(),
+        ChartAvailability::Unavailable
+    );
+
+    model.apply_runtime_event(RuntimeEvent::HistoryCompleted {
+        generation,
+        key: key.clone(),
+        candles: vec![history_candle(777.0)],
+    });
+
+    assert!(!model.charts().contains_key(&key));
+    assert!(model.warnings().is_empty());
+}
+
+#[test]
+fn removing_final_instrument_supersedes_stale_history_failure() {
+    let mut model = AppModel::new(
+        state_with_one_instrument(),
+        CachedMarketState::default(),
+        fake_runtime(),
+    );
+    let instrument = model.selected().expect("selected instrument").clone();
+    let generation = model.request_history(instrument.clone(), ChartPeriod::OneDay);
+    let key = ChartRequestKey {
+        instrument_id: instrument.id,
+        period: ChartPeriod::OneDay,
+    };
+
+    model.remove_selected().expect("remove final instrument");
+    model.apply_runtime_event(RuntimeEvent::HistoryFailed {
+        generation,
+        key,
+        error: market_error(MarketDataErrorKind::Timeout),
+    });
+
+    assert!(model.selected().is_none());
+    assert_eq!(
+        model.selected_chart_availability(),
+        ChartAvailability::Unavailable
+    );
+    assert!(model.warnings().is_empty());
+}
+
+#[test]
+fn current_history_failure_finishes_without_mutating_cached_chart() {
+    let mut cache = CachedMarketState::default();
+    let instrument = PersistedState::starter()
+        .watchlist
+        .selected()
+        .expect("starter selection")
+        .clone();
+    let key = ChartRequestKey {
+        instrument_id: instrument.id.clone(),
+        period: ChartPeriod::OneYear,
+    };
+    let original = kabu_core::CachedChart {
+        candles: vec![history_candle(88.0)],
+        fetched_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp"),
+    };
+    cache.charts.insert(key.clone(), original.clone());
+    let mut model = AppModel::new(PersistedState::starter(), cache, fake_runtime());
+    let generation = model.request_history(instrument, ChartPeriod::OneYear);
+
+    model.apply_runtime_event(RuntimeEvent::HistoryFailed {
+        generation,
+        key: key.clone(),
+        error: market_error(MarketDataErrorKind::Unavailable),
+    });
+
+    assert_eq!(model.charts().get(&key), Some(&original));
+    assert_eq!(
+        model.warnings().last().expect("history warning").message,
+        "Chart history is temporarily unavailable."
+    );
+}
+
+#[test]
+fn adding_new_crypto_updates_complete_watchlist_and_requests_one_day_history() {
+    let runtime = RuntimeHandle::default();
+    let mut model = AppModel::new(
+        PersistedState::starter(),
+        CachedMarketState::default(),
+        runtime.clone(),
+    );
+    let generation = model.begin_search("sol");
+    let result = sol_result();
+    model.apply_search_results(generation, vec![result.clone()], Vec::new());
+
+    model.add_search_result(0).expect("add SOL");
+
+    let commands = runtime.recorded_commands();
+    assert!(matches!(
+        &commands[0],
+        RuntimeCommand::SetWatchlist(instruments)
+            if instruments.last().map(|instrument| &instrument.id) == Some(&result.instrument.id)
+    ));
+    assert!(matches!(
+        &commands[1],
+        RuntimeCommand::History { instrument, period: ChartPeriod::OneDay, .. }
+            if instrument.id == result.instrument.id
+    ));
+}
+
+#[test]
+fn app_model_rejects_older_quotes_and_preserves_the_last_good_value_on_error() {
+    let mut model = AppModel::new(
+        PersistedState::starter(),
+        CachedMarketState::default(),
+        fake_runtime(),
+    );
+    let id = InstrumentId::equity("AAPL", Some("NASDAQ")).expect("AAPL");
+    let mut newest = cached_quote(id.clone(), 222.0, 200.0);
+    newest.provider_timestamp = ts(2_000);
+    newest.received_at = ts(2_000);
+    let mut older = cached_quote(id.clone(), 111.0, 100.0);
+    older.provider_timestamp = ts(1_000);
+    older.received_at = ts(2_001);
+
+    model.apply_runtime_event_at(RuntimeEvent::Quotes(vec![newest]), ts(2_000));
+    model.set_quote_loading(id.clone(), true);
+    model.apply_runtime_event_at(RuntimeEvent::Quotes(vec![older]), ts(2_001));
+    assert!(
+        !model.quote_is_loading(&id),
+        "any completed quote outcome clears reconciliation loading"
+    );
+    model.apply_runtime_event_at(
+        RuntimeEvent::QuoteError {
+            instrument_ids: vec![id.clone()],
+            error: market_error(MarketDataErrorKind::Timeout),
+        },
+        ts(2_002),
+    );
+
+    assert_eq!(model.quote(&id).expect("last good quote").last, 222.0);
+    assert_eq!(
+        model.quote_error_message(&id),
+        Some("The market-data request timed out. Kabu will retry.")
+    );
+}
+
+#[test]
+fn app_model_classifies_every_freshness_state() {
+    let now = ts(10_000);
+    let mut model = AppModel::new(
+        PersistedState::starter(),
+        CachedMarketState::default(),
+        fake_runtime(),
+    );
+    let aapl = InstrumentId::equity("AAPL", Some("NASDAQ")).expect("AAPL");
+    let btc = InstrumentId::crypto("BTC", "USDT").expect("BTC");
+    assert_eq!(model.freshness(&aapl), Freshness::Unavailable);
+
+    let mut equity = cached_quote(aapl.clone(), 100.0, 99.0);
+    equity.provider_timestamp = now;
+    equity.received_at = now;
+    model.apply_runtime_event_at(RuntimeEvent::Quotes(vec![equity.clone()]), now);
+    assert_eq!(model.freshness(&aapl), Freshness::Fresh);
+    model.recompute_freshness_at(now + chrono::Duration::seconds(31));
+    assert_eq!(model.freshness(&aapl), Freshness::Aging);
+    model.recompute_freshness_at(now + chrono::Duration::seconds(121));
+    assert_eq!(model.freshness(&aapl), Freshness::Stale);
+
+    equity.provider_delayed = true;
+    equity.provider_timestamp = now + chrono::Duration::seconds(200);
+    model.apply_runtime_event_at(
+        RuntimeEvent::Quotes(vec![equity.clone()]),
+        now + chrono::Duration::seconds(200),
+    );
+    assert_eq!(model.freshness(&aapl), Freshness::Delayed);
+    equity.provider_delayed = false;
+    equity.market_state = MarketState::Closed;
+    equity.provider_timestamp = now + chrono::Duration::seconds(201);
+    model.apply_runtime_event_at(
+        RuntimeEvent::Quotes(vec![equity]),
+        now + chrono::Duration::seconds(201),
+    );
+    assert_eq!(model.freshness(&aapl), Freshness::Closed);
+
+    let mut crypto = cached_quote(btc.clone(), 100.0, 99.0);
+    crypto.source = DataSource::Binance;
+    crypto.market_state = MarketState::Continuous;
+    crypto.provider_timestamp = now;
+    crypto.received_at = now;
+    model.apply_runtime_event_at(RuntimeEvent::Quotes(vec![crypto]), now);
+    assert_eq!(model.freshness(&btc), Freshness::Live);
+}
+
+#[test]
+fn freshness_timer_reclassifies_only_while_visible() {
+    let runtime = RuntimeHandle::default();
+    let mut model = AppModel::new(
+        PersistedState::starter(),
+        CachedMarketState::default(),
+        runtime,
+    );
+    let btc = InstrumentId::crypto("BTC", "USDT").expect("BTC");
+    let mut quote = cached_quote(btc.clone(), 100.0, 99.0);
+    quote.source = DataSource::Binance;
+    quote.market_state = MarketState::Continuous;
+    quote.provider_timestamp = ts(1_000);
+    quote.received_at = ts(1_000);
+    model.apply_runtime_event_at(RuntimeEvent::Quotes(vec![quote]), ts(1_000));
+
+    model.set_visible_at(true, ts(1_000));
+    model.tick_at(ts(1_006));
+    assert_eq!(model.freshness(&btc), Freshness::Aging);
+    model.set_visible_at(false, ts(1_006));
+    model.tick_at(ts(1_016));
+    assert_eq!(model.freshness(&btc), Freshness::Aging);
+    model.set_visible_at(true, ts(1_016));
+    assert_eq!(model.freshness(&btc), Freshness::Stale);
+}
+
+#[test]
+fn initial_hidden_probe_dispatches_even_when_model_already_desires_hidden() {
+    let runtime = RuntimeHandle::default();
+    let mut model = AppModel::new(
+        PersistedState::starter(),
+        CachedMarketState::default(),
+        runtime.clone(),
+    );
+
+    model.set_visible_at(false, ts(1_000));
+
+    assert!(matches!(
+        runtime.recorded_commands().as_slice(),
+        [RuntimeCommand::SetVisible(false)]
+    ));
+}
+
+#[test]
+fn visible_reconciliation_marks_quotes_loading_until_each_provider_outcome_arrives() {
+    let mut model = AppModel::new(
+        PersistedState::starter(),
+        CachedMarketState::default(),
+        fake_runtime(),
+    );
+    let aapl = InstrumentId::equity("AAPL", Some("NASDAQ")).expect("AAPL");
+    let btc = InstrumentId::crypto("BTC", "USDT").expect("BTC/USDT");
+
+    model.set_visible_at(true, ts(1_000));
+
+    assert!(model.quote_is_loading(&aapl));
+    assert!(model.quote_is_loading(&btc));
+    model.apply_runtime_event_at(
+        RuntimeEvent::Quotes(vec![cached_quote(aapl.clone(), 100.0, 99.0)]),
+        ts(1_001),
+    );
+    model.apply_runtime_event(RuntimeEvent::QuoteError {
+        instrument_ids: vec![btc.clone()],
+        error: MarketDataError {
+            kind: MarketDataErrorKind::Unavailable,
+            message: "private provider body".into(),
+            retry_after: None,
+        },
+    });
+
+    assert!(!model.quote_is_loading(&aapl));
+    assert!(!model.quote_is_loading(&btc));
+}
+
+#[test]
+fn visible_ticks_request_repaint_on_consecutive_seconds_within_one_freshness_class() {
+    let mut model = AppModel::new(
+        PersistedState::starter(),
+        CachedMarketState::default(),
+        fake_runtime(),
+    );
+    let aapl = InstrumentId::equity("AAPL", Some("NASDAQ")).expect("AAPL");
+    let mut quote = cached_quote(aapl, 100.0, 99.0);
+    quote.provider_timestamp = ts(1_000);
+    quote.received_at = ts(1_000);
+    model.apply_runtime_event_at(RuntimeEvent::Quotes(vec![quote]), ts(1_000));
+    model.set_visible_at(true, ts(1_000));
+
+    assert!(model.tick_at(ts(1_001)));
+    assert!(model.tick_at(ts(1_002)));
+    model.set_visible_at(false, ts(1_002));
+    assert!(!model.tick_at(ts(1_003)));
+}
+
+#[test]
+fn hiding_terminalizes_search_and_rejects_its_late_completion() {
+    let mut model = AppModel::new(
+        PersistedState::starter(),
+        CachedMarketState::default(),
+        fake_runtime(),
+    );
+    model.set_visible_at(true, ts(1_000));
+    let generation = model.set_search_query("private-query");
+    model.advance_search_clock(Duration::from_millis(250));
+    assert!(model.search().is_loading());
+
+    model.set_visible_at(false, ts(1_001));
+    model.apply_search_results(generation, vec![nvda_result()], Vec::new());
+
+    assert!(!model.search().is_loading());
+    assert!(model.search().results().is_empty());
+    assert_eq!(
+        model.search().terminal_error(),
+        Some("Search paused while Kabu is hidden.")
+    );
+}
+
+#[test]
+fn restore_reissues_one_missing_selected_chart_but_never_duplicates_it() {
+    let runtime = RuntimeHandle::default();
+    let mut model = AppModel::new(
+        state_with_one_instrument(),
+        CachedMarketState::default(),
+        runtime.clone(),
+    );
+    model.set_visible_at(true, ts(1_000));
+    model.select_period_at(ChartPeriod::OneDay, ts(1_000));
+    assert_eq!(history_command_count(&runtime), 1);
+
+    model.set_visible_at(false, ts(1_001));
+    model.set_visible_at(true, ts(1_002));
+    model.set_visible_at(true, ts(1_003));
+
+    assert_eq!(history_command_count(&runtime), 2);
+}
+
+#[test]
+fn restore_does_not_request_a_selected_chart_that_is_still_fresh() {
+    let (mut model, runtime, now) =
+        model_with_cached_chart(ChartPeriod::OneDay, Duration::from_secs(30));
+    model.set_visible_at(true, now);
+    model.select_period_at(ChartPeriod::OneDay, now);
+
+    model.set_visible_at(false, now + chrono::Duration::seconds(1));
+    model.set_visible_at(true, now + chrono::Duration::seconds(2));
+
+    assert_eq!(history_command_count(&runtime), 0);
+}
+
+#[test]
+fn restore_rechecks_and_refreshes_a_chart_that_expired_while_hidden_once() {
+    let (mut model, runtime, hide_time) =
+        model_with_cached_chart(ChartPeriod::OneDay, Duration::from_secs(30));
+    model.set_visible_at(true, hide_time);
+    model.select_period_at(ChartPeriod::OneDay, hide_time);
+    assert_eq!(history_command_count(&runtime), 0);
+
+    model.set_visible_at(false, hide_time);
+    model.set_visible_at(true, hide_time + chrono::Duration::seconds(31));
+    model.tick_at(hide_time + chrono::Duration::seconds(32));
+    model.set_visible_at(true, hide_time + chrono::Duration::seconds(33));
+
+    assert_eq!(history_command_count(&runtime), 1);
+}
+
+#[test]
+fn restore_rechecks_but_does_not_refresh_a_chart_still_fresh_after_hidden_time() {
+    let (mut model, runtime, hide_time) =
+        model_with_cached_chart(ChartPeriod::OneDay, Duration::from_secs(30));
+    model.set_visible_at(true, hide_time);
+    model.select_period_at(ChartPeriod::OneDay, hide_time);
+
+    model.set_visible_at(false, hide_time);
+    model.set_visible_at(true, hide_time + chrono::Duration::seconds(29));
+    model.tick_at(hide_time + chrono::Duration::seconds(30));
+
+    assert_eq!(history_command_count(&runtime), 0);
+}
+
+#[test]
+fn market_cache_writes_are_batched_for_two_seconds_and_finally_flushed() {
+    let runtime = RuntimeHandle::default();
+    let mut model = AppModel::new(
+        PersistedState::starter(),
+        CachedMarketState::default(),
+        runtime.clone(),
+    );
+    let id = InstrumentId::equity("AAPL", Some("NASDAQ")).expect("AAPL");
+    let mut first = cached_quote(id.clone(), 100.0, 99.0);
+    first.provider_timestamp = ts(1_000);
+    first.received_at = ts(1_000);
+    model.apply_runtime_event_at(RuntimeEvent::Quotes(vec![first]), ts(1_000));
+    let mut second = cached_quote(id, 101.0, 99.0);
+    second.provider_timestamp = ts(1_001);
+    second.received_at = ts(1_001);
+    model.apply_runtime_event_at(RuntimeEvent::Quotes(vec![second]), ts(1_001));
+    model.tick_at(ts(1_001));
+
+    assert_eq!(persist_cache_count(&runtime), 1);
+    model.tick_at(ts(1_002));
+    assert_eq!(persist_cache_count(&runtime), 2);
+
+    model.flush_and_shutdown();
+    assert_eq!(persist_cache_count(&runtime), 3);
+    assert!(matches!(
+        runtime.recorded_commands().last(),
+        Some(RuntimeCommand::Shutdown)
+    ));
+}
+
+#[test]
+fn recovery_notices_are_once_per_category_and_never_include_file_contents() {
+    let secret = "private-watchlist-json-content";
+    let model = AppModel::from_recoveries(
+        Recovery {
+            value: PersistedState::starter(),
+            recovered_from_corruption: true,
+        },
+        Recovery {
+            value: CachedMarketState::default(),
+            recovered_from_corruption: true,
+        },
+        fake_runtime(),
+    );
+
+    assert_eq!(model.warnings().len(), 2);
+    assert!(model.warnings()[0].message.contains("state.json"));
+    assert!(model.warnings()[1].message.contains("cache.json"));
+    assert!(!format!("{:?}", model.warnings()).contains(secret));
+}
+
+#[test]
+fn repeated_quote_errors_have_stable_sanitized_text_without_toast_spam_and_retry() {
+    let runtime = RuntimeHandle::default();
+    let mut model = AppModel::new(
+        PersistedState::starter(),
+        CachedMarketState::default(),
+        runtime.clone(),
+    );
+    let id = InstrumentId::equity("AAPL", Some("NASDAQ")).expect("AAPL");
+    let raw = "private body with AAPL and query=secret";
+    for kind in [
+        MarketDataErrorKind::RateLimited,
+        MarketDataErrorKind::Disconnected,
+        MarketDataErrorKind::MalformedResponse,
+        MarketDataErrorKind::Unavailable,
+        MarketDataErrorKind::Timeout,
+    ] {
+        model.apply_runtime_event(RuntimeEvent::QuoteError {
+            instrument_ids: vec![id.clone()],
+            error: MarketDataError {
+                kind,
+                message: raw.into(),
+                retry_after: None,
+            },
+        });
+        assert!(
+            !model
+                .quote_error_message(&id)
+                .expect("status")
+                .contains(raw)
+        );
+    }
+    model.apply_runtime_event(RuntimeEvent::QuoteError {
+        instrument_ids: vec![id.clone()],
+        error: MarketDataError {
+            kind: MarketDataErrorKind::Timeout,
+            message: raw.into(),
+            retry_after: None,
+        },
+    });
+
+    assert!(model.warnings().is_empty());
+    model.retry_selected_quote();
+    assert!(matches!(
+        runtime.recorded_commands().last(),
+        Some(RuntimeCommand::Snapshot { instruments })
+            if instruments.iter().map(|instrument| &instrument.id).eq([&id])
+    ));
+}
+
+#[test]
+fn history_error_is_hidden_after_selection_change_and_retry_cannot_target_the_old_key() {
+    let runtime = RuntimeHandle::default();
+    let mut model = AppModel::new(
+        PersistedState::starter(),
+        CachedMarketState::default(),
+        runtime.clone(),
+    );
+    let instrument = model.selected().expect("selection").clone();
+    let generation = model.request_history(instrument.clone(), ChartPeriod::OneYear);
+    let key = ChartRequestKey {
+        instrument_id: instrument.id,
+        period: ChartPeriod::OneYear,
+    };
+    model.apply_runtime_event(RuntimeEvent::HistoryFailed {
+        generation,
+        key,
+        error: market_error(MarketDataErrorKind::Timeout),
+    });
+    assert!(model.history_error_message().is_some());
+
+    model.select_index(1).expect("select another instrument");
+    let before_retry = history_command_count(&runtime);
+    model.retry_selected_history();
+
+    assert!(model.history_error_message().is_none());
+    assert_eq!(history_command_count(&runtime), before_retry);
+}
+
+#[test]
+fn successful_history_clears_its_operational_warning() {
+    let mut model = AppModel::new(
+        PersistedState::starter(),
+        CachedMarketState::default(),
+        fake_runtime(),
+    );
+    let instrument = model.selected().expect("selection").clone();
+    let generation = model.request_history(instrument.clone(), ChartPeriod::OneMonth);
+    let key = ChartRequestKey {
+        instrument_id: instrument.id.clone(),
+        period: ChartPeriod::OneMonth,
+    };
+    model.apply_runtime_event(RuntimeEvent::HistoryFailed {
+        generation,
+        key: key.clone(),
+        error: market_error(MarketDataErrorKind::Timeout),
+    });
+    assert_eq!(model.warnings().len(), 1);
+    let retry = model.request_history(instrument, ChartPeriod::OneMonth);
+
+    model.apply_runtime_event_at(
+        RuntimeEvent::HistoryCompleted {
+            generation: retry,
+            key,
+            candles: vec![history_candle(101.0)],
+        },
+        ts(2_000),
+    );
+
+    assert!(model.warnings().is_empty());
+}
+
+#[test]
+fn quote_retry_queue_failure_is_terminal_and_preserves_last_good_quote() {
+    let runtime = RuntimeHandle::default();
+    for _ in 0..64 {
+        runtime
+            .send(RuntimeCommand::Snapshot {
+                instruments: Vec::new(),
+            })
+            .expect("fill recording queue");
+    }
+    let selected = PersistedState::starter()
+        .watchlist
+        .selected()
+        .expect("selected")
+        .id
+        .clone();
+    let mut cache = CachedMarketState::default();
+    cache.quotes.insert(
+        selected.clone(),
+        cached_quote(selected.clone(), 123.0, 120.0),
+    );
+    let mut model = AppModel::new(PersistedState::starter(), cache, runtime);
+
+    model.retry_selected_quote();
+
+    assert_eq!(model.quote(&selected).expect("last good").last, 123.0);
+    assert!(!model.quote_is_loading(&selected));
+    assert_eq!(model.warnings().len(), 1);
+}
+
+#[test]
+fn quote_retry_closed_runtime_is_terminal_without_loading() {
+    let runtime = RuntimeHandle::default();
+    runtime.shutdown();
+    let selected = PersistedState::starter()
+        .watchlist
+        .selected()
+        .expect("selected")
+        .id
+        .clone();
+    let mut model = AppModel::new(
+        PersistedState::starter(),
+        CachedMarketState::default(),
+        runtime,
+    );
+
+    model.retry_selected_quote();
+
+    assert!(!model.quote_is_loading(&selected));
+    assert_eq!(model.warnings().len(), 1);
+}
+
+#[test]
+fn sustained_cache_queue_saturation_keeps_warnings_bounded() {
+    let runtime = RuntimeHandle::default();
+    for _ in 0..64 {
+        runtime
+            .send(RuntimeCommand::Snapshot {
+                instruments: Vec::new(),
+            })
+            .expect("fill recording queue");
+    }
+    let mut model = AppModel::new(
+        PersistedState::starter(),
+        CachedMarketState::default(),
+        runtime.clone(),
+    );
+    let id = InstrumentId::equity("AAPL", Some("NASDAQ")).expect("AAPL");
+    let mut quote = cached_quote(id, 100.0, 99.0);
+    quote.provider_timestamp = ts(1_000);
+    quote.received_at = ts(1_000);
+    model.apply_runtime_event_at(RuntimeEvent::Quotes(vec![quote]), ts(1_000));
+
+    for seconds in 1..=500 {
+        model.tick_at(ts(1_000 + seconds * 2));
+    }
+
+    assert_eq!(model.warnings().len(), 1);
+    assert_eq!(runtime.take_recorded_commands().len(), 64);
+    model.tick_at(ts(2_002));
+    assert!(model.warnings().is_empty());
+    assert_eq!(persist_cache_count(&runtime), 1);
+}
+
+#[test]
+fn operational_dispatch_warnings_clear_only_when_their_own_class_recovers() {
+    let runtime = RuntimeHandle::default();
+    for _ in 0..64 {
+        runtime
+            .send(RuntimeCommand::Snapshot {
+                instruments: Vec::new(),
+            })
+            .expect("fill ordinary recording queue");
+    }
+    let mut model = AppModel::new(
+        PersistedState::starter(),
+        CachedMarketState::default(),
+        runtime.clone(),
+    );
+    let selected = model.selected().expect("selected").id.clone();
+    model.apply_runtime_event_at(
+        RuntimeEvent::Quotes(vec![cached_quote(selected, 100.0, 99.0)]),
+        ts(1_000),
+    );
+    for _ in 0..300 {
+        model.retry_selected_quote();
+    }
+
+    assert_eq!(model.warnings().len(), 2);
+    assert!(model.warnings().iter().any(
+        |warning| warning.message == "Background market-data work is temporarily unavailable."
+    ));
+    assert!(
+        model
+            .warnings()
+            .iter()
+            .any(|warning| warning.message == "Cached market data could not be queued for saving.")
+    );
+
+    model.set_visible_at(true, ts(1_000));
+
+    assert!(runtime.recorded_commands().iter().any(|command| matches!(
+        command,
+        RuntimeCommand::SetWatchlist(_) | RuntimeCommand::SetVisible(true)
+    )));
+    assert_eq!(model.warnings().len(), 2);
+
+    runtime.take_recorded_commands();
+    model.select_period_at(ChartPeriod::OneDay, ts(1_001));
+
+    assert_eq!(history_command_count(&runtime), 1);
+    assert_eq!(model.warnings().len(), 2);
+
+    model.retry_selected_quote();
+
+    assert_eq!(model.warnings().len(), 1);
+    assert_eq!(
+        model
+            .warnings()
+            .first()
+            .map(|warning| warning.message.as_str()),
+        Some("Cached market data could not be queued for saving.")
+    );
+
+    model.tick_at(ts(1_002));
+
+    assert!(model.warnings().is_empty());
+}
+
+#[test]
+fn successful_history_dispatch_does_not_clear_snapshot_or_cache_write_warnings() {
+    let runtime = RuntimeHandle::default();
+    for _ in 0..64 {
+        runtime
+            .send(RuntimeCommand::Snapshot {
+                instruments: Vec::new(),
+            })
+            .expect("fill ordinary recording queue");
+    }
+    let mut model = AppModel::new(
+        PersistedState::starter(),
+        CachedMarketState::default(),
+        runtime.clone(),
+    );
+    let selected = model.selected().expect("selected").id.clone();
+    model.apply_runtime_event_at(
+        RuntimeEvent::Quotes(vec![cached_quote(selected, 100.0, 99.0)]),
+        ts(1_000),
+    );
+    model.retry_selected_quote();
+    assert_eq!(model.warnings().len(), 2);
+
+    runtime.take_recorded_commands();
+    model.select_period_at(ChartPeriod::OneDay, ts(1_001));
+
+    assert_eq!(history_command_count(&runtime), 1);
+    assert_eq!(model.warnings().len(), 2);
+    assert!(model.warnings().iter().any(
+        |warning| warning.message == "Background market-data work is temporarily unavailable."
+    ));
+    assert!(
+        model
+            .warnings()
+            .iter()
+            .any(|warning| warning.message == "Cached market data could not be queued for saving.")
+    );
+}
+
+#[test]
+fn failed_startup_catalog_refresh_surfaces_sanitized_provider_kinds_without_spam() {
+    for kind in [
+        MarketDataErrorKind::Unavailable,
+        MarketDataErrorKind::RateLimited,
+        MarketDataErrorKind::MalformedResponse,
+    ] {
+        let mut model = AppModel::new(
+            PersistedState::starter(),
+            CachedMarketState::default(),
+            fake_runtime(),
+        );
+        for _ in 0..100 {
+            model.apply_runtime_event(RuntimeEvent::CatalogRefresh {
+                result: Err(kind),
+                catalog_available: false,
+            });
+        }
+        let generation = model.begin_search("private-catalog-query");
+        model.apply_runtime_event(RuntimeEvent::SearchCompleted {
+            generation,
+            results: vec![nvda_result()],
+            warnings: Vec::new(),
+        });
+
+        assert_eq!(model.search().results(), &[nvda_result()]);
+        assert_eq!(model.search().provider_warnings().len(), 1);
+        let warning = &model.search().provider_warnings()[0];
+        assert_eq!(warning.source, DataSource::Binance);
+        assert_eq!(warning.kind, kind);
+        assert!(!warning.message.contains("private-catalog-query"));
+        assert_eq!(model.warnings().len(), 1);
+
+        model.apply_runtime_event(RuntimeEvent::CatalogRefresh {
+            result: Ok(()),
+            catalog_available: true,
+        });
+        assert!(model.warnings().is_empty());
+        assert!(model.search().provider_warnings().is_empty());
+    }
+}
+
+fn persist_cache_count(runtime: &RuntimeHandle) -> usize {
+    runtime
+        .recorded_commands()
+        .iter()
+        .filter(|command| matches!(command, RuntimeCommand::PersistMarketCache { .. }))
+        .count()
+}
+
+fn history_command_count(runtime: &RuntimeHandle) -> usize {
+    runtime
+        .recorded_commands()
+        .iter()
+        .filter(|command| matches!(command, RuntimeCommand::History { .. }))
+        .count()
+}
+
+fn fake_runtime() -> RuntimeHandle {
+    RuntimeHandle::default()
+}
+
+fn model_with_recording_runtime() -> AppModel {
+    AppModel::new(
+        PersistedState::starter(),
+        CachedMarketState::default(),
+        RuntimeHandle::default(),
+    )
+}
+
+fn connected_model(brokerage: Brokerage) -> AppModel {
+    let mut model = model_with_recording_runtime();
+    model.apply_runtime_event(RuntimeEvent::BrokerConnectionChanged {
+        brokerage,
+        state: BrokerageConnectionState::Connected {
+            last_synced_at: Some(ts(1_800_000_000)),
+        },
+    });
+    model.apply_runtime_event(RuntimeEvent::PortfolioUpdated(snapshot(brokerage, 1)));
+    model
+}
+
+fn snapshot(brokerage: Brokerage, position_count: usize) -> PortfolioSnapshot {
+    let account_id = BrokerageAccountId::new("private-account-id");
+    let positions = (0..position_count)
+        .map(|index| BrokeragePosition {
+            brokerage,
+            account_id: account_id.clone(),
+            native_symbol: format!("PRIVATE-{index}"),
+            display_name: format!("Private holding {index}"),
+            asset_kind: BrokerageAssetKind::Equity,
+            instrument: None,
+            quantity: Default::default(),
+            average_cost: None,
+            market_value: None,
+            unrealized_pnl: None,
+            currency: "USD".into(),
+        })
+        .collect();
+    PortfolioSnapshot {
+        brokerage,
+        accounts: Vec::new(),
+        positions,
+        received_at: ts(1_800_000_001),
+    }
+}
+
+fn cached_quote(instrument_id: InstrumentId, last: f64, previous_close: f64) -> Quote {
+    let timestamp = chrono::DateTime::from_timestamp(1_777_777_777, 0).expect("timestamp");
+    Quote {
+        instrument_id,
+        last,
+        previous_close: Some(previous_close),
+        open: None,
+        high: None,
+        low: None,
+        volume: None,
+        currency: "USD".into(),
+        source: DataSource::Yahoo,
+        market_state: MarketState::Regular,
+        provider_timestamp: timestamp,
+        received_at: timestamp,
+        provider_delayed: false,
+    }
+}
+
+fn nvda_result() -> SearchResult {
+    SearchResult {
+        instrument: Instrument::equity("NVDA", Some("NASDAQ"), "NVIDIA Corporation", "USD")
+            .expect("NVDA"),
+        source: DataSource::Yahoo,
+        venue_label: "NASDAQ".into(),
+    }
+}
+
+fn btc_result() -> SearchResult {
+    SearchResult {
+        instrument: Instrument::crypto("BTC", "USDT", "Bitcoin").expect("BTC"),
+        source: DataSource::Binance,
+        venue_label: "Binance".into(),
+    }
+}
+
+fn msft_result() -> SearchResult {
+    SearchResult {
+        instrument: Instrument::equity("MSFT", Some("NASDAQ"), "Microsoft", "USD").expect("MSFT"),
+        source: DataSource::Yahoo,
+        venue_label: "NASDAQ".into(),
+    }
+}
+
+fn sol_result() -> SearchResult {
+    SearchResult {
+        instrument: Instrument::crypto("SOL", "USDT", "Solana").expect("SOL"),
+        source: DataSource::Binance,
+        venue_label: "Binance".into(),
+    }
+}
+
+fn history_candle(close: f64) -> Candle {
+    Candle {
+        starts_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp"),
+        open: close - 1.0,
+        high: close + 1.0,
+        low: close - 2.0,
+        close,
+        volume: 1_000.0,
+    }
+}
+
+fn model_with_cached_chart(
+    period: ChartPeriod,
+    age: Duration,
+) -> (AppModel, RuntimeHandle, chrono::DateTime<chrono::Utc>) {
+    let state = PersistedState::starter();
+    let instrument = state
+        .watchlist
+        .selected()
+        .expect("starter selection")
+        .clone();
+    let now = ts(1_800_000_000);
+    let mut cache = CachedMarketState::default();
+    cache.charts.insert(
+        ChartRequestKey {
+            instrument_id: instrument.id,
+            period,
+        },
+        kabu_core::CachedChart {
+            candles: vec![history_candle(101.0)],
+            fetched_at: now - chrono::Duration::from_std(age).expect("test age"),
+        },
+    );
+    let runtime = RuntimeHandle::default();
+    let model = AppModel::new(state, cache, runtime.clone());
+    (model, runtime, now)
+}
+
+fn state_with_one_instrument() -> PersistedState {
+    let instrument = PersistedState::starter().watchlist.instruments()[0].clone();
+    let mut watchlist = Watchlist::default();
+    watchlist.add(instrument);
+    watchlist.select(0).expect("select only instrument");
+    let mut state = PersistedState::starter();
+    state.watchlist = watchlist;
+    state
+}
+
+fn ts(seconds: i64) -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::from_timestamp(seconds, 0).expect("timestamp")
+}
+
+fn market_error(kind: MarketDataErrorKind) -> MarketDataError {
+    MarketDataError {
+        kind,
+        message: "controlled history error".into(),
+        retry_after: None,
+    }
+}
+
+#[derive(Clone)]
+struct RecordingRepository {
+    inner: Arc<Mutex<RecordingState>>,
+}
+
+struct RecordingState {
+    state: PersistedState,
+    cache: CachedMarketState,
+    saved_states: Vec<PersistedState>,
+    fail_saves: bool,
+}
+
+impl RecordingRepository {
+    fn starter() -> Self {
+        Self::new(false)
+    }
+
+    fn failing() -> Self {
+        Self::new(true)
+    }
+
+    fn with_state(state: PersistedState) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(RecordingState {
+                state,
+                cache: CachedMarketState::default(),
+                saved_states: Vec::new(),
+                fail_saves: false,
+            })),
+        }
+    }
+
+    fn new(fail_saves: bool) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(RecordingState {
+                state: PersistedState::starter(),
+                cache: CachedMarketState::default(),
+                saved_states: Vec::new(),
+                fail_saves,
+            })),
+        }
+    }
+
+    fn saved_states(&self) -> Vec<PersistedState> {
+        self.inner
+            .lock()
+            .expect("repository lock")
+            .saved_states
+            .clone()
+    }
+}
+
+impl StateRepository for RecordingRepository {
+    fn load_state(&self) -> Result<PersistedState, PersistenceError> {
+        Ok(self.inner.lock().expect("repository lock").state.clone())
+    }
+
+    fn save_state(&self, state: &PersistedState) -> Result<(), PersistenceError> {
+        let mut inner = self.inner.lock().expect("repository lock");
+        if inner.fail_saves {
+            return Err(io::Error::other("recording failure").into());
+        }
+        inner.saved_states.push(state.clone());
+        inner.state = state.clone();
+        Ok(())
+    }
+
+    fn load_cache(&self) -> Result<CachedMarketState, PersistenceError> {
+        Ok(self.inner.lock().expect("repository lock").cache.clone())
+    }
+
+    fn save_cache(&self, cache: &CachedMarketState) -> Result<(), PersistenceError> {
+        self.inner.lock().expect("repository lock").cache = cache.clone();
+        Ok(())
+    }
+}

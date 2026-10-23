@@ -1,0 +1,1127 @@
+use gpui::{AppContext as _, Entity, Modifiers, WindowAppearance, px, size};
+use gpui_component::{Root, WindowExt as _};
+use kabu_app::runtime::{ProviderSet, RuntimeCommand, RuntimeEvent, RuntimeHandle, StreamStatus};
+use kabu_app::{
+    app_model::AppModel,
+    commands::{
+        RemoveSelectedInstrument, SelectMidnightTheme, SelectNextWatchlist,
+        SelectPreviousWatchlist, SelectSignalTheme, SelectSystemTheme,
+    },
+    theme::{KabuTheme, ThemeSelection},
+    views::{
+        AppShell, DEFAULT_WINDOW_HEIGHT, DEFAULT_WINDOW_WIDTH, MIN_WINDOW_HEIGHT, MIN_WINDOW_WIDTH,
+        SIDEBAR_WIDTH, SelectedQuoteAvailability, search_result_provenance,
+    },
+};
+use kabu_core::{
+    CachedChart, CachedMarketState, Candle, ChartHistory, ChartPeriod, ChartRequestKey, DataSource,
+    Instrument, InstrumentId, InstrumentSearch, MarketDataError, MarketDataErrorKind, MarketState,
+    PersistedState, PersistenceError, Quote, QuoteSnapshots, QuoteStream, QuoteSubscription,
+    SearchResult, StateRepository, ThemePreference,
+};
+use kabu_data::{JsonRepository, Recovery};
+use std::{
+    cell::RefCell,
+    rc::Rc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
+
+#[test]
+fn window_shell_uses_approved_geometry() {
+    assert_eq!(
+        (DEFAULT_WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT),
+        (980.0, 640.0)
+    );
+    assert_eq!((MIN_WINDOW_WIDTH, MIN_WINDOW_HEIGHT), (760.0, 500.0));
+    assert_eq!(SIDEBAR_WIDTH, 280.0);
+}
+
+#[gpui::test]
+fn recovered_categories_each_produce_one_startup_notification(cx: &mut gpui::TestAppContext) {
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        kabu_app::commands::init(cx);
+    });
+    let runtime = RuntimeHandle::default();
+    let model = cx.update(|cx| {
+        cx.new(|_| {
+            AppModel::from_recoveries(
+                Recovery {
+                    value: PersistedState::starter(),
+                    recovered_from_corruption: true,
+                },
+                Recovery {
+                    value: CachedMarketState::default(),
+                    recovered_from_corruption: true,
+                },
+                runtime,
+            )
+        })
+    });
+    let (_, cx) = cx.add_window_view(move |window, cx| {
+        let shell = cx.new(|cx| AppShell::with_model(model.clone(), window, cx));
+        Root::new(shell, window, cx)
+    });
+
+    cx.run_until_parked();
+
+    let notification_count = cx.update(|window, cx| window.notifications(cx).len());
+    assert_eq!(notification_count, 2);
+}
+
+#[gpui::test]
+fn watchlist_actions_require_focus_and_remove_the_selected_row(cx: &mut gpui::TestAppContext) {
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        kabu_app::commands::init(cx);
+    });
+    let (shell, cx) = cx.add_window_view(AppShell::new);
+    let model = shell.update(cx, |shell, _| shell.model());
+
+    cx.refresh().expect("render shell");
+    cx.dispatch_action(SelectNextWatchlist);
+    model.read_with(cx, |model, _| {
+        assert_eq!(
+            model.selected().expect("selection").id.canonical_symbol(),
+            "AAPL"
+        );
+    });
+
+    cx.update(|window, cx| {
+        shell.update(cx, |shell, _| shell.focus_watchlist(window));
+    });
+    cx.refresh().expect("render focused shell");
+    cx.dispatch_action(SelectNextWatchlist);
+    model.read_with(cx, |model, _| {
+        assert_eq!(
+            model.selected().expect("selection").id.canonical_symbol(),
+            "NVDA"
+        );
+    });
+
+    cx.dispatch_action(RemoveSelectedInstrument);
+    model.read_with(cx, |model, _| {
+        assert_eq!(model.watchlist().len(), 3);
+        assert_eq!(
+            model.selected().expect("selection").id.canonical_symbol(),
+            "BTC/USDT"
+        );
+    });
+
+    cx.dispatch_action(SelectPreviousWatchlist);
+    model.read_with(cx, |model, _| {
+        assert_eq!(
+            model.selected().expect("selection").id.canonical_symbol(),
+            "AAPL"
+        );
+    });
+}
+
+#[gpui::test]
+fn clicking_a_watchlist_row_selects_it(cx: &mut gpui::TestAppContext) {
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        kabu_app::commands::init(cx);
+    });
+    let model = cached_watchlist_model(cx);
+    let (shell, cx) =
+        cx.add_window_view(move |window, cx| AppShell::with_model(model.clone(), window, cx));
+    let model = shell.update(cx, |shell, _| shell.model());
+    cx.refresh().expect("render shell");
+
+    shell.update(cx, |shell, cx| {
+        let header = shell.selected_quote_header(cx);
+        assert_eq!(header.symbol, "AAPL");
+        assert_eq!(header.price, "100.00 USD");
+    });
+
+    let row = cx.debug_bounds("watchlist-row-1").expect("NVDA row bounds");
+    cx.simulate_click(row.center(), Modifiers::none());
+
+    model.read_with(cx, |model, _| {
+        assert_eq!(
+            model.selected().expect("selection").id.canonical_symbol(),
+            "NVDA"
+        );
+    });
+    shell.update(cx, |shell, cx| {
+        let header = shell.selected_quote_header(cx);
+        assert_eq!(header.symbol, "NVDA");
+        assert_eq!(header.price, "200.00 USD");
+        assert_eq!(header.change, "−10.00 (−4.76%)");
+        assert_eq!(header.source, "Yahoo");
+        assert_eq!(header.provider_timestamp, "2023-11-14T22:13:20+00:00");
+        assert_eq!(header.availability, SelectedQuoteAvailability::Available);
+    });
+}
+
+#[gpui::test]
+fn keyboard_selection_updates_the_cached_quote_header_while_chart_loads(
+    cx: &mut gpui::TestAppContext,
+) {
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        kabu_app::commands::init(cx);
+    });
+    let model = cached_watchlist_model(cx);
+    let (shell, cx) =
+        cx.add_window_view(move |window, cx| AppShell::with_model(model.clone(), window, cx));
+    cx.update(|window, cx| {
+        shell.update(cx, |shell, _| shell.focus_watchlist(window));
+    });
+    cx.refresh().expect("render focused cached shell");
+
+    cx.dispatch_action(SelectNextWatchlist);
+
+    shell.update(cx, |shell, cx| {
+        let header = shell.selected_quote_header(cx);
+        assert_eq!(header.symbol, "NVDA");
+        assert_eq!(header.price, "200.00 USD");
+        assert_eq!(header.change, "−10.00 (−4.76%)");
+        assert_eq!(header.source, "Yahoo");
+        assert_eq!(header.provider_timestamp, "2023-11-14T22:13:20+00:00");
+    });
+}
+
+#[gpui::test]
+fn selected_quote_header_distinguishes_missing_and_loading_without_zero_values(
+    cx: &mut gpui::TestAppContext,
+) {
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        kabu_app::commands::init(cx);
+    });
+    let (shell, cx) = cx.add_window_view(AppShell::new);
+    let model = shell.update(cx, |shell, _| shell.model());
+
+    shell.update(cx, |shell, cx| {
+        let header = shell.selected_quote_header(cx);
+        assert_eq!(header.price, "—");
+        assert_eq!(header.change, "—");
+        assert_eq!(header.status, "Loading quote");
+        assert_eq!(header.availability, SelectedQuoteAvailability::Loading);
+    });
+
+    model.update(cx, |model, cx| {
+        let selected = model.selected_identity().expect("selection").clone();
+        model.set_quote_loading(selected, false);
+        cx.notify();
+    });
+
+    shell.update(cx, |shell, cx| {
+        let header = shell.selected_quote_header(cx);
+        assert_eq!(header.price, "—");
+        assert_eq!(header.change, "—");
+        assert_eq!(header.status, "No cached quote");
+        assert_eq!(header.availability, SelectedQuoteAvailability::Unavailable);
+    });
+}
+
+#[gpui::test]
+fn quote_detail_renders_metrics_chart_and_dispatches_period_clicks(cx: &mut gpui::TestAppContext) {
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        kabu_app::commands::init(cx);
+    });
+    let runtime = RuntimeHandle::default();
+    let state = PersistedState::starter();
+    let instrument = state
+        .watchlist
+        .selected()
+        .expect("starter selection")
+        .clone();
+    let mut quote = cached_quote(instrument.id.clone(), 105.0, 100.0);
+    quote.open = Some(101.0);
+    quote.high = Some(107.0);
+    quote.low = Some(99.0);
+    quote.volume = Some(42_000_000.0);
+    let mut cache = CachedMarketState::default();
+    cache.quotes.insert(instrument.id.clone(), quote);
+    cache.charts.insert(
+        ChartRequestKey {
+            instrument_id: instrument.id,
+            period: ChartPeriod::OneDay,
+        },
+        CachedChart {
+            candles: vec![chart_candle(100.0), chart_candle(105.0)],
+            fetched_at: chrono::Utc::now(),
+        },
+    );
+    let model = cx.update(|cx| cx.new(|_| AppModel::new(state, cache, runtime.clone())));
+    let (shell, cx) =
+        cx.add_window_view(move |window, cx| AppShell::with_model(model.clone(), window, cx));
+    cx.refresh().expect("render quote detail");
+
+    for selector in [
+        "quote-detail",
+        "quote-detail-symbol",
+        "price-chart",
+        "quote-metric-open",
+        "quote-metric-high",
+        "quote-metric-low",
+        "quote-metric-previous-close",
+        "quote-metric-volume",
+        "quote-freshness",
+    ] {
+        assert!(cx.debug_bounds(selector).is_some(), "missing {selector}");
+    }
+
+    let period = cx.debug_bounds("quote-period-5d").expect("5D period tab");
+    cx.simulate_click(period.center(), Modifiers::none());
+
+    let model = shell.update(cx, |shell, _| shell.model());
+    model.read_with(cx, |model, _| {
+        assert_eq!(model.selected_chart_period(), ChartPeriod::FiveDays);
+    });
+    assert!(matches!(
+        runtime.recorded_commands().last(),
+        Some(RuntimeCommand::History {
+            period: ChartPeriod::FiveDays,
+            ..
+        })
+    ));
+}
+
+#[gpui::test]
+fn minimum_window_keeps_the_chart_above_every_metric_card(cx: &mut gpui::TestAppContext) {
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        kabu_app::commands::init(cx);
+    });
+    let state = PersistedState::starter();
+    let instrument = state
+        .watchlist
+        .selected()
+        .expect("starter selection")
+        .clone();
+    let mut cache = CachedMarketState::default();
+    cache.quotes.insert(
+        instrument.id.clone(),
+        cached_quote(instrument.id.clone(), 105.0, 100.0),
+    );
+    cache.charts.insert(
+        ChartRequestKey {
+            instrument_id: instrument.id,
+            period: ChartPeriod::OneDay,
+        },
+        CachedChart {
+            candles: vec![chart_candle(100.0), chart_candle(105.0)],
+            fetched_at: chrono::Utc::now(),
+        },
+    );
+    let model = cx.update(|cx| cx.new(|_| AppModel::new(state, cache, RuntimeHandle::default())));
+    let (_, cx) =
+        cx.add_window_view(move |window, cx| AppShell::with_model(model.clone(), window, cx));
+    cx.simulate_resize(size(px(MIN_WINDOW_WIDTH), px(MIN_WINDOW_HEIGHT)));
+    cx.refresh().expect("render minimum-size detail");
+
+    let chart = cx.debug_bounds("price-chart").expect("price chart bounds");
+    assert!(
+        f32::from(chart.size.height) >= 190.0,
+        "minimum-size chart collapsed to {} points",
+        f32::from(chart.size.height)
+    );
+    for selector in [
+        "quote-metric-open",
+        "quote-metric-high",
+        "quote-metric-low",
+        "quote-metric-previous-close",
+        "quote-metric-volume",
+    ] {
+        let metric = cx.debug_bounds(selector).expect("metric card bounds");
+        assert!(
+            chart.bottom() <= metric.top(),
+            "{selector} overlaps the chart: chart={chart:?}, metric={metric:?}"
+        );
+    }
+}
+
+#[gpui::test]
+fn quote_retry_keeps_last_good_price_visible_with_refreshing_indicator(
+    cx: &mut gpui::TestAppContext,
+) {
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        kabu_app::commands::init(cx);
+    });
+    let state = PersistedState::starter();
+    let instrument = state
+        .watchlist
+        .selected()
+        .expect("starter selection")
+        .clone();
+    let mut cache = CachedMarketState::default();
+    cache.quotes.insert(
+        instrument.id.clone(),
+        cached_quote(instrument.id.clone(), 105.0, 100.0),
+    );
+    let model = cx.update(|cx| cx.new(|_| AppModel::new(state, cache, RuntimeHandle::default())));
+    model.update(cx, |model, cx| {
+        model.set_quote_loading(instrument.id, true);
+        cx.notify();
+    });
+    let (_, cx) =
+        cx.add_window_view(move |window, cx| AppShell::with_model(model.clone(), window, cx));
+    cx.refresh().expect("render refreshing quote");
+
+    assert!(cx.debug_bounds("quote-detail-price").is_some());
+    assert!(cx.debug_bounds("quote-refreshing-indicator").is_some());
+    assert!(cx.debug_bounds("quote-loading-skeleton").is_none());
+}
+
+#[gpui::test]
+fn quote_detail_keeps_chart_loading_and_unavailable_states_outside_the_painter(
+    cx: &mut gpui::TestAppContext,
+) {
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        kabu_app::commands::init(cx);
+    });
+    let (shell, cx) = cx.add_window_view(AppShell::new);
+    cx.refresh().expect("render unavailable chart");
+    assert!(cx.debug_bounds("chart-unavailable").is_some());
+    assert!(cx.debug_bounds("price-chart").is_none());
+
+    let period = cx.debug_bounds("quote-period-1m").expect("1M period tab");
+    cx.simulate_click(period.center(), Modifiers::none());
+    cx.refresh().expect("render loading chart");
+    assert!(cx.debug_bounds("chart-loading").is_some());
+    assert!(cx.debug_bounds("price-chart").is_none());
+
+    let model = shell.update(cx, |shell, _| shell.model());
+    model.read_with(cx, |model, _| {
+        assert_eq!(model.selected_chart_period(), ChartPeriod::OneMonth);
+    });
+}
+
+#[gpui::test]
+fn quote_error_renders_an_inline_retry_that_dispatches_a_snapshot(cx: &mut gpui::TestAppContext) {
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        kabu_app::commands::init(cx);
+    });
+    let runtime = RuntimeHandle::default();
+    let mut app_model = AppModel::new(
+        PersistedState::starter(),
+        CachedMarketState::default(),
+        runtime.clone(),
+    );
+    let aapl = InstrumentId::equity("AAPL", Some("NASDAQ")).expect("AAPL");
+    app_model.apply_runtime_event(kabu_app::runtime::RuntimeEvent::QuoteError {
+        instrument_ids: vec![aapl],
+        error: MarketDataError {
+            kind: MarketDataErrorKind::Timeout,
+            message: "private provider response".into(),
+            retry_after: None,
+        },
+    });
+    let model = cx.update(|cx| cx.new(|_| app_model));
+    let (_shell, cx) =
+        cx.add_window_view(move |window, cx| AppShell::with_model(model.clone(), window, cx));
+    cx.refresh().expect("render error");
+
+    let retry = cx
+        .debug_bounds("quote-retry-button")
+        .expect("retry button bounds");
+    cx.simulate_click(retry.center(), Modifiers::none());
+
+    assert!(matches!(
+        runtime.recorded_commands().last(),
+        Some(RuntimeCommand::Snapshot { instruments }) if instruments.len() == 1
+    ));
+}
+
+#[gpui::test]
+fn gpui_event_pressure_applies_final_quote_status_and_typed_error_without_deadlock(
+    cx: &mut gpui::TestAppContext,
+) {
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        kabu_app::commands::init(cx);
+    });
+    let runtime = RuntimeHandle::default();
+    let model = cx.update(|cx| {
+        cx.new(|_| {
+            AppModel::new(
+                PersistedState::starter(),
+                CachedMarketState::default(),
+                runtime.clone(),
+            )
+        })
+    });
+    let aapl = InstrumentId::equity("AAPL", Some("NASDAQ")).expect("AAPL");
+    let btc = InstrumentId::crypto("BTC", "USDT").expect("BTC/USDT");
+    let window_model = model.clone();
+    let (_, window_cx) = cx
+        .add_window_view(move |window, cx| AppShell::with_model(window_model.clone(), window, cx));
+
+    runtime.publish_recorded_event(RuntimeEvent::StreamStatus(StreamStatus::Connecting));
+    runtime.publish_recorded_event(RuntimeEvent::StreamStatus(StreamStatus::Live));
+    for index in 0..300 {
+        let unrelated = InstrumentId::equity(&format!("X{index}"), Some("NASDAQ"))
+            .expect("distinct pressure identity");
+        let mut quote = cached_quote(unrelated.clone(), 100.0 + index as f64, 99.0);
+        quote.provider_timestamp += chrono::Duration::milliseconds(index as i64);
+        runtime.publish_recorded_event(RuntimeEvent::Quotes(vec![quote]));
+        runtime.publish_recorded_event(RuntimeEvent::QuoteError {
+            instrument_ids: vec![unrelated],
+            error: MarketDataError {
+                kind: MarketDataErrorKind::Timeout,
+                message: "private distinct provider response".into(),
+                retry_after: None,
+            },
+        });
+    }
+    runtime.publish_recorded_event(RuntimeEvent::Quotes(vec![cached_quote(
+        aapl.clone(),
+        399.0,
+        99.0,
+    )]));
+    runtime.publish_recorded_event(RuntimeEvent::QuoteError {
+        instrument_ids: vec![btc.clone()],
+        error: MarketDataError {
+            kind: MarketDataErrorKind::Disconnected,
+            message: "private websocket frame".into(),
+            retry_after: None,
+        },
+    });
+    runtime.publish_recorded_event(RuntimeEvent::StreamStatus(StreamStatus::Reconnecting));
+    runtime.publish_recorded_event(RuntimeEvent::StreamStatus(StreamStatus::Paused));
+    window_cx.run_until_parked();
+
+    model.read_with(window_cx, |model, _| {
+        assert_eq!(model.quote(&aapl).expect("final AAPL quote").last, 399.0);
+        assert_eq!(model.stream_status(), StreamStatus::Paused);
+        assert_eq!(
+            model.quote_error_message(&btc),
+            Some("The live market-data connection was interrupted. Reconnecting…")
+        );
+    });
+    assert!(window_cx.simulate_close());
+    window_cx.run_until_parked();
+    assert!(runtime.is_shutdown());
+}
+
+#[gpui::test]
+fn final_persistence_failure_vetoes_close_and_second_close_retries_successfully(
+    cx: &mut gpui::TestAppContext,
+) {
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        kabu_app::commands::init(cx);
+    });
+    let repository = Arc::new(CloseRetryRepository::default());
+    let provider = Arc::new(IdleProvider);
+    let runtime = RuntimeHandle::start(
+        ProviderSet {
+            equities: provider.clone(),
+            crypto: provider,
+        },
+        repository.clone(),
+    )
+    .expect("live runtime");
+    let model = cx.update(|cx| {
+        cx.new(|_| {
+            AppModel::new(
+                PersistedState::starter(),
+                CachedMarketState::default(),
+                runtime.clone(),
+            )
+        })
+    });
+    let window_model = model.clone();
+    let (_, window_cx) = cx
+        .add_window_view(move |window, cx| AppShell::with_model(window_model.clone(), window, cx));
+
+    assert!(!window_cx.simulate_close());
+    let first = runtime
+        .wait_for_shutdown(Duration::from_secs(2))
+        .expect("first shutdown outcome");
+    assert!(!first.is_success());
+    window_cx.run_until_parked();
+    assert_eq!(
+        window_cx.windows().len(),
+        1,
+        "failed save keeps window visible"
+    );
+    model.read_with(window_cx, |model, _| {
+        let warning = model
+            .warnings()
+            .iter()
+            .find(|warning| warning.message.contains("settings"))
+            .expect("state persistence warning");
+        assert!(!warning.message.contains("/private/close-state.json"));
+    });
+
+    assert!(!window_cx.simulate_close());
+    window_cx.run_until_parked();
+    assert_eq!(repository.state_saves.load(Ordering::SeqCst), 3);
+    assert!(
+        runtime
+            .shutdown_outcome()
+            .expect("retry outcome")
+            .is_success()
+    );
+    assert!(window_cx.windows().is_empty());
+}
+
+#[gpui::test]
+fn window_geometry_persists_after_exactly_250_milliseconds(cx: &mut gpui::TestAppContext) {
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        kabu_app::commands::init(cx);
+    });
+    let directory = tempfile::tempdir().expect("temporary repository");
+    let repository = Arc::new(JsonRepository::at(directory.path()));
+    let model = cx.update(|cx| {
+        cx.new(|_| AppModel::with_shared_repository(repository.clone(), RuntimeHandle::default()))
+    });
+    let executor = cx.executor();
+    let (_, window_cx) =
+        cx.add_window_view(move |window, cx| AppShell::with_model(model.clone(), window, cx));
+
+    window_cx.simulate_resize(size(px(900.0), px(580.0)));
+    window_cx.run_until_parked();
+    executor.advance_clock(Duration::from_millis(249));
+    assert_eq!(
+        repository
+            .load_state()
+            .expect("state before debounce")
+            .window_width,
+        980.0
+    );
+
+    executor.advance_clock(Duration::from_millis(1));
+    window_cx.run_until_parked();
+    let saved = repository.load_state().expect("debounced state");
+    assert_eq!((saved.window_width, saved.window_height), (900.0, 580.0));
+
+    window_cx.simulate_resize(size(px(840.0), px(540.0)));
+    window_cx.run_until_parked();
+    assert!(window_cx.simulate_close());
+    let flushed = repository.load_state().expect("close-flushed state");
+    assert_eq!(
+        (flushed.window_width, flushed.window_height),
+        (840.0, 540.0)
+    );
+}
+
+#[test]
+fn manual_theme_preferences_ignore_window_appearance() {
+    let cases = [
+        (ThemePreference::Graphite, KabuTheme::Graphite),
+        (ThemePreference::Midnight, KabuTheme::Midnight),
+        (ThemePreference::Signal, KabuTheme::Signal),
+    ];
+
+    for (preference, expected) in cases {
+        assert_eq!(
+            KabuTheme::resolve(preference, WindowAppearance::Light),
+            expected
+        );
+        assert_eq!(
+            KabuTheme::resolve(preference, WindowAppearance::Dark),
+            expected
+        );
+    }
+}
+
+#[test]
+fn system_selection_stays_selected_while_resolving_light() {
+    let selection = ThemeSelection::new(ThemePreference::System);
+
+    assert_eq!(selection.preference(), ThemePreference::System);
+    assert_eq!(
+        selection.resolve(WindowAppearance::Light),
+        KabuTheme::Graphite
+    );
+}
+
+#[test]
+fn system_selection_re_resolves_when_appearance_changes() {
+    let selection = ThemeSelection::new(ThemePreference::System);
+
+    assert_eq!(
+        selection.resolve(WindowAppearance::Light),
+        KabuTheme::Graphite
+    );
+    assert_eq!(
+        selection.resolve(WindowAppearance::Dark),
+        KabuTheme::Midnight
+    );
+    assert_eq!(selection.preference(), ThemePreference::System);
+}
+
+#[gpui::test]
+fn theme_actions_update_the_shell(cx: &mut gpui::TestAppContext) {
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        kabu_app::commands::init(cx);
+    });
+    let (shell, cx) = cx.add_window_view(AppShell::new);
+
+    cx.dispatch_action(SelectSignalTheme);
+    shell.update(cx, |shell, _| {
+        assert_eq!(shell.active_theme(), KabuTheme::Signal);
+    });
+
+    cx.dispatch_action(SelectMidnightTheme);
+    shell.update(cx, |shell, _| {
+        assert_eq!(shell.active_theme(), KabuTheme::Midnight);
+    });
+
+    cx.dispatch_action(SelectSystemTheme);
+    shell.update(cx, |shell, _| {
+        assert_eq!(shell.theme_preference(), ThemePreference::System);
+        assert_eq!(shell.active_theme(), KabuTheme::Graphite);
+    });
+}
+
+#[gpui::test]
+fn theme_action_target_moves_to_recreated_shell_and_clears_on_release(
+    cx: &mut gpui::TestAppContext,
+) {
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        kabu_app::commands::init(cx);
+    });
+    let (first_shell, cx) = cx.add_window_view(AppShell::new);
+
+    cx.dispatch_action(SelectSignalTheme);
+    first_shell.update(cx, |shell, _| {
+        assert_eq!(shell.theme_preference(), ThemePreference::Signal);
+    });
+
+    let second_shell = cx.update(|window, cx| window.replace_root(cx, AppShell::new));
+    cx.dispatch_action(SelectMidnightTheme);
+    first_shell.update(cx, |shell, _| {
+        assert_eq!(shell.theme_preference(), ThemePreference::Signal);
+    });
+    second_shell.update(cx, |shell, _| {
+        assert_eq!(shell.theme_preference(), ThemePreference::Midnight);
+    });
+
+    cx.update(|window, cx| {
+        window.replace_root(cx, |_, _| gpui::Empty);
+    });
+    drop(second_shell);
+    cx.run_until_parked();
+    cx.dispatch_action(SelectSystemTheme);
+    first_shell.update(cx, |shell, _| {
+        assert_eq!(shell.theme_preference(), ThemePreference::Signal);
+    });
+}
+
+#[gpui::test]
+fn command_k_opens_search_and_focuses_its_input(cx: &mut gpui::TestAppContext) {
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        kabu_app::commands::init(cx);
+    });
+    let shell_slot = Rc::new(RefCell::new(None));
+    let shell_capture = shell_slot.clone();
+    let (_, cx) = cx.add_window_view(move |window, cx| {
+        let shell = cx.new(|cx| AppShell::new(window, cx));
+        *shell_capture.borrow_mut() = Some(shell.clone());
+        Root::new(shell, window, cx)
+    });
+    let shell: Entity<AppShell> = shell_slot.borrow().clone().expect("shell");
+
+    cx.simulate_keystrokes("cmd-k");
+    cx.refresh().expect("render search overlay");
+
+    shell.update(cx, |shell, _| assert!(shell.search_is_open()));
+    cx.update(|window, cx| {
+        let focus = shell.update(cx, |shell, cx| shell.search_input_focus_handle(cx));
+        assert!(focus.is_focused(window));
+    });
+    assert!(cx.debug_bounds("search-overlay").is_some());
+}
+
+#[test]
+fn search_result_provenance_names_asset_venue_pair_and_provider_exactly() {
+    let equity = aapl_result();
+    let crypto = SearchResult {
+        instrument: Instrument::crypto("btc", "usdt", "Bitcoin").expect("BTC/USDT"),
+        source: DataSource::Binance,
+        venue_label: "spot".into(),
+    };
+
+    assert_eq!(
+        search_result_provenance(&equity),
+        "US Equity · NASDAQ · Yahoo"
+    );
+    assert_eq!(
+        search_result_provenance(&crypto),
+        "Crypto · BTC/USDT · Binance Spot"
+    );
+}
+
+#[gpui::test]
+fn provider_warning_renders_an_inline_retry_for_only_the_failed_provider(
+    cx: &mut gpui::TestAppContext,
+) {
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        kabu_app::commands::init(cx);
+    });
+    let runtime = RuntimeHandle::default();
+    let model = cx.update(|cx| {
+        cx.new(|_| {
+            let mut model = AppModel::new(
+                PersistedState::starter(),
+                CachedMarketState::default(),
+                runtime.clone(),
+            );
+            let generation = model.begin_search("a");
+            model.apply_search_results(
+                generation,
+                vec![aapl_result()],
+                vec![kabu_app::runtime::ProviderWarning {
+                    source: DataSource::Binance,
+                    kind: MarketDataErrorKind::Unavailable,
+                    message: "Crypto search is temporarily unavailable.".into(),
+                }],
+            );
+            model
+        })
+    });
+    let (_, cx) = cx.add_window_view(move |window, cx| {
+        let shell = cx.new(|cx| AppShell::with_model(model.clone(), window, cx));
+        Root::new(shell, window, cx)
+    });
+
+    cx.simulate_keystrokes("cmd-k");
+    cx.refresh().expect("render provider warning");
+
+    assert!(cx.debug_bounds("search-result-provenance-0").is_some());
+    assert!(cx.debug_bounds("search-provider-retry-binance").is_some());
+    assert!(cx.debug_bounds("search-provider-retry-yahoo").is_none());
+    let retry = cx
+        .debug_bounds("search-provider-retry-binance")
+        .expect("Binance retry button bounds");
+    cx.simulate_click(retry.center(), Modifiers::none());
+
+    assert!(matches!(
+        runtime.recorded_commands().last(),
+        Some(RuntimeCommand::RetrySearchProvider {
+            query,
+            source: DataSource::Binance,
+            ..
+        }) if query == "a"
+    ));
+}
+
+#[gpui::test]
+fn search_input_debounces_for_exactly_250_milliseconds(cx: &mut gpui::TestAppContext) {
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        kabu_app::commands::init(cx);
+    });
+    let runtime = RuntimeHandle::default();
+    let model = cx.update(|cx| {
+        cx.new(|_| {
+            AppModel::new(
+                PersistedState::starter(),
+                CachedMarketState::default(),
+                runtime.clone(),
+            )
+        })
+    });
+    let executor = cx.executor();
+    let shell_slot = Rc::new(RefCell::new(None));
+    let shell_capture = shell_slot.clone();
+    let (_, window_cx) = cx.add_window_view(move |window, cx| {
+        let shell = cx.new(|cx| AppShell::with_model(model.clone(), window, cx));
+        *shell_capture.borrow_mut() = Some(shell.clone());
+        Root::new(shell, window, cx)
+    });
+
+    window_cx.simulate_keystrokes("cmd-k");
+    window_cx.refresh().expect("render search overlay");
+    window_cx.simulate_input("nv");
+    window_cx.run_until_parked();
+    executor.advance_clock(Duration::from_millis(249));
+    window_cx.run_until_parked();
+    assert!(
+        !runtime
+            .recorded_commands()
+            .iter()
+            .any(|command| matches!(command, RuntimeCommand::Search { .. }))
+    );
+
+    executor.advance_clock(Duration::from_millis(1));
+    window_cx.run_until_parked();
+    assert!(matches!(
+        runtime.recorded_commands().last(),
+        Some(RuntimeCommand::Search { query, .. }) if query == "nv"
+    ));
+}
+
+#[gpui::test]
+fn closing_search_cancels_the_pending_debounce_task(cx: &mut gpui::TestAppContext) {
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        kabu_app::commands::init(cx);
+    });
+    let runtime = RuntimeHandle::default();
+    let model = cx.update(|cx| {
+        cx.new(|_| {
+            AppModel::new(
+                PersistedState::starter(),
+                CachedMarketState::default(),
+                runtime.clone(),
+            )
+        })
+    });
+    let executor = cx.executor();
+    let shell_slot = Rc::new(RefCell::new(None));
+    let shell_capture = shell_slot.clone();
+    let (_, window_cx) = cx.add_window_view(move |window, cx| {
+        let shell = cx.new(|cx| AppShell::with_model(model.clone(), window, cx));
+        *shell_capture.borrow_mut() = Some(shell.clone());
+        Root::new(shell, window, cx)
+    });
+    let shell: Entity<AppShell> = shell_slot.borrow().clone().expect("shell");
+
+    window_cx.simulate_keystrokes("cmd-k");
+    window_cx.refresh().expect("render search overlay");
+    window_cx.simulate_input("nv");
+    window_cx.run_until_parked();
+    window_cx.simulate_keystrokes("escape");
+    window_cx.run_until_parked();
+    executor.advance_clock(Duration::from_millis(250));
+    window_cx.run_until_parked();
+
+    assert!(
+        !runtime
+            .recorded_commands()
+            .iter()
+            .any(|command| matches!(command, RuntimeCommand::Search { .. }))
+    );
+    let model = shell.update(window_cx, |shell, _| shell.model());
+    model.read_with(window_cx, |model, _| {
+        assert!(model.search().query().is_empty());
+        assert!(!model.search().is_loading());
+    });
+}
+
+#[gpui::test]
+fn arrows_and_return_select_an_existing_result_and_close_search(cx: &mut gpui::TestAppContext) {
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        kabu_app::commands::init(cx);
+    });
+    let runtime = RuntimeHandle::default();
+    let model = cx.update(|cx| {
+        cx.new(|_| {
+            let mut state = PersistedState::starter();
+            state.watchlist.select(2).expect("select BTC first");
+            let mut model = AppModel::new(state, CachedMarketState::default(), runtime.clone());
+            let generation = model.begin_search("n");
+            model.apply_search_results(generation, vec![aapl_result(), nvda_result()], Vec::new());
+            model
+        })
+    });
+    let shell_slot = Rc::new(RefCell::new(None));
+    let shell_capture = shell_slot.clone();
+    let (_, cx) = cx.add_window_view(move |window, cx| {
+        let shell = cx.new(|cx| AppShell::with_model(model.clone(), window, cx));
+        *shell_capture.borrow_mut() = Some(shell.clone());
+        Root::new(shell, window, cx)
+    });
+    let shell: Entity<AppShell> = shell_slot.borrow().clone().expect("shell");
+    let model = shell.update(cx, |shell, _| shell.model());
+
+    cx.simulate_keystrokes("cmd-k down enter");
+    cx.run_until_parked();
+
+    shell.update(cx, |shell, _| assert!(!shell.search_is_open()));
+    model.read_with(cx, |model, _| {
+        assert_eq!(model.watchlist().len(), 4);
+        assert_eq!(
+            model
+                .selected()
+                .expect("existing NVDA selected")
+                .id
+                .canonical_symbol(),
+            "NVDA"
+        );
+    });
+    let history_commands: Vec<_> = runtime
+        .recorded_commands()
+        .into_iter()
+        .filter(|command| matches!(command, RuntimeCommand::History { .. }))
+        .collect();
+    assert_eq!(history_commands.len(), 1);
+    assert!(matches!(
+        history_commands.first(),
+        Some(RuntimeCommand::History { instrument, .. })
+            if instrument.id.canonical_symbol() == "NVDA"
+    ));
+}
+
+#[gpui::test]
+fn escape_closes_search_and_restores_watchlist_focus(cx: &mut gpui::TestAppContext) {
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        kabu_app::commands::init(cx);
+    });
+    let shell_slot = Rc::new(RefCell::new(None));
+    let shell_capture = shell_slot.clone();
+    let (_, cx) = cx.add_window_view(move |window, cx| {
+        let shell = cx.new(|cx| AppShell::new(window, cx));
+        *shell_capture.borrow_mut() = Some(shell.clone());
+        Root::new(shell, window, cx)
+    });
+    let shell: Entity<AppShell> = shell_slot.borrow().clone().expect("shell");
+
+    cx.simulate_keystrokes("cmd-k escape");
+    cx.run_until_parked();
+
+    shell.update(cx, |shell, _| assert!(!shell.search_is_open()));
+    cx.dispatch_action(SelectNextWatchlist);
+    let model = shell.update(cx, |shell, _| shell.model());
+    model.read_with(cx, |model, _| {
+        assert_eq!(
+            model
+                .selected()
+                .expect("watchlist focus restored")
+                .id
+                .canonical_symbol(),
+            "NVDA"
+        );
+    });
+}
+
+fn cached_watchlist_model(cx: &mut gpui::TestAppContext) -> gpui::Entity<AppModel> {
+    let aapl = InstrumentId::equity("AAPL", Some("NASDAQ")).expect("AAPL id");
+    let nvda = InstrumentId::equity("NVDA", Some("NASDAQ")).expect("NVDA id");
+    let mut cache = CachedMarketState::default();
+    cache
+        .quotes
+        .insert(aapl.clone(), cached_quote(aapl, 100.0, 95.0));
+    cache
+        .quotes
+        .insert(nvda.clone(), cached_quote(nvda, 200.0, 210.0));
+    cx.update(|cx| {
+        cx.new(|_| AppModel::new(PersistedState::starter(), cache, RuntimeHandle::default()))
+    })
+}
+
+fn cached_quote(instrument_id: InstrumentId, last: f64, previous_close: f64) -> Quote {
+    let timestamp = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp");
+    Quote {
+        instrument_id,
+        last,
+        previous_close: Some(previous_close),
+        open: None,
+        high: None,
+        low: None,
+        volume: None,
+        currency: "USD".into(),
+        source: DataSource::Yahoo,
+        market_state: MarketState::Regular,
+        provider_timestamp: timestamp,
+        received_at: timestamp,
+        provider_delayed: false,
+    }
+}
+
+fn chart_candle(close: f64) -> Candle {
+    Candle {
+        starts_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp"),
+        open: close,
+        high: close,
+        low: close,
+        close,
+        volume: 1_000.0,
+    }
+}
+
+fn aapl_result() -> SearchResult {
+    SearchResult {
+        instrument: Instrument::equity("AAPL", Some("NASDAQ"), "Apple", "USD").expect("AAPL"),
+        source: DataSource::Yahoo,
+        venue_label: "NASDAQ".into(),
+    }
+}
+
+fn nvda_result() -> SearchResult {
+    SearchResult {
+        instrument: Instrument::equity("NVDA", Some("NASDAQ"), "NVIDIA", "USD").expect("NVDA"),
+        source: DataSource::Yahoo,
+        venue_label: "NASDAQ".into(),
+    }
+}
+
+struct IdleProvider;
+
+#[async_trait::async_trait]
+impl InstrumentSearch for IdleProvider {
+    async fn search(&self, _: &str) -> Result<Vec<SearchResult>, MarketDataError> {
+        Ok(Vec::new())
+    }
+}
+
+#[async_trait::async_trait]
+impl QuoteSnapshots for IdleProvider {
+    async fn snapshots(&self, _: &[Instrument]) -> Result<Vec<Quote>, MarketDataError> {
+        Ok(Vec::new())
+    }
+}
+
+#[async_trait::async_trait]
+impl ChartHistory for IdleProvider {
+    async fn history(
+        &self,
+        _: &Instrument,
+        _: ChartPeriod,
+    ) -> Result<Vec<Candle>, MarketDataError> {
+        Ok(Vec::new())
+    }
+}
+
+#[async_trait::async_trait]
+impl QuoteSubscription for IdleProvider {
+    async fn subscribe(&self, _: &[Instrument]) -> Result<QuoteStream, MarketDataError> {
+        Err(MarketDataError {
+            kind: MarketDataErrorKind::Unavailable,
+            message: "idle provider".into(),
+            retry_after: None,
+        })
+    }
+}
+
+#[derive(Default)]
+struct CloseRetryRepository {
+    state_saves: AtomicUsize,
+}
+
+impl StateRepository for CloseRetryRepository {
+    fn load_state(&self) -> Result<PersistedState, PersistenceError> {
+        Ok(PersistedState::starter())
+    }
+
+    fn save_state(&self, _: &PersistedState) -> Result<(), PersistenceError> {
+        if self.state_saves.fetch_add(1, Ordering::SeqCst) < 2 {
+            Err(PersistenceError::Io(std::io::Error::other(
+                "/private/close-state.json",
+            )))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn load_cache(&self) -> Result<CachedMarketState, PersistenceError> {
+        Ok(CachedMarketState::default())
+    }
+
+    fn save_cache(&self, _: &CachedMarketState) -> Result<(), PersistenceError> {
+        Ok(())
+    }
+}

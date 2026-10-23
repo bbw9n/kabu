@@ -1,0 +1,13 @@
+{
+  "timezone": "UTC",
+  "serverTime": 1724171400000,
+  "symbols": [
+    {"symbol":"BTCUSDT","status":"TRADING","baseAsset":"BTC","baseAssetName":"Bitcoin","quoteAsset":"USDT","quoteAssetName":"Tether USDt","isSpotTradingAllowed":true},
+    {"symbol":"BTCUSDC","status":"TRADING","baseAsset":"BTC","baseAssetName":"Bitcoin","quoteAsset":"USDC","quoteAssetName":"USD Coin","isSpotTradingAllowed":true},
+    {"symbol":"BTCETH","status":"TRADING","baseAsset":"BTC","baseAssetName":"Bitcoin","quoteAsset":"ETH","quoteAssetName":"Ethereum","isSpotTradingAllowed":true},
+    {"symbol":"ETHUSDT","status":"TRADING","baseAsset":"ETH","baseAssetName":"Ethereum","quoteAsset":"USDT","quoteAssetName":"Tether USDt","isSpotTradingAllowed":true},
+    {"symbol":"BTCDOWNUSDT","status":"BREAK","baseAsset":"BTCDOWN","baseAssetName":"BTC Down","quoteAsset":"USDT","quoteAssetName":"Tether USDt","isSpotTradingAllowed":true},
+    {"symbol":"BTCFDUSD","status":"TRADING","baseAsset":"BTC","baseAssetName":"","quoteAsset":"FDUSD","quoteAssetName":"First Digital USD","isSpotTradingAllowed":true},
+    {"symbol":"BTCBUSD","status":"TRADING","baseAsset":"BTC","baseAssetName":"Bitcoin","quoteAsset":"BUSD","quoteAssetName":"Binance USD","isSpotTradingAllowed":false}
+  ]
+}

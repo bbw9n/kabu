@@ -1,0 +1,34 @@
+[package]
+name = "kabu-app"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+[dependencies]
+anyhow.workspace = true
+async-channel.workspace = true
+chrono.workspace = true
+futures-util.workspace = true
+gpui.workspace = true
+gpui-component.workspace = true
+gpui-component-assets.workspace = true
+kabu-core = { path = "../kabu-core" }
+kabu-data = { path = "../kabu-data" }
+rand.workspace = true
+reqwest.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+url.workspace = true
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2.workspace = true
+objc2-app-kit.workspace = true
+raw-window-handle.workspace = true
+[dev-dependencies]
+async-trait.workspace = true
+gpui = { workspace = true, features = ["test-support"] }
+tempfile.workspace = true
+wiremock.workspace = true
+[lints]
+workspace = true

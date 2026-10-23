@@ -1,0 +1,25 @@
+{
+  "quotes": [
+    {
+      "symbol": "NVDA",
+      "shortname": "NVIDIA Corporation",
+      "quoteType": "EQUITY",
+      "exchange": "NMS",
+      "currency": "USD"
+    },
+    {
+      "symbol": "NVDA.BA",
+      "shortname": "NVIDIA Argentina",
+      "quoteType": "EQUITY",
+      "exchange": "BUE",
+      "currency": "ARS"
+    },
+    {
+      "symbol": "SOXX",
+      "shortname": "iShares Semiconductor ETF",
+      "quoteType": "ETF",
+      "exchange": "NMS",
+      "currency": "USD"
+    }
+  ]
+}

@@ -1,0 +1,16 @@
+{
+  "results": [
+    {
+      "account_number": "RH-ABC-1234567890",
+      "status": "active",
+      "type": "individual",
+      "currency": "USD",
+      "cash_management_enabled": false,
+      "deactivated": false,
+      "created_at": "2024-01-02T03:04:05Z",
+      "updated_at": "2026-09-01T12:00:00Z"
+    }
+  ],
+  "next": null,
+  "previous": null
+}
